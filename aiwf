@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+is_windowsapps_python() {
+  case "${1:-}" in
+    *Microsoft/WindowsApps/python|*Microsoft/WindowsApps/python.exe|*Microsoft/WindowsApps/python3|*Microsoft/WindowsApps/python3.exe)
+      return 0
+      ;;
+    *Microsoft\\WindowsApps\\python|*Microsoft\\WindowsApps\\python.exe|*Microsoft\\WindowsApps\\python3|*Microsoft\\WindowsApps\\python3.exe)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+try_candidate() {
+  local candidate="${1:-}"
+  if [ -z "$candidate" ]; then
+    return 1
+  fi
+  if is_windowsapps_python "$candidate"; then
+    return 1
+  fi
+  if [ -x "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+try_command_on_path() {
+  local name="${1:-}"
+  local candidate=""
+  if [ -z "$name" ]; then
+    return 1
+  fi
+  if ! candidate="$(command -v "$name" 2>/dev/null)"; then
+    return 1
+  fi
+  try_candidate "$candidate"
+}
+
+check_python_version() {
+  local candidate="${1:-}"
+  "$candidate" - <<'PY'
+import sys
+if sys.version_info < (3, 10):
+    raise SystemExit(
+        f"ERROR: AIWF requires Python >= 3.10, got {sys.version.split()[0]}"
+    )
+PY
+}
+
+try_supported_candidate() {
+  local candidate="${1:-}"
+  if ! candidate="$(try_candidate "$candidate")"; then
+    return 1
+  fi
+  if ! check_python_version "$candidate" >/dev/null 2>&1; then
+    return 1
+  fi
+  printf '%s\n' "$candidate"
+  return 0
+}
+
+try_supported_command_on_path() {
+  local name="${1:-}"
+  local candidate=""
+  if [ -z "$name" ]; then
+    return 1
+  fi
+  if ! candidate="$(command -v "$name" 2>/dev/null)"; then
+    return 1
+  fi
+  try_supported_candidate "$candidate"
+}
+
+find_python() {
+  local candidate=""
+  if [ -n "${AIWF_PYTHON:-}" ]; then
+    candidate="$(try_candidate "$AIWF_PYTHON")" || {
+      echo "ERROR: invalid AIWF_PYTHON interpreter: $AIWF_PYTHON" >&2
+      exit 127
+    }
+    check_python_version "$candidate"
+    printf '%s\n' "$candidate"
+    return
+  fi
+  if try_supported_candidate "$repo_root/.venv/bin/python"; then
+    return
+  fi
+  if try_supported_candidate "$repo_root/.venv/Scripts/python"; then
+    return
+  fi
+  if try_supported_candidate "$repo_root/.venv/Scripts/python.exe"; then
+    return
+  fi
+  if try_supported_command_on_path "python"; then
+    return
+  fi
+  if try_supported_command_on_path "python3"; then
+    return
+  fi
+  echo "ERROR: Python >= 3.10 interpreter not found. Set AIWF_PYTHON=/path/to/python (WindowsApps aliases are ignored)." >&2
+  exit 127
+}
+
+bootstrap_help() {
+  cat <<'EOF'
+AIWF bootstrap mode
+
+The canonical runtime .aiwf/bin/ai_workflow.py is missing.
+Only upgrade commands are available in bootstrap mode.
+
+Usage:
+  ./aiwf upgrade --check --source /path/to/new_aiwf_repo
+  ./aiwf upgrade --dry-run --source /path/to/new_aiwf_repo
+  ./aiwf upgrade --apply --source /path/to/new_aiwf_repo
+EOF
+}
+
+bootstrap_help_requested() {
+  local arg="${1:-}"
+  case "$arg" in
+    -h|--help|help)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bootstrap_source_root() {
+  local source_arg="${1:-}"
+  if [ -z "$source_arg" ]; then
+    return 1
+  fi
+  if [ ! -d "$source_arg" ]; then
+    return 1
+  fi
+  (cd "$source_arg" && pwd)
+}
+
+python_bin="$(find_python)"
+
+runtime_path="$repo_root/.aiwf/bin/ai_workflow.py"
+
+if [ -f "$runtime_path" ]; then
+  exec "$python_bin" "$runtime_path" "$@"
+fi
+
+if bootstrap_help_requested "${1:-}"; then
+  bootstrap_help
+  exit 0
+fi
+
+if [ "${1:-}" = "upgrade" ]; then
+  if bootstrap_help_requested "${2:-}"; then
+    bootstrap_help
+    exit 0
+  fi
+
+  source_arg=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "--source" ]; then
+      source_arg="$arg"
+      break
+    fi
+    prev="$arg"
+  done
+
+  source_root="$(bootstrap_source_root "$source_arg")" || {
+    echo "ERROR: bootstrap mode requires ./aiwf upgrade --source <new_aiwf_repo>" >&2
+    exit 2
+  }
+
+  if [ ! -x "$source_root/aiwf" ]; then
+    echo "ERROR: invalid AIWF upgrade source; missing executable aiwf: $source_root/aiwf" >&2
+    exit 2
+  fi
+  if [ ! -f "$source_root/.aiwf/bin/ai_workflow.py" ]; then
+    echo "ERROR: invalid AIWF upgrade source; missing .aiwf/bin/ai_workflow.py: $source_root/.aiwf/bin/ai_workflow.py" >&2
+    exit 2
+  fi
+  if [ ! -d "$source_root/.aiwf/docs" ]; then
+    echo "ERROR: invalid AIWF upgrade source; missing .aiwf/docs: $source_root/.aiwf/docs" >&2
+    exit 2
+  fi
+
+  cd "$source_root"
+  exec ./aiwf --repo-root "$repo_root" "$@"
+fi
+
+bootstrap_help
+echo "ERROR: bootstrap mode only supports upgrade commands." >&2
+exit 2

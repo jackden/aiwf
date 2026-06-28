@@ -1,0 +1,21 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+*.zip
+*.swp
+*.swo
+.*.swp
+.*.swo
+__MACOSX/
+logs/
+.venv/
+venv/
+env/
+.aiwf/metadata.local.env
+.aiwf/metadata.current
+.aiwf/metadata_profiles/
+# Added by code-review-graph
+.code-review-graph/
+backup/

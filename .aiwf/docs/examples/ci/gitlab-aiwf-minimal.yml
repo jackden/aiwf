@@ -1,0 +1,11 @@
+stages:
+  - test
+
+aiwf:
+  image: python:3.11
+  stage: test
+  script:
+    - python -m pip install -r requirement.txt
+    - python -m py_compile .aiwf/bin/ai_workflow.py tests/unit/test_ai_workflow.py
+    - python -m pytest -q
+    - ./aiwf report --path .aiwf/records --format json

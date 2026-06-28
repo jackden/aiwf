@@ -1,0 +1,5 @@
+aiwf_layout_version: 2
+docs_root: ".aiwf/docs"
+record_root: ".aiwf/records"
+event_log: ".aiwf/events/events.jsonl"
+legacy_enabled: true
