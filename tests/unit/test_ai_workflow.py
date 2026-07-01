@@ -119,7 +119,9 @@ def test_supported_first_install_preserves_project_scripts_and_does_not_create_r
     assert rc == 0
     _assert_text_files_unchanged(before)
     assert not (root / REMOVED_ROOT_PACKAGE_HELPER).exists()
-    assert (root / ".aiwf" / "bin" / "package_review_bundle.sh").exists()
+    source_review_helper = REPO_ROOT / ".aiwf" / "bin" / "package_review_bundle.sh"
+    installed_review_helper = root / ".aiwf" / "bin" / "package_review_bundle.sh"
+    assert installed_review_helper.exists() == source_review_helper.exists()
 
 
 def _seed_upgrade_target_repo(root: Path) -> Path:

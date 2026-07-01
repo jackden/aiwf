@@ -1,0 +1,653 @@
+{
+  "$schema": "urn:json-schema:draft:2020-12",
+  "$id": "urn:aiwf:schemas:package_records_manifest_v1",
+  "title": "AIWF Package Records Manifest v1",
+  "description": "Runtime-validated schema for an AIWF workflow records analysis package manifest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "package_type",
+    "package_version",
+    "capabilities",
+    "generator",
+    "options",
+    "redaction_profile",
+    "redaction_count",
+    "excluded_artifact_count",
+    "records_root",
+    "filters",
+    "selected_tasks",
+    "artifacts",
+    "events",
+    "dataset",
+    "redaction",
+    "repository",
+    "identity",
+    "validation"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "aiwf-package-records-manifest-v1"
+    },
+    "package_type": {
+      "const": "aiwf-package-records"
+    },
+    "package_version": {
+      "const": "1"
+    },
+    "generated_at_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Instance metadata only. This field does not participate in reproducible evidence identity."
+    },
+    "capabilities": {
+      "type": "object",
+      "description": "Manifest-level feature metadata for forward compatibility. Consumers should not infer all behavior from schema_version alone.",
+      "additionalProperties": {
+        "type": "boolean"
+      },
+      "required": [
+        "canonical_events",
+        "dataset",
+        "redaction",
+        "package_identity",
+        "referential_validation"
+      ],
+      "properties": {
+        "canonical_events": {
+          "type": "boolean"
+        },
+        "dataset": {
+          "type": "boolean"
+        },
+        "redaction": {
+          "type": "boolean"
+        },
+        "package_identity": {
+          "type": "boolean"
+        },
+        "referential_validation": {
+          "type": "boolean"
+        }
+      }
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "tool_version"],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "const": "aiwf"
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "workflow_protocol_version": {
+          "type": "string"
+        }
+      }
+    },
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "include_dataset",
+        "include_global_events",
+        "include_related",
+        "redaction_profile",
+        "strict"
+      ],
+      "properties": {
+        "format": {
+          "enum": ["zip", "directory"]
+        },
+        "include_dataset": {
+          "type": "boolean"
+        },
+        "include_global_events": {
+          "type": "boolean"
+        },
+        "include_related": {
+          "type": "boolean"
+        },
+        "redaction_profile": {
+          "enum": ["safe", "internal", "none"]
+        },
+        "strict": {
+          "type": "boolean"
+        }
+      }
+    },
+    "redaction_profile": {
+      "enum": ["safe", "internal", "none"]
+    },
+    "redaction_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "excluded_artifact_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "records_root": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_path", "layout_version"],
+      "properties": {
+        "source_path": {
+          "$ref": "#/$defs/repo_relative_path"
+        },
+        "layout_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "config_path": {
+          "$ref": "#/$defs/repo_relative_path"
+        }
+      }
+    },
+    "filters": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "from_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "to_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "dates": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "date"
+          }
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "workflow_phase": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "review_status": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "project": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "selected_tasks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/task_entry"
+      }
+    },
+    "excluded_tasks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/excluded_entry"
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["included", "excluded", "prohibited_count"],
+      "properties": {
+        "included": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact_entry"
+          }
+        },
+        "excluded": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/excluded_entry"
+          }
+        },
+        "prohibited_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "events": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_local_event_count",
+        "global_event_count",
+        "canonical_event_count",
+        "malformed_event_count",
+        "unassociated_event_count"
+      ],
+      "properties": {
+        "task_local_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "global_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "canonical_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "malformed_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unassociated_event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/event_source"
+          }
+        }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["included"],
+      "properties": {
+        "included": {
+          "type": "boolean"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/package_relative_path"
+        },
+        "warning_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "redaction_count",
+        "excluded_artifact_count",
+        "secret_finding_count",
+        "redaction_report",
+        "exclusion_report"
+      ],
+      "properties": {
+        "profile": {
+          "enum": ["safe", "internal", "none"]
+        },
+        "redaction_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excluded_artifact_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "secret_finding_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "redaction_report": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/redaction_report_entry"
+          }
+        },
+        "exclusion_report": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/excluded_entry"
+          }
+        }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_available", "dirty_tree"],
+      "properties": {
+        "git_available": {
+          "type": "boolean"
+        },
+        "dirty_tree": {
+          "type": "boolean"
+        },
+        "commit": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "privacy_profile_applied": {
+          "type": "boolean"
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hash_policy",
+        "reproducible_evidence_sha256",
+        "content_file_count",
+        "content_total_bytes"
+      ],
+      "properties": {
+        "hash_policy": {
+          "const": "aiwf-package-records-v1"
+        },
+        "reproducible_evidence_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "content_file_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "content_total_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excluded_identity_fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "result",
+        "finding_count",
+        "findings",
+        "scope",
+        "package_generation",
+        "manifest_schema",
+        "package_integrity",
+        "privacy_security",
+        "workflow_evidence"
+      ],
+      "properties": {
+        "result": {
+          "$ref": "#/$defs/validation_result",
+          "description": "Backward-compatible workflow evidence finding result. Package generation status is stored in package_generation."
+        },
+        "finding_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Backward-compatible workflow evidence finding count."
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/finding"
+          }
+        },
+        "scope": {
+          "const": "workflow_evidence"
+        },
+        "package_generation": {
+          "$ref": "#/$defs/validation_status"
+        },
+        "manifest_schema": {
+          "$ref": "#/$defs/validation_status"
+        },
+        "package_integrity": {
+          "$ref": "#/$defs/validation_status"
+        },
+        "privacy_security": {
+          "$ref": "#/$defs/validation_status"
+        },
+        "workflow_evidence": {
+          "$ref": "#/$defs/workflow_evidence_status"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "validation_result": {
+      "enum": ["pass", "warn", "fail"]
+    },
+    "validation_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result"],
+      "properties": {
+        "result": {
+          "$ref": "#/$defs/validation_result"
+        }
+      }
+    },
+    "workflow_evidence_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "finding_count"],
+      "properties": {
+        "result": {
+          "$ref": "#/$defs/validation_result"
+        },
+        "finding_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "repo_relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          }
+        ]
+      }
+    },
+    "package_relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          }
+        ]
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "task_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_id", "task_name", "source_path", "package_path"],
+      "properties": {
+        "task_id": {
+          "type": "string"
+        },
+        "task_name": {
+          "type": "string"
+        },
+        "source_path": {
+          "$ref": "#/$defs/repo_relative_path"
+        },
+        "package_path": {
+          "$ref": "#/$defs/package_relative_path"
+        },
+        "status": {
+          "type": "string"
+        },
+        "workflow_phase": {
+          "type": "string"
+        },
+        "review_status": {
+          "type": "string"
+        }
+      }
+    },
+    "artifact_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_path",
+        "package_path",
+        "artifact_class",
+        "bytes",
+        "sha256",
+        "redaction"
+      ],
+      "properties": {
+        "source_path": {
+          "$ref": "#/$defs/repo_relative_path"
+        },
+        "package_path": {
+          "$ref": "#/$defs/package_relative_path"
+        },
+        "artifact_class": {
+          "enum": [
+            "workflow_evidence",
+            "agent_review",
+            "task_content",
+            "derived_analysis",
+            "generated_metadata"
+          ]
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mode": {
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "redaction": {
+          "enum": ["none", "redacted"]
+        }
+      }
+    },
+    "excluded_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_path", "reason"],
+      "properties": {
+        "source_path": {
+          "$ref": "#/$defs/repo_relative_path"
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "event_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_path", "event_count"],
+      "properties": {
+        "source_path": {
+          "$ref": "#/$defs/repo_relative_path"
+        },
+        "event_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "malformed_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "redaction_report_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_path", "package_path", "rule", "action", "count"],
+      "properties": {
+        "source_path": {
+          "$ref": "#/$defs/repo_relative_path"
+        },
+        "package_path": {
+          "$ref": "#/$defs/package_relative_path"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "code", "message"],
+      "properties": {
+        "severity": {
+          "enum": ["info", "warn", "error"]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/package_relative_path"
+        }
+      }
+    }
+  }
+}
