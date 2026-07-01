@@ -2,18 +2,18 @@
 
 This document is the canonical protocol semantics reference for repository-native AI workflow governance.
 
-## Version Identity Policy (v1.7.8.post1)
+## Version Identity Policy (v1.7.9)
 
 For the current lightweight, repository-native AIWF project, release identity and tool provenance normally move together.
-The `v1.7.8.post1` public baseline patch advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
+The `v1.7.9` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
 This does not introduce a package manager, database migration framework, or silent overwrite of workflow evidence.
 
 Current version state:
-- release version: `1.7.8.post1`
-- tool version: `1.7.8.post1`
+- release version: `1.7.9`
+- tool version: `1.7.9`
 - workflow protocol version: `1.7.8`
 
-This patch identity is a public packaging and documentation decision. The upgrade mechanism is additive and does not by itself imply event schema, finalize gate, or diagnostic behavior changes.
+This release identity is a public packaging, documentation, and workflow evidence portability decision. The upgrade mechanism is additive and does not by itself imply event schema, finalize gate, or diagnostic behavior changes.
 
 Version-separation strategy may be revisited only if AIWF later requires:
 - external compatibility guarantees
@@ -154,7 +154,9 @@ Closure hardening:
 - `check --finalize-ready` runs finalize-level diagnostics in read-only mode for CI/agent gates.
 - `check --finalize-ready` validates closure evidence hygiene, including pending validation/review residue, default template residue in required artifacts, and acceptance-criteria closure-decision states.
 - v1.6.1 remains evidence-driven; strict phase-gated finalize is deferred and not enforced as `workflow_phase == review`.
-- finalized required artifacts (`task.md`, `task_record.md`, `self_validation.md`, `review_codex.md`, `review_final.md`) are governance-controlled evidence after finalize.
+- finalized required artifacts (`task.md`, `task_record.md`, `self_validation.md`, `review_agent.md`, `review_final.md`) are governance-controlled evidence after finalize.
+- `review_agent.md` is the canonical AI/agent review artifact for new tasks.
+- `review_codex.md` is a legacy alias retained for backward compatibility with existing records.
 - AIWF does not provide tamper-proof storage or physical immutability guarantees for finalized artifacts.
 - AIWF guarantees deterministic post-finalize drift handling: detect, diagnose, repair, preserve evidence.
 - follow-up tasks must not silently rewrite finalized evidence.

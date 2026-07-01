@@ -32,23 +32,45 @@ Commands:
 Safety:
 - Writes only workflow files under the repo root, `.aiwf/`, and `.aiwf/docs/knowledge/*`.
 - Does not run pytest, DUT, destructive, mkfs, RAID, firmware, power-cycle, or git commands.
-- Never deletes files.
+- Does not delete existing workflow records. Failed new-task creation may roll back
+  files and directories created by the failed command before a valid task exists.
 - Does not overwrite existing files unless --update-existing is passed.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import hashlib
+import io
 import json
 import os
 import shutil
 import re
+import subprocess
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional, Sequence
+
+AIWF_BIN_DIR = Path(__file__).resolve().parent
+if str(AIWF_BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(AIWF_BIN_DIR))
+
+from lib.package_core import (  # noqa: E402
+    build_manifest_row,
+    compute_sha256,
+    file_size,
+    git_mode,
+    manifest_row_tsv,
+    normalize_package_path,
+    sha256_bytes,
+    stable_json_dump,
+    stable_sort,
+    stable_tsv_dump,
+)
 
 AI_DATE_RE = re.compile(r"^ai_(\d{8})$")
 TASK_DIR_RE = re.compile(r"^\d{3}_[a-z0-9][a-z0-9_]*$")
@@ -66,11 +88,19 @@ SCHEMA_V16 = "ai-workflow-v1.6"
 CURRENT_SCHEMA_VERSION = SCHEMA_V16
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16}
 WORKFLOW_PROTOCOL_VERSION = "1.7.8"
-AIWF_TOOL_VERSION = "1.7.8.post1"
+AIWF_TOOL_VERSION = "1.7.9"
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.1"
 AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.2"
 AIWF_EXPERIMENT_SCHEMA_VERSION = "aiwf-experiment-v0.1"
 AIWF_DATASET_SCHEMA_VERSION = "1"
+AIWF_PACKAGE_RECORDS_MANIFEST_SCHEMA_VERSION = "aiwf-package-records-manifest-v1"
+AIWF_PACKAGE_RECORDS_PACKAGE_VERSION = "1"
+AIWF_PACKAGE_RECORDS_HASH_POLICY = "aiwf-package-records-v1"
+AIWF_PACKAGE_RECORDS_MANIFEST_SCHEMA_FILENAME = "package_records_manifest_v1.schema.json"
+AIWF_PACKAGE_RECORDS_MANIFEST_ERROR = "AIWF-PKG-MANIFEST-001"
+AIWF_PACKAGE_RECORDS_DATASET_PATH = "dataset/aiwf_dataset.json"
+AIWF_PACKAGE_RECORDS_ROOT_DIR = "aiwf-records-package"
+AIWF_PACKAGE_RECORDS_REDACTION_PROFILES = {"safe", "internal", "none"}
 ALLOWED_STATUS = {"draft", "active", "review", "blocked", "done", "archived"}
 ALLOWED_PRIORITY = {"P0", "P1", "P2", "P3"}
 ALLOWED_RISK = {"low", "medium", "high", "critical"}
@@ -145,8 +175,29 @@ TASK_METADATA_SCHEMA: dict[str, dict[str, Any]] = {
     },
 }
 METADATA_LIST_FIELDS = {name for name, spec in TASK_METADATA_SCHEMA.items() if spec.get("type") == "list"}
-FINALIZE_REQUIRED_FILES = ("task.md", "task_record.md", "self_validation.md", "review_codex.md", "review_final.md")
-PRE_EDIT_REQUIRED_FILES = ("task.md", "agent.md", "task_record.md", "self_validation.md", "review_codex.md", "review_final.md")
+AGENT_REVIEW_CANONICAL_FILE = "review_agent.md"
+AGENT_REVIEW_LEGACY_FILE = "review_codex.md"
+AGENT_REVIEW_FILES = (AGENT_REVIEW_CANONICAL_FILE, AGENT_REVIEW_LEGACY_FILE)
+FINALIZE_REQUIRED_FILE_GROUPS = (
+    ("task.md",),
+    ("task_record.md",),
+    ("self_validation.md",),
+    AGENT_REVIEW_FILES,
+    ("review_final.md",),
+)
+PRE_EDIT_REQUIRED_FILE_GROUPS = (
+    ("task.md",),
+    ("agent.md",),
+    ("task_record.md",),
+    ("self_validation.md",),
+    AGENT_REVIEW_FILES,
+    ("review_final.md",),
+)
+FINALIZE_REQUIRED_FILES = tuple(group[0] for group in FINALIZE_REQUIRED_FILE_GROUPS)
+PRE_EDIT_REQUIRED_FILES = tuple(group[0] for group in PRE_EDIT_REQUIRED_FILE_GROUPS)
+LEGACY_REQUIRED_FILES = (AGENT_REVIEW_LEGACY_FILE,)
+FINALIZE_MANIFEST_FILES = tuple(dict.fromkeys((*FINALIZE_REQUIRED_FILES, *LEGACY_REQUIRED_FILES)))
+DATASET_RECORD_REFERENCE_FILES = tuple(dict.fromkeys((*FINALIZE_REQUIRED_FILES, *LEGACY_REQUIRED_FILES)))
 REQUIRED_DOC_SECTIONS: dict[str, tuple[str, ...]] = {
     "task_record.md": ("Changed", "Why"),
     "self_validation.md": ("Commands Run", "Results"),
@@ -170,6 +221,13 @@ DEFAULT_TEMPLATE_SECTION_BODIES: dict[str, dict[str, str]] = {
     "self_validation.md": {
         "Commands Run": "Record exact commands if executed.",
         "Known Limitations": "Document skipped checks and environment limitations.",
+    },
+    "review_agent.md": {
+        "Code / Documentation Quality": "Pending.",
+        "Logic Coverage": "Pending.",
+        "Safety Impact": "Pending.",
+        "v1.1 Completeness": "Pending.",
+        "Remaining Risks": "Pending.",
     },
     "review_codex.md": {
         "Code / Documentation Quality": "Pending.",
@@ -196,6 +254,7 @@ DATASET_ALLOWED_TASK_FIELDS = (
     "has_task_record_artifact",
     "has_self_validation_artifact",
     "has_validation_event",
+    "has_agent_review_artifact",
     "has_review_codex_artifact",
     "has_review_final_artifact",
     "has_review_event",
@@ -455,6 +514,19 @@ AGENTS_BLOCK_END = "<!-- AIWF:END -->"
 class WriteResult:
     path: Path
     action: str
+
+
+@dataclass(frozen=True)
+class PackageRecordsTaskCandidate:
+    path: Path
+    source_path: str
+    package_path: str
+    date: str
+    task_id: str
+    task_name: str
+    metadata: dict[str, Any]
+    metadata_valid: bool
+    task_md_missing: bool
 
 
 @dataclass(frozen=True)
@@ -1458,13 +1530,46 @@ def write_file(root: Path, path: Path, content: str, update_existing: bool = Fal
     return WriteResult(path, action)
 
 
+def _artifact_group_label(group: Sequence[str]) -> str:
+    if len(group) == 1:
+        return group[0]
+    return f"{group[0]} (legacy alias: {', '.join(group[1:])})"
+
+
+def _resolve_artifact_group(task_dir: Path, group: Sequence[str]) -> tuple[str, Path, bool]:
+    for filename in group:
+        path = task_dir / filename
+        if path.exists():
+            return filename, path, filename != group[0]
+    return group[0], task_dir / group[0], False
+
+
+def _resolved_required_artifacts(
+    task_dir: Path,
+    groups: Sequence[Sequence[str]],
+) -> list[tuple[str, Path, bool, Sequence[str]]]:
+    return [(*_resolve_artifact_group(task_dir, group), group) for group in groups]
+
+
+def _agent_review_artifact_path(task_dir: Path) -> tuple[Optional[str], Optional[Path]]:
+    filename, path, _legacy = _resolve_artifact_group(task_dir, AGENT_REVIEW_FILES)
+    if path.exists():
+        return filename, path
+    return None, None
+
+
+def _has_agent_review_artifact(task_dir: Path) -> bool:
+    _filename, path = _agent_review_artifact_path(task_dir)
+    return path is not None
+
+
 def safe_dataset_output_path(root: Path, path: Path) -> None:
     try:
         rp = path.resolve().relative_to(root.resolve())
     except ValueError:
         raise SystemExit(f"ERROR: refusing to write outside repo root: {path}")
 
-    if rp.name in {"task.md", "task_record.md", "self_validation.md", "review_codex.md", "review_final.md"}:
+    if rp.name in {"task.md", "task_record.md", "self_validation.md", "review_agent.md", "review_codex.md", "review_final.md"}:
         raise SystemExit(f"ERROR: refusing to overwrite workflow evidence artifact: {rp}")
     if rp == Path("README.md"):
         raise SystemExit("ERROR: refusing to overwrite README.md during dataset export")
@@ -2102,6 +2207,22 @@ def append_index(index_path: Path, entry: str) -> WriteResult:
     return WriteResult(index_path, "updated")
 
 
+def _rollback_failed_task_creation(
+    *,
+    task_dir: Path,
+    task_dir_existed_before: bool,
+    index_path: Path,
+    index_existed_before: bool,
+    index_before_text: Optional[str],
+) -> None:
+    if not task_dir_existed_before and task_dir.exists():
+        shutil.rmtree(task_dir)
+    if index_existed_before:
+        index_path.write_text(index_before_text or "", encoding="utf-8")
+    elif index_path.exists():
+        index_path.unlink()
+
+
 def _index_entry_tokens(line: str) -> list[str]:
     return re.findall(r"`([^`]+)`", line)
 
@@ -2276,7 +2397,7 @@ def title_from_path(path: Path) -> str:
 
 
 def read_existing_summary(path: Path) -> str:
-    for name in ["task_record.md", "review_final.md", "self_validation.md", "review_codex.md", "task.md"]:
+    for name in ["task_record.md", "review_final.md", "self_validation.md", "review_agent.md", "review_codex.md", "task.md"]:
         p = path / name
         if p.exists():
             text = p.read_text(encoding="utf-8", errors="replace").strip()
@@ -2845,7 +2966,7 @@ Treat hardware-impacting actions as unsafe unless explicitly approved.
 - `agent.md`
 - `task_record.md`
 - `self_validation.md`
-- `review_codex.md`
+- `review_agent.md` (canonical agent review artifact; `review_codex.md` is a legacy alias)
 - `review_final.md`
 - Knowledge writeback when reusable
 
@@ -2916,8 +3037,8 @@ Document skipped checks and environment limitations.
 """
 
 
-def review_codex_md(title: str) -> str:
-    return f"""# Codex Self Review: {title}
+def review_agent_md(title: str) -> str:
+    return f"""# Agent Self Review: {title}
 
 ## Code / Documentation Quality
 
@@ -2939,6 +3060,10 @@ Pending.
 
 Pending.
 """
+
+
+def review_codex_md(title: str) -> str:
+    return review_agent_md(title).replace("# Agent Self Review:", "# Codex Self Review:", 1)
 
 
 def review_final_md(title: str) -> str:
@@ -3219,7 +3344,11 @@ def guard_pre_edit(root: Path, raw_target: Optional[str], *, pre_edit: bool) -> 
         diag = make_diagnostic("AIWF-GUARD-001", display_path, blocker=True)
         return 2, f"{diag.code}: {diag.message}\ntask_path: {display_path}\n"
 
-    missing = [filename for filename in PRE_EDIT_REQUIRED_FILES if not (task_dir / filename).exists()]
+    missing = [
+        _artifact_group_label(group)
+        for filename, path, _legacy, group in _resolved_required_artifacts(task_dir, PRE_EDIT_REQUIRED_FILE_GROUPS)
+        if not path.exists()
+    ]
     if missing:
         diag = make_diagnostic("AIWF-GUARD-002", display_path, blocker=True)
         lines = [f"{diag.code}: {diag.message}", f"task_path: {display_path}", "missing:"]
@@ -3247,12 +3376,12 @@ def guard_pre_edit(root: Path, raw_target: Optional[str], *, pre_edit: bool) -> 
 
 def _collect_required_file_diagnostics(root: Path, task_dir: Path) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
-    for filename in FINALIZE_REQUIRED_FILES:
-        path = task_dir / filename
+    for filename, path, legacy, group in _resolved_required_artifacts(task_dir, FINALIZE_REQUIRED_FILE_GROUPS):
         if path.exists():
-            diagnostics.append(make_diagnostic("AIWF-FILE-OK", rel(root, path), filename=filename))
+            label = filename if not legacy else _artifact_group_label(group)
+            diagnostics.append(make_diagnostic("AIWF-FILE-OK", rel(root, path), filename=label))
             continue
-        diagnostics.append(make_diagnostic("AIWF-FILE-001", rel(root, task_dir), blocker=True, filename=filename))
+        diagnostics.append(make_diagnostic("AIWF-FILE-001", rel(root, task_dir), blocker=True, filename=_artifact_group_label(group)))
     return diagnostics
 
 
@@ -3410,8 +3539,7 @@ def _collect_finalized_mutation_warnings(root: Path, task_dir: Path, metadata_pa
 
 def _artifact_manifest(task_dir: Path) -> dict[str, str]:
     manifest: dict[str, str] = {}
-    for filename in FINALIZE_REQUIRED_FILES:
-        path = task_dir / filename
+    for filename, path, _legacy, _group in _resolved_required_artifacts(task_dir, FINALIZE_REQUIRED_FILE_GROUPS):
         if not path.exists():
             continue
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -3579,7 +3707,7 @@ def _collect_path_policy_diagnostics(
                 diagnostics.append(make_diagnostic("AIWF-PATH-015", rel(root, _metadata_path(root, task_dir)), blocker=True))
             else:
                 actual_manifest = _artifact_manifest(task_dir)
-                expected_manifest = {k: v for k, v in manifest.items() if k in FINALIZE_REQUIRED_FILES}
+                expected_manifest = {k: v for k, v in manifest.items() if k in FINALIZE_MANIFEST_FILES}
                 if actual_manifest != expected_manifest:
                     diagnostics.append(make_diagnostic("AIWF-PATH-015", rel(root, _metadata_path(root, task_dir)), blocker=True))
 
@@ -3662,12 +3790,15 @@ def _collect_task_diagnostics(
     if not is_task_specific_dir(task_dir):
         return [make_diagnostic("AIWF-PATH-002", rel(root, task_dir), blocker=True)]
 
-    for filename in ("task_record.md", "self_validation.md", "review_codex.md", "review_final.md"):
-        path = task_dir / filename
+    for filename, path, legacy, group in _resolved_required_artifacts(
+        task_dir,
+        (("task_record.md",), ("self_validation.md",), AGENT_REVIEW_FILES, ("review_final.md",)),
+    ):
         if path.exists():
-            diagnostics.append(make_diagnostic("AIWF-FILE-OK", rel(root, path), filename=filename))
+            label = filename if not legacy else _artifact_group_label(group)
+            diagnostics.append(make_diagnostic("AIWF-FILE-OK", rel(root, path), filename=label))
         else:
-            diagnostics.append(make_diagnostic("AIWF-FILE-001", rel(root, task_dir), blocker=True, filename=filename))
+            diagnostics.append(make_diagnostic("AIWF-FILE-001", rel(root, task_dir), blocker=True, filename=_artifact_group_label(group)))
 
     for filename in ("task.md", "agent.md"):
         path = task_dir / filename
@@ -4084,24 +4215,46 @@ def create_task(
         "agent.md": agent_md(resolved_title),
         "task_record.md": task_record_md(resolved_title),
         "self_validation.md": self_validation_md(resolved_title),
-        "review_codex.md": review_codex_md(resolved_title),
+        "review_agent.md": review_agent_md(resolved_title),
         "review_final.md": review_final_md(resolved_title),
     }
-    results = [write_file(root, task_dir / fn, content, update_existing) for fn, content in files.items()]
+    index_path = ai_day / "index.md"
+    task_dir_existed_before = task_dir.exists()
+    index_existed_before = index_path.exists()
+    index_before_text = index_path.read_text(encoding="utf-8", errors="replace") if index_existed_before else None
+    results: list[WriteResult] = []
     entry = (
         f"- `{task_id}` `{task_dir.name}` | scope: workflow | status: {metadata['status']} "
         f"| priority: {metadata['priority']} | note: created by .aiwf/bin/ai_workflow.py"
     )
-    results.append(append_index(ai_day / "index.md", entry))
-    metadata_payload = load_task_metadata(task_dir)
-    diagnostics = validate_task_metadata(root, task_dir, metadata_payload)
-    blockers = [item for item in diagnostics if item.blocker and item.severity == "error"]
-    print(f"Task directory: {rel(root, task_dir)}")
-    print_results(results, root)
-    if blockers:
-        _print_diagnostics(blockers)
-        return 2
-    return 0
+    try:
+        results = [write_file(root, task_dir / fn, content, update_existing) for fn, content in files.items()]
+        results.append(append_index(index_path, entry))
+        metadata_payload = load_task_metadata(task_dir)
+        diagnostics = validate_task_metadata(root, task_dir, metadata_payload)
+        blockers = [item for item in diagnostics if item.blocker and item.severity == "error"]
+        print(f"Task directory: {rel(root, task_dir)}")
+        print_results(results, root)
+        if blockers:
+            _rollback_failed_task_creation(
+                task_dir=task_dir,
+                task_dir_existed_before=task_dir_existed_before,
+                index_path=index_path,
+                index_existed_before=index_existed_before,
+                index_before_text=index_before_text,
+            )
+            _print_diagnostics(blockers)
+            return 2
+        return 0
+    except BaseException:
+        _rollback_failed_task_creation(
+            task_dir=task_dir,
+            task_dir_existed_before=task_dir_existed_before,
+            index_path=index_path,
+            index_existed_before=index_existed_before,
+            index_before_text=index_before_text,
+        )
+        raise
 
 
 def backfill(root: Path, raw_target: str, date: Optional[str], update_existing: bool, no_decision: bool) -> int:
@@ -4290,7 +4443,7 @@ You are an AI workflow backfill agent.
         "agent.md": agent_md(f"backfill {target_rel}", backfill=True),
         "task_record.md": task_record_md(f"backfill {target_rel}", backfill_path=selected_rel),
         "self_validation.md": self_validation_md(f"backfill {target_rel}"),
-        "review_codex.md": review_codex_md(f"backfill {target_rel}"),
+        "review_agent.md": review_agent_md(f"backfill {target_rel}"),
         "review_final.md": review_final_md(f"backfill {target_rel}"),
     }
     for fn, content in record_files.items():
@@ -4806,7 +4959,7 @@ def _dataset_task_indexes(root: Path, task_dirs: Sequence[Path]) -> dict[str, di
         task_id, _task_name = split_task_dir_name(task_dir)
         if task_id:
             id_index.setdefault(task_id, set()).add(task_rel)
-        for filename in FINALIZE_REQUIRED_FILES:
+        for filename in DATASET_RECORD_REFERENCE_FILES:
             record_rel = f"{task_rel}/{filename}"
             record_index.setdefault(record_rel, set()).add(task_rel)
     return {
@@ -5024,6 +5177,7 @@ def collect_task_dataset_record(
         "has_task_record_artifact": (task_dir / "task_record.md").exists(),
         "has_self_validation_artifact": (task_dir / "self_validation.md").exists(),
         "has_validation_event": event_type_counts.get("validation", 0) > 0,
+        "has_agent_review_artifact": _has_agent_review_artifact(task_dir),
         "has_review_codex_artifact": (task_dir / "review_codex.md").exists(),
         "has_review_final_artifact": (task_dir / "review_final.md").exists(),
         "has_review_event": event_type_counts.get("review", 0) > 0,
@@ -5036,8 +5190,7 @@ def collect_task_dataset_record(
     return {field: record[field] for field in DATASET_ALLOWED_TASK_FIELDS}
 
 
-def collect_dataset_records(root: Path) -> list[dict[str, Any]]:
-    task_dirs = _iter_all_task_dirs(root)
+def collect_dataset_records_for_task_dirs(root: Path, task_dirs: Sequence[Path]) -> list[dict[str, Any]]:
     associated_events, warning_map = _dataset_event_inventory(root, task_dirs)
     records: list[dict[str, Any]] = []
     for task_dir in task_dirs:
@@ -5053,9 +5206,13 @@ def collect_dataset_records(root: Path) -> list[dict[str, Any]]:
     return records
 
 
-def build_dataset_export_payload(root: Path) -> dict[str, Any]:
+def collect_dataset_records(root: Path) -> list[dict[str, Any]]:
+    return collect_dataset_records_for_task_dirs(root, _iter_all_task_dirs(root))
+
+
+def build_dataset_export_payload(root: Path, task_dirs: Optional[Sequence[Path]] = None) -> dict[str, Any]:
     records_root = get_record_root(root)
-    tasks = collect_dataset_records(root)
+    tasks = collect_dataset_records_for_task_dirs(root, task_dirs) if task_dirs is not None else collect_dataset_records(root)
     return {
         "dataset_version": AIWF_DATASET_SCHEMA_VERSION,
         "generated_at": _now_iso_timestamp(),
@@ -5074,6 +5231,1934 @@ def dataset_export_command(root: Path, output: str, output_format: str) -> int:
     payload = build_dataset_export_payload(root)
     result = write_dataset_output(root, target.resolve(), json.dumps(payload, ensure_ascii=False, indent=2))
     print(f"{result.action.upper()}  {rel(root, result.path)}")
+    return 0
+
+
+def _package_records_manifest_output_label(root: Path, path: Path) -> str:
+    try:
+        return rel(root, path)
+    except OSError:
+        return str(path)
+
+
+def _package_records_is_under(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _package_records_parse_date(raw: str, *, field: str) -> str:
+    text = str(raw).strip()
+    if re.fullmatch(r"\d{8}", text):
+        parsed = parse_aiwf_date_arg(text, field=field)
+        return f"{parsed[0:4]}-{parsed[4:6]}-{parsed[6:8]}"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            dt.datetime.strptime(text, "%Y-%m-%d")
+        except ValueError:
+            raise DateValidationError(
+                "AIWF-DATE-003",
+                f"Invalid {field} value: {text}.",
+                "Use a valid calendar date in YYYY-MM-DD format, for example: 2026-06-03.",
+            )
+        return text
+    raise DateValidationError(
+        "AIWF-DATE-002",
+        f"Invalid {field} format: {text}.",
+        "Use YYYY-MM-DD format, for example: 2026-06-03.",
+    )
+
+
+def _package_records_finding(severity: str, code: str, message: str, path: Optional[str] = None) -> dict[str, str]:
+    item = {"severity": severity, "code": code, "message": message}
+    if path:
+        item["path"] = path
+    return item
+
+
+def _package_records_validation_result(findings: Sequence[dict[str, str]]) -> str:
+    if any(item.get("severity") == "error" for item in findings):
+        return "fail"
+    if any(item.get("severity") == "warn" for item in findings):
+        return "warn"
+    return "pass"
+
+
+def _package_records_status(result: str, **fields: Any) -> dict[str, Any]:
+    item: dict[str, Any] = {"result": result}
+    item.update(fields)
+    return item
+
+
+def _package_records_validation_status(findings: Sequence[dict[str, str]]) -> dict[str, Any]:
+    workflow_result = _package_records_validation_result(findings)
+    finding_count = len(findings)
+    return {
+        # Backward-compatible workflow evidence summary.
+        "result": workflow_result,
+        "finding_count": finding_count,
+        "findings": list(findings),
+        "scope": "workflow_evidence",
+        "package_generation": _package_records_status("pass"),
+        "manifest_schema": _package_records_status("pass"),
+        "package_integrity": _package_records_status("pass"),
+        "privacy_security": _package_records_status("pass"),
+        "workflow_evidence": _package_records_status(workflow_result, finding_count=finding_count),
+    }
+
+
+def _package_records_result_label(result: Any) -> str:
+    return {
+        "pass": "PASS",
+        "warn": "WARNING",
+        "fail": "FAIL",
+    }.get(str(result), "UNKNOWN")
+
+
+def _package_records_package_path(records_root: Path, task_dir: Path) -> str:
+    rel_to_records = task_dir.resolve().relative_to(records_root.resolve()).as_posix()
+    return f"records/{rel_to_records}"
+
+
+def _package_records_discover_tasks(root: Path) -> tuple[list[PackageRecordsTaskCandidate], list[dict[str, str]], list[dict[str, str]]]:
+    records_root = get_record_root(root)
+    candidates: list[PackageRecordsTaskCandidate] = []
+    excluded: list[dict[str, str]] = []
+    findings: list[dict[str, str]] = []
+
+    if not records_root.exists():
+        findings.append(
+            _package_records_finding(
+                "warn",
+                "AIWF-PACKAGE-RECORDS-NO-RECORDS-ROOT",
+                f"Records root does not exist: {rel(root, records_root)}.",
+            )
+        )
+        return candidates, excluded, findings
+
+    for day_dir in sorted(records_root.iterdir(), key=lambda item: item.name):
+        source_path = rel(root, day_dir)
+        if not day_dir.is_dir():
+            continue
+        match = AI_DATE_RE.match(day_dir.name)
+        if not match:
+            excluded.append({"source_path": source_path, "reason": "invalid_date_dir"})
+            continue
+        task_date = f"{match.group(1)[0:4]}-{match.group(1)[4:6]}-{match.group(1)[6:8]}"
+        for task_dir in sorted(day_dir.iterdir(), key=lambda item: item.name):
+            task_source_path = rel(root, task_dir)
+            if not task_dir.is_dir():
+                continue
+            if not TASK_DIR_RE.match(task_dir.name):
+                excluded.append({"source_path": task_source_path, "reason": "invalid_task_dir"})
+                continue
+            task_id, task_name = split_task_dir_name(task_dir)
+            package_path = _package_records_package_path(records_root, task_dir)
+            metadata_info = load_task_metadata(task_dir)
+            front = metadata_info.get("metadata", {})
+            metadata = front if isinstance(front, dict) else {}
+            diagnostics = validate_task_metadata(root, task_dir, metadata_info)
+            metadata_valid = bool(metadata) and not any(item.severity == "error" for item in diagnostics)
+            for diagnostic in diagnostics:
+                if diagnostic.code == "AIWF-META-OK":
+                    continue
+                findings.append(
+                    _package_records_finding(
+                        diagnostic.severity,
+                        diagnostic.code,
+                        diagnostic.message,
+                        f"{package_path}/task.md",
+                    )
+                )
+            task_md_missing = not (task_dir / "task.md").exists()
+            if task_md_missing:
+                findings.append(
+                    _package_records_finding(
+                        "warn",
+                        "AIWF-PACKAGE-RECORDS-MISSING-TASK-MD",
+                        "Task directory is missing task.md; task remains discoverable but metadata filters may not match.",
+                        f"{package_path}/task.md",
+                    )
+                )
+            candidates.append(
+                PackageRecordsTaskCandidate(
+                    path=task_dir,
+                    source_path=task_source_path,
+                    package_path=package_path,
+                    date=task_date,
+                    task_id=task_id or "",
+                    task_name=task_name or "",
+                    metadata=metadata,
+                    metadata_valid=metadata_valid,
+                    task_md_missing=task_md_missing,
+                )
+            )
+
+    return candidates, excluded, findings
+
+
+def _package_records_metadata_filter_value(candidate: PackageRecordsTaskCandidate, field_name: str) -> str:
+    value = candidate.metadata.get(field_name)
+    return value if isinstance(value, str) else ""
+
+
+def _package_records_matches_date(
+    candidate: PackageRecordsTaskCandidate,
+    *,
+    from_date: Optional[str],
+    to_date: Optional[str],
+    dates: set[str],
+) -> bool:
+    if dates and candidate.date not in dates:
+        return False
+    if from_date and candidate.date < from_date:
+        return False
+    if to_date and candidate.date > to_date:
+        return False
+    return True
+
+
+def _package_records_normalize_task_path_selector(root: Path, raw: str) -> Optional[str]:
+    text = raw.strip()
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        try:
+            return path.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            return None
+    rel_text = text.replace("\\", "/").rstrip("/")
+    while rel_text.startswith("./"):
+        rel_text = rel_text[2:]
+    if not rel_text or rel_text in {".", ".."} or rel_text.startswith("../") or "/../" in f"/{rel_text}/":
+        return None
+    return rel_text
+
+
+def _package_records_resolve_task_selectors(
+    root: Path,
+    candidates: Sequence[PackageRecordsTaskCandidate],
+    task_selectors: Sequence[str],
+    *,
+    from_date: Optional[str],
+    to_date: Optional[str],
+    dates: set[str],
+) -> tuple[Optional[set[str]], Optional[str]]:
+    if not task_selectors:
+        return None, None
+
+    date_scoped = [
+        candidate
+        for candidate in candidates
+        if _package_records_matches_date(candidate, from_date=from_date, to_date=to_date, dates=dates)
+    ]
+    selected_paths: set[str] = set()
+    for raw in task_selectors:
+        text = raw.strip()
+        if not text:
+            return None, "empty --task selector"
+        if TASK_ID_VALUE_RE.match(text):
+            matches = [candidate for candidate in date_scoped if candidate.task_id == text]
+            if len(matches) != 1:
+                return None, f"ambiguous task id selector: {text}"
+            selected_paths.add(matches[0].source_path)
+            continue
+        task_path = _package_records_normalize_task_path_selector(root, text)
+        if task_path is None:
+            return None, f"invalid task path selector: {text}"
+        matches = [candidate for candidate in date_scoped if candidate.source_path == task_path]
+        if len(matches) != 1:
+            return None, f"task path selector did not match exactly one task: {text}"
+        selected_paths.add(matches[0].source_path)
+
+    return selected_paths, None
+
+
+def _package_records_candidate_exclusion_reason(
+    candidate: PackageRecordsTaskCandidate,
+    *,
+    from_date: Optional[str],
+    to_date: Optional[str],
+    dates: set[str],
+    selected_task_paths: Optional[set[str]],
+    statuses: set[str],
+    workflow_phases: set[str],
+    review_statuses: set[str],
+    projects: set[str],
+    tags: set[str],
+) -> Optional[str]:
+    if not _package_records_matches_date(candidate, from_date=from_date, to_date=to_date, dates=dates):
+        return "filtered_by_date"
+    if selected_task_paths is not None and candidate.source_path not in selected_task_paths:
+        return "filtered_by_task"
+    if statuses and _package_records_metadata_filter_value(candidate, "status") not in statuses:
+        return "filtered_by_status"
+    if workflow_phases and _package_records_metadata_filter_value(candidate, "workflow_phase") not in workflow_phases:
+        return "filtered_by_workflow_phase"
+    if review_statuses and _package_records_metadata_filter_value(candidate, "review_status") not in review_statuses:
+        return "filtered_by_review_status"
+    if projects and _package_records_metadata_filter_value(candidate, "project") not in projects:
+        return "filtered_by_project"
+    if tags:
+        raw_tags = candidate.metadata.get("tags")
+        task_tags = set(raw_tags) if isinstance(raw_tags, list) and all(isinstance(item, str) for item in raw_tags) else set()
+        if not task_tags.intersection(tags):
+            return "filtered_by_tag"
+    return None
+
+
+def _package_records_task_entry(candidate: PackageRecordsTaskCandidate) -> dict[str, str]:
+    entry = {
+        "task_id": candidate.task_id,
+        "task_name": candidate.task_name,
+        "source_path": candidate.source_path,
+        "package_path": candidate.package_path,
+    }
+    for field_name in ("status", "workflow_phase", "review_status"):
+        value = candidate.metadata.get(field_name)
+        if isinstance(value, str):
+            entry[field_name] = value
+    return entry
+
+
+def _package_records_select_tasks(
+    root: Path,
+    *,
+    from_date: Optional[str],
+    to_date: Optional[str],
+    dates: set[str],
+    task_selectors: Sequence[str],
+    statuses: set[str],
+    workflow_phases: set[str],
+    review_statuses: set[str],
+    projects: set[str],
+    tags: set[str],
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]], Optional[str]]:
+    candidates, excluded, findings = _package_records_discover_tasks(root)
+    selected_task_paths, selector_error = _package_records_resolve_task_selectors(
+        root,
+        candidates,
+        task_selectors,
+        from_date=from_date,
+        to_date=to_date,
+        dates=dates,
+    )
+    if selector_error:
+        return [], excluded, findings, selector_error
+
+    selected: list[dict[str, str]] = []
+    for candidate in candidates:
+        reason = _package_records_candidate_exclusion_reason(
+            candidate,
+            from_date=from_date,
+            to_date=to_date,
+            dates=dates,
+            selected_task_paths=selected_task_paths,
+            statuses=statuses,
+            workflow_phases=workflow_phases,
+            review_statuses=review_statuses,
+            projects=projects,
+            tags=tags,
+        )
+        if reason:
+            excluded.append({"source_path": candidate.source_path, "reason": reason})
+        else:
+            selected.append(_package_records_task_entry(candidate))
+
+    selected.sort(key=lambda item: (item.get("source_path", ""), item.get("task_id", ""), item.get("task_name", "")))
+    excluded = sorted(excluded, key=lambda item: (item.get("source_path", ""), item.get("reason", "")))
+    return selected, excluded, findings, None
+
+
+def _package_records_git_output(root: Path, args: Sequence[str]) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _package_records_repository_metadata(root: Path) -> dict[str, Any]:
+    inside = _package_records_git_output(root, ["rev-parse", "--is-inside-work-tree"])
+    if inside != "true":
+        return {
+            "git_available": False,
+            "dirty_tree": False,
+            "privacy_profile_applied": True,
+        }
+
+    status = _package_records_git_output(root, ["status", "--porcelain=v1"])
+    commit = _package_records_git_output(root, ["rev-parse", "HEAD"])
+    branch = _package_records_git_output(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+    metadata: dict[str, Any] = {
+        "git_available": True,
+        "dirty_tree": bool(status),
+        "privacy_profile_applied": True,
+    }
+    if commit:
+        metadata["commit"] = commit
+    if branch:
+        metadata["branch"] = branch
+    return metadata
+
+
+def _package_records_artifact_class(filename: str) -> str:
+    if filename in {"task.md", "agent.md"}:
+        return "task_content"
+    if filename in AGENT_REVIEW_FILES:
+        return "agent_review"
+    return "workflow_evidence"
+
+
+def _package_records_apply_redactions(text: str, profile: str) -> tuple[str, bool]:
+    if profile != "safe":
+        return text, False
+    redacted = text
+    changed = False
+    for rule, pattern in _package_records_redaction_rule_patterns():
+        replacement = f"[AIWF-REDACTED:{rule}]"
+        redacted, count = re.subn(pattern, replacement, redacted)
+        if count:
+            changed = True
+    return redacted, changed
+
+
+def _package_records_artifact_bytes(path: Path, redaction_profile: str) -> tuple[bytes, str]:
+    if path.is_symlink():
+        return os.readlink(path).encode("utf-8"), "none"
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw, "none"
+    redacted, changed = _package_records_apply_redactions(text, redaction_profile)
+    if not changed:
+        return raw, "none"
+    return redacted.encode("utf-8"), "redacted"
+
+
+def _package_records_build_artifact_inventory(
+    root: Path,
+    selected_tasks: Sequence[dict[str, str]],
+    *,
+    redaction_profile: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    included: list[dict[str, Any]] = []
+    excluded: list[dict[str, str]] = []
+
+    for task in stable_sort(selected_tasks, key=lambda item: item.get("package_path", "")):
+        source_path = task.get("source_path", "")
+        package_path = task.get("package_path", "")
+        if not source_path or not package_path:
+            continue
+        task_dir = (root / source_path).resolve()
+        package_task_path = normalize_package_path(package_path)
+        for filename, source, _legacy, group in _resolved_required_artifacts(task_dir, PRE_EDIT_REQUIRED_FILE_GROUPS):
+            source = task_dir / filename
+            artifact_source_path = rel(root, source)
+            if not source.exists() and not source.is_symlink():
+                excluded.append({"source_path": artifact_source_path, "reason": "missing_task_artifact"})
+                continue
+            if not source.is_file() and not source.is_symlink():
+                excluded.append({"source_path": artifact_source_path, "reason": "non_file_task_artifact"})
+                continue
+            artifact_package_path = normalize_package_path(f"{package_task_path}/{filename}")
+            content, redaction = _package_records_artifact_bytes(source, redaction_profile)
+            included.append(
+                {
+                    "source_path": artifact_source_path,
+                    "package_path": artifact_package_path,
+                    "artifact_class": _package_records_artifact_class(filename),
+                    "bytes": len(content),
+                    "mode": git_mode(source),
+                    "sha256": sha256_bytes(content),
+                    "redaction": redaction,
+                }
+            )
+            if tuple(group) == AGENT_REVIEW_FILES and filename == AGENT_REVIEW_CANONICAL_FILE:
+                legacy_source = task_dir / AGENT_REVIEW_LEGACY_FILE
+                if legacy_source.exists() or legacy_source.is_symlink():
+                    excluded.append(
+                        {
+                            "source_path": rel(root, legacy_source),
+                            "reason": "legacy_duplicate_agent_review_alias",
+                        }
+                    )
+
+    included = stable_sort(included, key=lambda item: item.get("package_path", ""))
+    excluded = stable_sort(excluded, key=lambda item: (item.get("source_path", ""), item.get("reason", "")))
+    return included, excluded
+
+
+def _package_records_package_tree_manifest_rows(included_artifacts: Sequence[dict[str, Any]]) -> list[tuple[str, str, int, str]]:
+    rows = []
+    for artifact in stable_sort(included_artifacts, key=lambda item: item.get("package_path", "")):
+        row = build_manifest_row(
+            sha256=str(artifact["sha256"]),
+            git_mode=str(artifact.get("mode", "100644")),
+            size=int(artifact["bytes"]),
+            package_relative_path=str(artifact["package_path"]),
+        )
+        rows.append((row.sha256, row.git_mode, row.size, row.package_relative_path))
+    return rows
+
+
+def _package_records_package_tree_manifest_tsv(included_artifacts: Sequence[dict[str, Any]]) -> str:
+    rows = []
+    for sha256, mode, size, package_path in _package_records_package_tree_manifest_rows(included_artifacts):
+        rows.append(build_manifest_row(sha256=sha256, git_mode=mode, size=size, package_relative_path=package_path))
+    return "".join(manifest_row_tsv(row) for row in rows)
+
+
+def _package_records_identity(included_artifacts: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    tree_manifest = _package_records_package_tree_manifest_tsv(included_artifacts)
+    return {
+        "hash_policy": AIWF_PACKAGE_RECORDS_HASH_POLICY,
+        "reproducible_evidence_sha256": sha256_bytes(tree_manifest.encode("utf-8")),
+        "content_file_count": len(included_artifacts),
+        "content_total_bytes": sum(int(item.get("bytes", 0)) for item in included_artifacts),
+        "excluded_identity_fields": [
+            "generated_at_utc",
+            "repository.git_available",
+            "repository.dirty_tree",
+            "repository.commit",
+            "repository.branch",
+            "host_platform",
+            "runtime_duration",
+            "archive_timestamp",
+            "temporary_paths",
+        ],
+    }
+
+
+def _package_records_dataset_metadata(
+    root: Path,
+    selected_tasks: Sequence[dict[str, str]],
+    *,
+    include_dataset: bool,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    if not include_dataset:
+        return {"included": False, "warning_count": 0}, []
+
+    task_dirs = [(root / task["source_path"]).resolve() for task in selected_tasks if task.get("source_path")]
+    payload = build_dataset_export_payload(root, task_dirs=task_dirs)
+    warnings: list[dict[str, str]] = []
+    findings: list[dict[str, str]] = []
+    for task in payload.get("tasks", []):
+        if not isinstance(task, Mapping):
+            continue
+        task_id = task.get("task_id")
+        task_label = f"task {task_id}" if isinstance(task_id, str) and task_id else "a selected task"
+        task_warnings = task.get("export_warnings")
+        if not isinstance(task_warnings, list):
+            continue
+        for warning in task_warnings:
+            if not isinstance(warning, Mapping):
+                continue
+            code = warning.get("code")
+            message = warning.get("message")
+            if not isinstance(code, str) or not isinstance(message, str):
+                continue
+            warning_item = {"code": code, "message": message}
+            warnings.append(warning_item)
+            findings.append(
+                _package_records_finding(
+                    "warn",
+                    "AIWF-PACKAGE-RECORDS-DATASET-WARNING",
+                    f"{task_label}: {code}: {message}",
+                    AIWF_PACKAGE_RECORDS_DATASET_PATH,
+                )
+            )
+
+    return (
+        {
+            "included": True,
+            "schema_version": str(payload.get("dataset_version", AIWF_DATASET_SCHEMA_VERSION)),
+            "path": AIWF_PACKAGE_RECORDS_DATASET_PATH,
+            "warning_count": len(warnings),
+        },
+        stable_sort(findings, key=lambda item: (item.get("message", ""), item.get("path", ""))),
+    )
+
+
+def _package_records_read_artifact_text(root: Path, artifact: Mapping[str, Any]) -> str:
+    source_path = artifact.get("source_path")
+    if not isinstance(source_path, str) or not source_path:
+        return ""
+    source = (root / source_path).resolve()
+    if source.is_symlink():
+        return os.readlink(source)
+    if not source.is_file():
+        return ""
+    return source.read_text(encoding="utf-8", errors="replace")
+
+
+def _package_records_secret_rules(text: str) -> list[tuple[str, int]]:
+    rules = [
+        ("private_key", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+        ("bearer_token", r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+        (
+            "access_token",
+            r"(?i)\b(?:access[_-]?token|auth[_-]?token|api[_-]?key|secret[_-]?key|credential)\b\s*[:=]\s*['\"]?[A-Za-z0-9][A-Za-z0-9_._~+/=-]{7,}",
+        ),
+        ("password", r"(?i)\b(?:password|passwd|pwd)\b\s*[:=]\s*['\"]?[^'\"\s]{4,}"),
+    ]
+    matches: list[tuple[str, int]] = []
+    for rule, pattern in rules:
+        count = len(list(re.finditer(pattern, text)))
+        if count:
+            matches.append((rule, count))
+    return matches
+
+
+def _package_records_redaction_rule_patterns() -> list[tuple[str, str]]:
+    users_root = r"/Users" + r"/[A-Za-z0-9._-]+(?:/[^\s'\"<>)]*)?"
+    home_root = r"/home" + r"/[A-Za-z0-9._-]+(?:/[^\s'\"<>)]*)?"
+    private_tmp_root = r"/private" + r"/tmp/[^\s'\"<>)]*"
+    windows_users_root = r"[A-Za-z]:\\Users\\[A-Za-z0-9._-]+(?:\\[^\s'\"<>)]*)?"
+    return [
+        (
+            "internal_url",
+            r"(?i)https?://(?:localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|[a-z0-9.-]+\.(?:local|lan|internal|corp))(?:[^\s'\"<>)]*)?",
+        ),
+        (
+            "absolute_path",
+            rf"(?:{users_root}|{home_root}|{private_tmp_root}|{windows_users_root})",
+        ),
+        (
+            "private_ip",
+            r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})\b",
+        ),
+        ("hostname", r"(?i)\b(?:localhost|[a-z0-9][a-z0-9-]*\.(?:local|lan|internal|corp))\b"),
+    ]
+
+
+def _package_records_redaction_rules(text: str) -> list[tuple[str, int]]:
+    rules = _package_records_redaction_rule_patterns()
+    matches: list[tuple[str, int]] = []
+    for rule, pattern in rules:
+        count = len(list(re.finditer(pattern, text)))
+        if count:
+            matches.append((rule, count))
+    return matches
+
+
+def _package_records_prohibited_artifact_reason(path: Path) -> Optional[str]:
+    name = path.name.lower()
+    suffixes = tuple(suffix.lower() for suffix in path.suffixes)
+    if name in {".env", ".netrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}:
+        return "prohibited_secret_path"
+    if suffixes and suffixes[-1] in {".pem", ".key", ".p12", ".pfx"}:
+        return "prohibited_secret_path"
+    return None
+
+
+def _package_records_detect_prohibited_artifacts(
+    root: Path,
+    selected_tasks: Sequence[dict[str, str]],
+    included_artifacts: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    included_sources = {
+        artifact.get("source_path")
+        for artifact in included_artifacts
+        if isinstance(artifact.get("source_path"), str)
+    }
+    excluded: list[dict[str, str]] = []
+    findings: list[dict[str, str]] = []
+    for task in selected_tasks:
+        source_path = task.get("source_path")
+        if not source_path:
+            continue
+        task_dir = (root / source_path).resolve()
+        if not task_dir.exists():
+            continue
+        for path in sorted((item for item in task_dir.rglob("*") if item.is_file() or item.is_symlink()), key=lambda item: rel(root, item)):
+            source_rel = rel(root, path)
+            if source_rel in included_sources:
+                continue
+            reason = _package_records_prohibited_artifact_reason(path)
+            if not reason:
+                continue
+            excluded.append({"source_path": source_rel, "reason": reason})
+            findings.append(
+                _package_records_finding(
+                    "warn",
+                    "AIWF-PACKAGE-RECORDS-PROHIBITED-ARTIFACT",
+                    f"Prohibited artifact path was excluded: {source_rel}.",
+                )
+            )
+    return (
+        stable_sort(excluded, key=lambda item: (item.get("source_path", ""), item.get("reason", ""))),
+        stable_sort(findings, key=lambda item: (item.get("message", ""), item.get("path", ""))),
+    )
+
+
+def _package_records_redaction_summary(
+    root: Path,
+    *,
+    profile: str,
+    included_artifacts: Sequence[dict[str, Any]],
+    selected_tasks: Sequence[dict[str, str]],
+) -> tuple[dict[str, Any], list[dict[str, str]], list[dict[str, str]]]:
+    redaction_report: list[dict[str, Any]] = []
+    findings: list[dict[str, str]] = []
+
+    for artifact in stable_sort(included_artifacts, key=lambda item: item.get("package_path", "")):
+        source_path = str(artifact.get("source_path", ""))
+        package_path = str(artifact.get("package_path", ""))
+        text = _package_records_read_artifact_text(root, artifact)
+        for rule, count in _package_records_secret_rules(text):
+            findings.append(
+                _package_records_finding(
+                    "error",
+                    "AIWF-PACKAGE-RECORDS-SECRET-DETECTED",
+                    f"Detected {rule} in {source_path}; package records fails closed.",
+                    package_path,
+                )
+            )
+
+        if profile == "safe":
+            for rule, count in _package_records_redaction_rules(text):
+                redaction_report.append(
+                    {
+                        "source_path": source_path,
+                        "package_path": package_path,
+                        "rule": rule,
+                        "action": "would_redact",
+                        "count": count,
+                    }
+                )
+
+    excluded_artifacts, exclusion_findings = _package_records_detect_prohibited_artifacts(root, selected_tasks, included_artifacts)
+    findings.extend(exclusion_findings)
+    redaction_report = stable_sort(
+        redaction_report,
+        key=lambda item: (str(item.get("package_path", "")), str(item.get("rule", ""))),
+    )
+    redaction_count = sum(int(item.get("count", 0)) for item in redaction_report)
+    summary = {
+        "profile": profile,
+        "redaction_count": redaction_count,
+        "excluded_artifact_count": len(excluded_artifacts),
+        "secret_finding_count": sum(1 for item in findings if item.get("code") == "AIWF-PACKAGE-RECORDS-SECRET-DETECTED"),
+        "redaction_report": redaction_report,
+        "exclusion_report": excluded_artifacts,
+    }
+    return (
+        summary,
+        stable_sort(findings, key=lambda item: (item.get("severity", ""), item.get("code", ""), item.get("message", ""), item.get("path", ""))),
+        excluded_artifacts,
+    )
+
+
+def _package_records_event_field(event: Mapping[str, Any], field_name: str) -> Any:
+    if field_name in event:
+        return event.get(field_name)
+    payload = event.get("payload")
+    if isinstance(payload, Mapping) and field_name in payload:
+        return payload.get(field_name)
+    return None
+
+
+def _package_records_jsonl_rows(path: Path) -> tuple[list[dict[str, Any]], list[int]]:
+    if not path.exists():
+        return [], []
+    events: list[dict[str, Any]] = []
+    malformed_lines: list[int] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            item = json.loads(raw)
+        except json.JSONDecodeError:
+            malformed_lines.append(line_number)
+            continue
+        if isinstance(item, dict):
+            events.append({"event": item, "source_line": line_number})
+        else:
+            malformed_lines.append(line_number)
+    return events, malformed_lines
+
+
+def _package_records_selected_task_indexes(selected_tasks: Sequence[dict[str, str]]) -> dict[str, Any]:
+    path_index: dict[str, dict[str, str]] = {}
+    id_index: dict[str, list[dict[str, str]]] = {}
+    for task in selected_tasks:
+        source_path = task.get("source_path")
+        task_id = task.get("task_id")
+        if source_path:
+            path_index[source_path] = task
+        if task_id:
+            id_index.setdefault(task_id, []).append(task)
+    return {"path": path_index, "id": id_index}
+
+
+def _package_records_normalize_event_task_path(root: Path, value: Any) -> Optional[str]:
+    normalized = _normalize_repo_relative_path(root, value)
+    return normalized.replace("\\", "/") if normalized else None
+
+
+def _package_records_associate_global_event(
+    root: Path,
+    event: Mapping[str, Any],
+    indexes: Mapping[str, Any],
+) -> tuple[Optional[str], Optional[dict[str, str]]]:
+    path_index: Mapping[str, dict[str, str]] = indexes.get("path", {})
+    id_index: Mapping[str, list[dict[str, str]]] = indexes.get("id", {})
+
+    task_path_value = _package_records_event_field(event, "task_path")
+    if task_path_value is not None:
+        task_path = _package_records_normalize_event_task_path(root, task_path_value)
+        if task_path is not None and task_path in path_index:
+            return task_path, None
+        return None, None
+
+    task_id_value = _package_records_event_field(event, "task_id")
+    if task_id_value is not None:
+        task_id = str(task_id_value).strip()
+        matches = id_index.get(task_id, [])
+        if len(matches) == 1:
+            return matches[0].get("source_path"), None
+        if len(matches) > 1:
+            return None, _package_records_finding(
+                "warn",
+                "AIWF-PACKAGE-RECORDS-AMBIGUOUS-EVENT-TASK-ID",
+                f"Global event task_id is ambiguous within selected tasks: {task_id}.",
+            )
+        return None, None
+
+    task_dir_value = _package_records_event_field(event, "task_dir")
+    if task_dir_value is not None:
+        task_path = _package_records_normalize_event_task_path(root, task_dir_value)
+        if task_path is not None and task_path in path_index:
+            return task_path, None
+        return None, None
+
+    record_path_value = _package_records_event_field(event, "record_path")
+    if record_path_value is not None:
+        record_path = _package_records_normalize_event_task_path(root, record_path_value)
+        if record_path is None:
+            return None, None
+        matches = [task_path for task_path in path_index if record_path == task_path or record_path.startswith(f"{task_path}/")]
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            return None, _package_records_finding(
+                "warn",
+                "AIWF-PACKAGE-RECORDS-AMBIGUOUS-EVENT-LEGACY-MAPPING",
+                f"Global event legacy record_path is ambiguous: {record_path}.",
+            )
+    return None, None
+
+
+def _package_records_parse_event_timestamp(event: Mapping[str, Any]) -> Optional[dt.datetime]:
+    value = event.get("timestamp")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _package_records_canonical_event_sort_key(item: Mapping[str, Any]) -> tuple[int, str, str, int]:
+    parsed = item.get("parsed_timestamp")
+    if isinstance(parsed, dt.datetime):
+        return (0, parsed.isoformat(), str(item.get("source_path", "")), int(item.get("source_line", 0)))
+    return (1, "", str(item.get("source_path", "")), int(item.get("source_line", 0)))
+
+
+def _package_records_event_plan(
+    root: Path,
+    selected_tasks: Sequence[dict[str, str]],
+    *,
+    include_global_events: bool,
+) -> tuple[dict[str, Any], list[dict[str, str]], list[dict[str, Any]]]:
+    findings: list[dict[str, str]] = []
+    sources: list[dict[str, Any]] = []
+    canonical_events: list[dict[str, Any]] = []
+    task_local_count = 0
+    global_count = 0
+    malformed_count = 0
+    unassociated_count = 0
+    selected_indexes = _package_records_selected_task_indexes(selected_tasks)
+
+    for task in stable_sort(selected_tasks, key=lambda item: item.get("source_path", "")):
+        source_path = task.get("source_path")
+        if not source_path:
+            continue
+        event_path = root / source_path / ".aiwf" / "events.jsonl"
+        if not event_path.exists():
+            continue
+        source_rel = rel(root, event_path)
+        rows, malformed_lines = _package_records_jsonl_rows(event_path)
+        task_local_count += len(rows)
+        malformed_count += len(malformed_lines)
+        sources.append(
+            {
+                "source_path": source_rel,
+                "event_count": len(rows),
+                "malformed_count": len(malformed_lines),
+            }
+        )
+        for line_number in malformed_lines:
+            findings.append(
+                _package_records_finding(
+                    "warn",
+                    "AIWF-PACKAGE-RECORDS-MALFORMED-EVENT",
+                    f"Malformed task-local event JSON at line {line_number}.",
+                    source_rel,
+                )
+            )
+        for row in rows:
+            event = row["event"]
+            line_number = int(row["source_line"])
+            parsed_timestamp = _package_records_parse_event_timestamp(event)
+            if parsed_timestamp is None:
+                findings.append(
+                    _package_records_finding(
+                        "warn",
+                        "AIWF-PACKAGE-RECORDS-INVALID-EVENT-TIMESTAMP",
+                        f"Task-local event timestamp is missing or invalid at line {line_number}.",
+                        source_rel,
+                    )
+                )
+            referenced_path = _package_records_event_field(event, "task_path")
+            normalized_path = _package_records_normalize_event_task_path(root, referenced_path) if referenced_path is not None else None
+            if normalized_path is not None and normalized_path not in selected_indexes["path"]:
+                findings.append(
+                    _package_records_finding(
+                        "warn",
+                        "AIWF-PACKAGE-RECORDS-EVENT-TASK-REFERENCE",
+                        f"Task-local event references a task outside the selected set at line {line_number}: {normalized_path}.",
+                        source_rel,
+                    )
+                )
+            task_id_value = _package_records_event_field(event, "task_id")
+            if task_id_value is not None and str(task_id_value).strip() not in selected_indexes["id"]:
+                findings.append(
+                    _package_records_finding(
+                        "warn",
+                        "AIWF-PACKAGE-RECORDS-EVENT-TASK-REFERENCE",
+                        f"Task-local event references a task_id outside the selected set at line {line_number}: {task_id_value}.",
+                        source_rel,
+                    )
+                )
+            canonical_events.append(
+                {
+                    "event": event,
+                    "source_path": source_rel,
+                    "source_line": line_number,
+                    "parsed_timestamp": parsed_timestamp,
+                }
+            )
+
+    if include_global_events:
+        global_path = get_event_log_path(root)
+        if global_path.exists():
+            source_rel = rel(root, global_path)
+            rows, malformed_lines = _package_records_jsonl_rows(global_path)
+            associated_count = 0
+            malformed_count += len(malformed_lines)
+            for line_number in malformed_lines:
+                findings.append(
+                    _package_records_finding(
+                        "warn",
+                        "AIWF-PACKAGE-RECORDS-MALFORMED-EVENT",
+                        f"Malformed global event JSON at line {line_number}.",
+                        source_rel,
+                    )
+                )
+            for row in rows:
+                event = row["event"]
+                line_number = int(row["source_line"])
+                task_path, association_finding = _package_records_associate_global_event(root, event, selected_indexes)
+                if association_finding is not None:
+                    association_finding["path"] = source_rel
+                    association_finding["message"] = f"{association_finding['message']} Line {line_number}."
+                    findings.append(association_finding)
+                    unassociated_count += 1
+                    continue
+                if task_path is None:
+                    unassociated_count += 1
+                    findings.append(
+                        _package_records_finding(
+                            "warn",
+                            "AIWF-PACKAGE-RECORDS-UNASSOCIATED-EVENT",
+                            f"Global event was not deterministically associated at line {line_number}.",
+                            source_rel,
+                        )
+                    )
+                    continue
+                parsed_timestamp = _package_records_parse_event_timestamp(event)
+                if parsed_timestamp is None:
+                    findings.append(
+                        _package_records_finding(
+                            "warn",
+                            "AIWF-PACKAGE-RECORDS-INVALID-EVENT-TIMESTAMP",
+                            f"Global event timestamp is missing or invalid at line {line_number}.",
+                            source_rel,
+                        )
+                    )
+                associated_count += 1
+                global_count += 1
+                canonical_events.append(
+                    {
+                        "event": event,
+                        "source_path": source_rel,
+                        "source_line": line_number,
+                        "parsed_timestamp": parsed_timestamp,
+                    }
+                )
+            sources.append(
+                {
+                    "source_path": source_rel,
+                    "event_count": associated_count,
+                    "malformed_count": len(malformed_lines),
+                }
+            )
+
+    canonical_events = stable_sort(canonical_events, key=_package_records_canonical_event_sort_key)
+    event_summary = {
+        "task_local_event_count": task_local_count,
+        "global_event_count": global_count,
+        "canonical_event_count": len(canonical_events),
+        "malformed_event_count": malformed_count,
+        "unassociated_event_count": unassociated_count,
+        "sources": stable_sort(sources, key=lambda item: item.get("source_path", "")),
+    }
+    findings = stable_sort(findings, key=lambda item: (item.get("path", ""), item.get("code", ""), item.get("message", "")))
+    return event_summary, findings, canonical_events
+
+
+def _package_records_event_summary(
+    root: Path,
+    selected_tasks: Sequence[dict[str, str]],
+    *,
+    include_global_events: bool,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    event_summary, findings, _canonical_events = _package_records_event_plan(
+        root,
+        selected_tasks,
+        include_global_events=include_global_events,
+    )
+    return event_summary, findings
+
+
+def _package_records_selected_task_dirs(root: Path, selected_tasks: Sequence[dict[str, str]]) -> list[Path]:
+    return [(root / task["source_path"]).resolve() for task in selected_tasks if task.get("source_path")]
+
+
+def _package_records_csv(rows: Sequence[Sequence[object]]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    for row in rows:
+        writer.writerow([str(value) for value in row])
+    return output.getvalue()
+
+
+def _package_records_task_inventory_csv(selected_tasks: Sequence[dict[str, str]]) -> str:
+    rows: list[list[object]] = [["task_id", "task_name", "source_path", "package_path", "status", "workflow_phase", "review_status"]]
+    for task in stable_sort(selected_tasks, key=lambda item: item.get("package_path", "")):
+        rows.append(
+            [
+                task.get("task_id", ""),
+                task.get("task_name", ""),
+                task.get("source_path", ""),
+                task.get("package_path", ""),
+                task.get("status", ""),
+                task.get("workflow_phase", ""),
+                task.get("review_status", ""),
+            ]
+        )
+    return _package_records_csv(rows)
+
+
+def _package_records_event_inventory_csv(canonical_events: Sequence[dict[str, Any]]) -> str:
+    rows: list[list[object]] = [["source_path", "source_line", "event_name", "timestamp"]]
+    for item in stable_sort(canonical_events, key=_package_records_canonical_event_sort_key):
+        event = item.get("event")
+        event_mapping = event if isinstance(event, Mapping) else {}
+        timestamp = event_mapping.get("timestamp") if isinstance(event_mapping.get("timestamp"), str) else ""
+        rows.append(
+            [
+                item.get("source_path", ""),
+                item.get("source_line", ""),
+                _dataset_event_name(dict(event_mapping)),
+                timestamp,
+            ]
+        )
+    return _package_records_csv(rows)
+
+
+def _package_records_artifact_inventory_tsv(included_artifacts: Sequence[dict[str, Any]]) -> str:
+    rows: list[list[object]] = [["source_path", "package_path", "artifact_class", "bytes", "sha256", "mode", "redaction"]]
+    for artifact in stable_sort(included_artifacts, key=lambda item: item.get("package_path", "")):
+        rows.append(
+            [
+                artifact.get("source_path", ""),
+                artifact.get("package_path", ""),
+                artifact.get("artifact_class", ""),
+                artifact.get("bytes", 0),
+                artifact.get("sha256", ""),
+                artifact.get("mode", ""),
+                artifact.get("redaction", ""),
+            ]
+        )
+    return stable_tsv_dump(rows)
+
+
+def _package_records_canonical_events_jsonl(canonical_events: Sequence[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for item in stable_sort(canonical_events, key=_package_records_canonical_event_sort_key):
+        event = item.get("event")
+        if isinstance(event, Mapping):
+            lines.append(json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return "".join(f"{line}\n" for line in lines)
+
+
+def _package_records_summary_md(manifest: Mapping[str, Any]) -> str:
+    validation = manifest.get("validation", {})
+    if not isinstance(validation, Mapping):
+        validation = {}
+    workflow_evidence = validation.get("workflow_evidence", {})
+    if not isinstance(workflow_evidence, Mapping):
+        workflow_evidence = {}
+    workflow_finding_count = workflow_evidence.get("finding_count", validation.get("finding_count", 0))
+    return "\n".join(
+        [
+            "# AIWF Records Package",
+            "",
+            f"- Package type: {manifest.get('package_type', '')}",
+            f"- Package version: {manifest.get('package_version', '')}",
+            f"- Selected tasks: {len(manifest.get('selected_tasks', []))}",
+            f"- Artifact files: {len(manifest.get('artifacts', {}).get('included', [])) if isinstance(manifest.get('artifacts'), Mapping) else 0}",
+            f"- Canonical events: {manifest.get('events', {}).get('canonical_event_count', 0) if isinstance(manifest.get('events'), Mapping) else 0}",
+            f"- Dataset included: {manifest.get('dataset', {}).get('included', False) if isinstance(manifest.get('dataset'), Mapping) else False}",
+            f"- Redaction profile: {manifest.get('redaction_profile', '')}",
+            f"- Package Generation: {_package_records_result_label(validation.get('package_generation', {}).get('result') if isinstance(validation.get('package_generation'), Mapping) else '')}",
+            f"- Manifest Schema: {_package_records_result_label(validation.get('manifest_schema', {}).get('result') if isinstance(validation.get('manifest_schema'), Mapping) else '')}",
+            f"- Package Integrity: {_package_records_result_label(validation.get('package_integrity', {}).get('result') if isinstance(validation.get('package_integrity'), Mapping) else '')}",
+            f"- Privacy/Security: {_package_records_result_label(validation.get('privacy_security', {}).get('result') if isinstance(validation.get('privacy_security'), Mapping) else '')}",
+            f"- Workflow Evidence Findings: {_package_records_result_label(workflow_evidence.get('result', validation.get('result', '')))} ({workflow_finding_count} findings packaged)",
+            "",
+            "Workflow evidence findings describe historical source workflow records packaged for review. They do not by themselves mean package generation failed.",
+            "",
+        ]
+    )
+
+
+def _package_records_file_rows(
+    files: Mapping[str, bytes],
+    artifact_modes: Optional[Mapping[str, str]] = None,
+) -> list[ManifestRow]:
+    rows: list[ManifestRow] = []
+    modes = artifact_modes or {}
+    for package_path, content in sorted(files.items()):
+        rows.append(
+            build_manifest_row(
+                sha256=sha256_bytes(content),
+                git_mode=modes.get(package_path, "100644"),
+                size=len(content),
+                package_relative_path=package_path,
+            )
+        )
+    return rows
+
+
+def _package_records_file_manifest_tsv(
+    files: Mapping[str, bytes],
+    artifact_modes: Optional[Mapping[str, str]] = None,
+) -> str:
+    return "".join(manifest_row_tsv(row) for row in _package_records_file_rows(files, artifact_modes))
+
+
+def _package_records_package_files(
+    root: Path,
+    manifest: Mapping[str, Any],
+    selected_tasks: Sequence[dict[str, str]],
+    *,
+    redaction_profile: str,
+    include_global_events: bool,
+) -> dict[str, bytes]:
+    event_summary, _event_findings, canonical_events = _package_records_event_plan(
+        root,
+        selected_tasks,
+        include_global_events=include_global_events,
+    )
+    if event_summary.get("canonical_event_count") != manifest.get("events", {}).get("canonical_event_count"):
+        raise SystemExit("ERROR: package records event inventory changed while building package")
+
+    files: dict[str, bytes] = {}
+    artifact_modes: dict[str, str] = {}
+    artifacts = manifest.get("artifacts", {}).get("included", []) if isinstance(manifest.get("artifacts"), Mapping) else []
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping):
+            continue
+        source_path = artifact.get("source_path")
+        package_path = artifact.get("package_path")
+        if not isinstance(source_path, str) or not isinstance(package_path, str):
+            continue
+        source = (root / source_path).resolve()
+        content, redaction = _package_records_artifact_bytes(source, redaction_profile)
+        if sha256_bytes(content) != artifact.get("sha256") or len(content) != artifact.get("bytes") or redaction != artifact.get("redaction"):
+            raise SystemExit(f"ERROR: package records artifact changed while building package: {source_path}")
+        package_path = normalize_package_path(package_path)
+        files[package_path] = content
+        artifact_modes[package_path] = str(artifact.get("mode", "100644"))
+
+    dataset = manifest.get("dataset")
+    if isinstance(dataset, Mapping) and dataset.get("included") is True:
+        dataset_path = normalize_package_path(str(dataset.get("path", AIWF_PACKAGE_RECORDS_DATASET_PATH)))
+        dataset_payload = build_dataset_export_payload(root, task_dirs=_package_records_selected_task_dirs(root, selected_tasks))
+        dataset_payload["generated_at"] = "1970-01-01T00:00:00Z"
+        files[dataset_path] = stable_json_dump(dataset_payload).encode("utf-8")
+
+    files["events/events.jsonl"] = _package_records_canonical_events_jsonl(canonical_events).encode("utf-8")
+    files["task_inventory.csv"] = _package_records_task_inventory_csv(selected_tasks).encode("utf-8")
+    files["event_inventory.csv"] = _package_records_event_inventory_csv(canonical_events).encode("utf-8")
+    files["artifact_inventory.tsv"] = _package_records_artifact_inventory_tsv(artifacts).encode("utf-8")
+    files["package_manifest.json"] = stable_json_dump(manifest).encode("utf-8")
+    files["package_summary.md"] = _package_records_summary_md(manifest).encode("utf-8")
+    files["integrity/redaction_report.json"] = stable_json_dump({"redaction_report": manifest.get("redaction", {}).get("redaction_report", [])}).encode("utf-8")
+    files["integrity/exclusion_report.json"] = stable_json_dump({"exclusion_report": manifest.get("redaction", {}).get("exclusion_report", [])}).encode("utf-8")
+
+    tree_manifest = _package_records_file_manifest_tsv(files, artifact_modes).encode("utf-8")
+    files["integrity/package_tree_manifest.tsv"] = tree_manifest
+    package_identity = {
+        "hash_policy": AIWF_PACKAGE_RECORDS_HASH_POLICY,
+        "package_tree_sha256": sha256_bytes(tree_manifest),
+        "package_file_count": len(files) + 1,
+        "package_total_bytes": sum(len(content) for content in files.values()),
+    }
+    files["integrity/package_identity.json"] = stable_json_dump(package_identity).encode("utf-8")
+    return {normalize_package_path(path): content for path, content in sorted(files.items())}
+
+
+def _package_records_write_directory(output_path: Path, files: Mapping[str, bytes]) -> None:
+    ensure_dir(output_path)
+    for package_path, content in sorted(files.items()):
+        target = output_path / package_path
+        ensure_dir(target.parent)
+        target.write_bytes(content)
+
+
+def _package_records_write_zip(output_path: Path, files: Mapping[str, bytes]) -> None:
+    ensure_dir(output_path.parent)
+    with zipfile.ZipFile(output_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for package_path, content in sorted(files.items()):
+            archive_path = f"{AIWF_PACKAGE_RECORDS_ROOT_DIR}/{package_path}"
+            info = zipfile.ZipInfo(archive_path, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (0o100644 & 0xFFFF) << 16
+            archive.writestr(info, content)
+
+
+def _package_records_manifest_schema_path() -> Path:
+    return AIWF_BIN_DIR.parent / "docs" / "schemas" / AIWF_PACKAGE_RECORDS_MANIFEST_SCHEMA_FILENAME
+
+
+def _package_records_manifest_schema() -> dict[str, Any]:
+    schema_path = _package_records_manifest_schema_path()
+    try:
+        data = json.loads(schema_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR: failed to load package records manifest schema: {schema_path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"ERROR: package records manifest schema is not a JSON object: {schema_path}")
+    return data
+
+
+def _package_records_schema_error(path: str, message: str) -> dict[str, str]:
+    return {"path": path, "message": message}
+
+
+def _package_records_schema_required(schema: Mapping[str, Any], *path: str) -> list[str]:
+    node: Any = schema
+    for key in path:
+        if not isinstance(node, Mapping):
+            return []
+        node = node.get(key, {})
+    required = node.get("required") if isinstance(node, Mapping) else None
+    return list(required) if isinstance(required, list) and all(isinstance(item, str) for item in required) else []
+
+
+def _package_records_schema_const(schema: Mapping[str, Any], *path: str) -> Optional[str]:
+    node: Any = schema
+    for key in path:
+        if not isinstance(node, Mapping):
+            return None
+        node = node.get(key, {})
+    value = node.get("const") if isinstance(node, Mapping) else None
+    return value if isinstance(value, str) else None
+
+
+def _package_records_schema_enum(schema: Mapping[str, Any], *path: str) -> set[str]:
+    node: Any = schema
+    for key in path:
+        if not isinstance(node, Mapping):
+            return set()
+        node = node.get(key, {})
+    values = node.get("enum") if isinstance(node, Mapping) else None
+    return {item for item in values if isinstance(item, str)} if isinstance(values, list) else set()
+
+
+def _package_records_validate_manifest_schema(
+    manifest: Mapping[str, Any],
+    schema: Optional[Mapping[str, Any]] = None,
+) -> list[dict[str, str]]:
+    schema = schema or _package_records_manifest_schema()
+    errors: list[dict[str, str]] = []
+
+    for field_name in _package_records_schema_required(schema):
+        if field_name not in manifest:
+            errors.append(_package_records_schema_error(f"$.{field_name}", "required field is missing"))
+
+    for field_name, expected in (
+        ("schema_version", _package_records_schema_const(schema, "properties", "schema_version")),
+        ("package_type", _package_records_schema_const(schema, "properties", "package_type")),
+        ("package_version", _package_records_schema_const(schema, "properties", "package_version")),
+    ):
+        if expected is not None and manifest.get(field_name) != expected:
+            errors.append(_package_records_schema_error(f"$.{field_name}", f'expected "{expected}"'))
+
+    capabilities = manifest.get("capabilities")
+    if isinstance(capabilities, Mapping):
+        for field_name in _package_records_schema_required(schema, "properties", "capabilities"):
+            value = capabilities.get(field_name)
+            if not isinstance(value, bool):
+                errors.append(_package_records_schema_error(f"$.capabilities.{field_name}", "expected boolean"))
+    elif "capabilities" in manifest:
+        errors.append(_package_records_schema_error("$.capabilities", "expected object"))
+
+    options = manifest.get("options")
+    if isinstance(options, Mapping):
+        format_values = _package_records_schema_enum(schema, "properties", "options", "properties", "format")
+        if format_values and options.get("format") not in format_values:
+            errors.append(
+                _package_records_schema_error(
+                    "$.options.format",
+                    "expected one of: " + ", ".join(sorted(format_values)),
+                )
+            )
+        for field_name in ("include_dataset", "include_global_events", "include_related", "strict"):
+            if not isinstance(options.get(field_name), bool):
+                errors.append(_package_records_schema_error(f"$.options.{field_name}", "expected boolean"))
+        redaction_values = _package_records_schema_enum(schema, "properties", "options", "properties", "redaction_profile")
+        if redaction_values and options.get("redaction_profile") not in redaction_values:
+            errors.append(
+                _package_records_schema_error(
+                    "$.options.redaction_profile",
+                    "expected one of: " + ", ".join(sorted(redaction_values)),
+                )
+            )
+    elif "options" in manifest:
+        errors.append(_package_records_schema_error("$.options", "expected object"))
+
+    top_redaction_values = _package_records_schema_enum(schema, "properties", "redaction_profile")
+    if top_redaction_values and manifest.get("redaction_profile") not in top_redaction_values:
+        errors.append(
+            _package_records_schema_error(
+                "$.redaction_profile",
+                "expected one of: " + ", ".join(sorted(top_redaction_values)),
+            )
+        )
+    for field_name in ("redaction_count", "excluded_artifact_count"):
+        value = manifest.get(field_name)
+        if not isinstance(value, int) or value < 0:
+            errors.append(_package_records_schema_error(f"$.{field_name}", "expected non-negative integer"))
+
+    artifact_classes = _package_records_schema_enum(
+        schema,
+        "$defs",
+        "artifact_entry",
+        "properties",
+        "artifact_class",
+    )
+    redaction_values = _package_records_schema_enum(
+        schema,
+        "$defs",
+        "artifact_entry",
+        "properties",
+        "redaction",
+    )
+    artifacts = manifest.get("artifacts")
+    if isinstance(artifacts, Mapping):
+        included = artifacts.get("included")
+        if isinstance(included, list):
+            for index, artifact in enumerate(included):
+                path = f"$.artifacts.included[{index}]"
+                if not isinstance(artifact, Mapping):
+                    errors.append(_package_records_schema_error(path, "expected object"))
+                    continue
+                artifact_class = artifact.get("artifact_class")
+                if artifact_classes and artifact_class not in artifact_classes:
+                    errors.append(
+                        _package_records_schema_error(
+                            f"{path}.artifact_class",
+                            "expected one of: " + ", ".join(sorted(artifact_classes)),
+                        )
+                    )
+                redaction = artifact.get("redaction")
+                if redaction_values and redaction not in redaction_values:
+                    errors.append(
+                        _package_records_schema_error(
+                            f"{path}.redaction",
+                            "expected one of: " + ", ".join(sorted(redaction_values)),
+                        )
+                    )
+                if not isinstance(artifact.get("bytes"), int) or int(artifact.get("bytes", -1)) < 0:
+                    errors.append(_package_records_schema_error(f"{path}.bytes", "expected non-negative integer"))
+                sha256 = artifact.get("sha256")
+                if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                    errors.append(_package_records_schema_error(f"{path}.sha256", "expected sha256 hex string"))
+        elif "included" in artifacts:
+            errors.append(_package_records_schema_error("$.artifacts.included", "expected array"))
+    elif "artifacts" in manifest:
+        errors.append(_package_records_schema_error("$.artifacts", "expected object"))
+
+    events = manifest.get("events")
+    if isinstance(events, Mapping):
+        for field_name in (
+            "task_local_event_count",
+            "global_event_count",
+            "canonical_event_count",
+            "malformed_event_count",
+            "unassociated_event_count",
+        ):
+            value = events.get(field_name)
+            if not isinstance(value, int) or value < 0:
+                errors.append(_package_records_schema_error(f"$.events.{field_name}", "expected non-negative integer"))
+        sources = events.get("sources")
+        if isinstance(sources, list):
+            for index, source in enumerate(sources):
+                path = f"$.events.sources[{index}]"
+                if not isinstance(source, Mapping):
+                    errors.append(_package_records_schema_error(path, "expected object"))
+                    continue
+                if not isinstance(source.get("source_path"), str) or not source.get("source_path"):
+                    errors.append(_package_records_schema_error(f"{path}.source_path", "expected non-empty string"))
+                event_count = source.get("event_count")
+                if not isinstance(event_count, int) or event_count < 0:
+                    errors.append(_package_records_schema_error(f"{path}.event_count", "expected non-negative integer"))
+                if "malformed_count" in source:
+                    malformed = source.get("malformed_count")
+                    if not isinstance(malformed, int) or malformed < 0:
+                        errors.append(_package_records_schema_error(f"{path}.malformed_count", "expected non-negative integer"))
+        elif "sources" in events:
+            errors.append(_package_records_schema_error("$.events.sources", "expected array"))
+    elif "events" in manifest:
+        errors.append(_package_records_schema_error("$.events", "expected object"))
+
+    dataset = manifest.get("dataset")
+    if isinstance(dataset, Mapping):
+        if not isinstance(dataset.get("included"), bool):
+            errors.append(_package_records_schema_error("$.dataset.included", "expected boolean"))
+        if dataset.get("included") is True:
+            if not isinstance(dataset.get("schema_version"), str) or not dataset.get("schema_version"):
+                errors.append(_package_records_schema_error("$.dataset.schema_version", "expected non-empty string"))
+            dataset_path = dataset.get("path")
+            if not isinstance(dataset_path, str) or not dataset_path:
+                errors.append(_package_records_schema_error("$.dataset.path", "expected non-empty package-relative path"))
+            else:
+                try:
+                    normalize_package_path(dataset_path)
+                except ValueError as exc:
+                    errors.append(_package_records_schema_error("$.dataset.path", str(exc)))
+        if "warning_count" in dataset:
+            warning_count = dataset.get("warning_count")
+            if not isinstance(warning_count, int) or warning_count < 0:
+                errors.append(_package_records_schema_error("$.dataset.warning_count", "expected non-negative integer"))
+    elif "dataset" in manifest:
+        errors.append(_package_records_schema_error("$.dataset", "expected object"))
+
+    redaction = manifest.get("redaction")
+    if isinstance(redaction, Mapping):
+        if top_redaction_values and redaction.get("profile") not in top_redaction_values:
+            errors.append(
+                _package_records_schema_error(
+                    "$.redaction.profile",
+                    "expected one of: " + ", ".join(sorted(top_redaction_values)),
+                )
+            )
+        for field_name in ("redaction_count", "excluded_artifact_count", "secret_finding_count"):
+            value = redaction.get(field_name)
+            if not isinstance(value, int) or value < 0:
+                errors.append(_package_records_schema_error(f"$.redaction.{field_name}", "expected non-negative integer"))
+        report = redaction.get("redaction_report")
+        if isinstance(report, list):
+            for index, item in enumerate(report):
+                path = f"$.redaction.redaction_report[{index}]"
+                if not isinstance(item, Mapping):
+                    errors.append(_package_records_schema_error(path, "expected object"))
+                    continue
+                for field_name in ("source_path", "package_path", "rule", "action"):
+                    if not isinstance(item.get(field_name), str) or not item.get(field_name):
+                        errors.append(_package_records_schema_error(f"{path}.{field_name}", "expected non-empty string"))
+                count = item.get("count")
+                if not isinstance(count, int) or count < 1:
+                    errors.append(_package_records_schema_error(f"{path}.count", "expected positive integer"))
+        elif "redaction_report" in redaction:
+            errors.append(_package_records_schema_error("$.redaction.redaction_report", "expected array"))
+        exclusion_report = redaction.get("exclusion_report")
+        if isinstance(exclusion_report, list):
+            for index, item in enumerate(exclusion_report):
+                path = f"$.redaction.exclusion_report[{index}]"
+                if not isinstance(item, Mapping):
+                    errors.append(_package_records_schema_error(path, "expected object"))
+                    continue
+                if not isinstance(item.get("source_path"), str) or not item.get("source_path"):
+                    errors.append(_package_records_schema_error(f"{path}.source_path", "expected non-empty string"))
+                if not isinstance(item.get("reason"), str) or not item.get("reason"):
+                    errors.append(_package_records_schema_error(f"{path}.reason", "expected non-empty string"))
+        elif "exclusion_report" in redaction:
+            errors.append(_package_records_schema_error("$.redaction.exclusion_report", "expected array"))
+    elif "redaction" in manifest:
+        errors.append(_package_records_schema_error("$.redaction", "expected object"))
+
+    validation_values = _package_records_schema_enum(schema, "$defs", "validation_result")
+    validation = manifest.get("validation")
+    if isinstance(validation, Mapping):
+        for field_name in _package_records_schema_required(schema, "properties", "validation"):
+            if field_name not in validation:
+                errors.append(_package_records_schema_error(f"$.validation.{field_name}", "required field is missing"))
+        if validation.get("scope") != "workflow_evidence":
+            errors.append(_package_records_schema_error("$.validation.scope", 'expected "workflow_evidence"'))
+        result = validation.get("result")
+        if validation_values and result not in validation_values:
+            errors.append(
+                _package_records_schema_error(
+                    "$.validation.result",
+                    "expected one of: " + ", ".join(sorted(validation_values)),
+                )
+            )
+        finding_count = validation.get("finding_count")
+        if not isinstance(finding_count, int) or finding_count < 0:
+            errors.append(_package_records_schema_error("$.validation.finding_count", "expected non-negative integer"))
+        findings = validation.get("findings")
+        if not isinstance(findings, list):
+            errors.append(_package_records_schema_error("$.validation.findings", "expected array"))
+        elif isinstance(finding_count, int) and finding_count >= 0 and finding_count != len(findings):
+            errors.append(_package_records_schema_error("$.validation.finding_count", "expected to match findings length"))
+        for field_name in ("package_generation", "manifest_schema", "package_integrity", "privacy_security"):
+            status = validation.get(field_name)
+            if isinstance(status, Mapping):
+                status_result = status.get("result")
+                if validation_values and status_result not in validation_values:
+                    errors.append(
+                        _package_records_schema_error(
+                            f"$.validation.{field_name}.result",
+                            "expected one of: " + ", ".join(sorted(validation_values)),
+                        )
+                    )
+            else:
+                errors.append(_package_records_schema_error(f"$.validation.{field_name}", "expected object"))
+        workflow_evidence = validation.get("workflow_evidence")
+        if isinstance(workflow_evidence, Mapping):
+            workflow_result = workflow_evidence.get("result")
+            if validation_values and workflow_result not in validation_values:
+                errors.append(
+                    _package_records_schema_error(
+                        "$.validation.workflow_evidence.result",
+                        "expected one of: " + ", ".join(sorted(validation_values)),
+                    )
+                )
+            workflow_count = workflow_evidence.get("finding_count")
+            if not isinstance(workflow_count, int) or workflow_count < 0:
+                errors.append(_package_records_schema_error("$.validation.workflow_evidence.finding_count", "expected non-negative integer"))
+            if result != workflow_result:
+                errors.append(_package_records_schema_error("$.validation.workflow_evidence.result", "expected to match validation result"))
+            if finding_count != workflow_count:
+                errors.append(_package_records_schema_error("$.validation.workflow_evidence.finding_count", "expected to match validation finding_count"))
+        else:
+            errors.append(_package_records_schema_error("$.validation.workflow_evidence", "expected object"))
+    elif "validation" in manifest:
+        errors.append(_package_records_schema_error("$.validation", "expected object"))
+
+    identity = manifest.get("identity")
+    if isinstance(identity, Mapping):
+        expected_hash_policy = _package_records_schema_const(schema, "properties", "identity", "properties", "hash_policy")
+        if expected_hash_policy is not None and identity.get("hash_policy") != expected_hash_policy:
+            errors.append(_package_records_schema_error("$.identity.hash_policy", f'expected "{expected_hash_policy}"'))
+        digest = identity.get("reproducible_evidence_sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            errors.append(_package_records_schema_error("$.identity.reproducible_evidence_sha256", "expected sha256 hex string"))
+        for field_name in ("content_file_count", "content_total_bytes"):
+            value = identity.get(field_name)
+            if not isinstance(value, int) or value < 0:
+                errors.append(_package_records_schema_error(f"$.identity.{field_name}", "expected non-negative integer"))
+    elif "identity" in manifest:
+        errors.append(_package_records_schema_error("$.identity", "expected object"))
+
+    return sorted(errors, key=lambda item: (item["path"], item["message"]))
+
+
+def _package_records_print_manifest_schema_errors(errors: Sequence[dict[str, str]]) -> None:
+    print(f"[ERROR] {AIWF_PACKAGE_RECORDS_MANIFEST_ERROR}: package records manifest schema validation failed", file=sys.stderr)
+    for error in errors:
+        print(f"- {error['path']}: {error['message']}", file=sys.stderr)
+
+
+def _package_records_manifest_status_result(validation: Mapping[str, Any], section: str, fallback: str = "pass") -> str:
+    value = validation.get(section)
+    if isinstance(value, Mapping):
+        result = value.get("result")
+        if isinstance(result, str):
+            return result
+    return fallback
+
+
+def _package_records_print_status(
+    manifest: Mapping[str, Any],
+    *,
+    stream: Any = None,
+    package_generation: Optional[str] = None,
+    manifest_schema: Optional[str] = None,
+    package_integrity: Optional[str] = None,
+    privacy_security: Optional[str] = None,
+) -> None:
+    if stream is None:
+        stream = sys.stdout
+    validation = manifest.get("validation", {})
+    if not isinstance(validation, Mapping):
+        validation = {}
+    workflow_evidence = validation.get("workflow_evidence", {})
+    if not isinstance(workflow_evidence, Mapping):
+        workflow_evidence = {}
+    workflow_result = workflow_evidence.get("result", validation.get("result", "pass"))
+    workflow_count = workflow_evidence.get("finding_count", validation.get("finding_count", 0))
+    print(
+        f"Package Generation: {_package_records_result_label(package_generation or _package_records_manifest_status_result(validation, 'package_generation'))}",
+        file=stream,
+    )
+    print(
+        f"Manifest Schema: {_package_records_result_label(manifest_schema or _package_records_manifest_status_result(validation, 'manifest_schema'))}",
+        file=stream,
+    )
+    print(
+        f"Package Integrity: {_package_records_result_label(package_integrity or _package_records_manifest_status_result(validation, 'package_integrity'))}",
+        file=stream,
+    )
+    print(
+        f"Privacy/Security: {_package_records_result_label(privacy_security or _package_records_manifest_status_result(validation, 'privacy_security'))}",
+        file=stream,
+    )
+    print(
+        f"Workflow Evidence Findings: {_package_records_result_label(workflow_result)}, {workflow_count} findings packaged",
+        file=stream,
+    )
+
+
+def _package_records_manifest(
+    root: Path,
+    *,
+    options: argparse.Namespace,
+    records_root: Path,
+    from_date: Optional[str],
+    to_date: Optional[str],
+    dates: set[str],
+    selected_tasks: list[dict[str, str]],
+    excluded_tasks: list[dict[str, str]],
+    findings: list[dict[str, str]],
+) -> dict[str, Any]:
+    findings = list(findings)
+    include_global_events = not bool(options.task_local_events_only)
+    event_summary, event_findings = _package_records_event_summary(
+        root,
+        selected_tasks,
+        include_global_events=include_global_events,
+    )
+    findings.extend(event_findings)
+    include_dataset = not bool(options.no_dataset)
+    dataset_metadata, dataset_findings = _package_records_dataset_metadata(
+        root,
+        selected_tasks,
+        include_dataset=include_dataset,
+    )
+    findings.extend(dataset_findings)
+    findings.extend(
+        [
+            _package_records_finding(
+                "info",
+                "AIWF-PACKAGE-RECORDS-SLICE-CAPABILITY",
+                "Redaction is not implemented in this slice.",
+            ),
+        ]
+    )
+    config_path = root / ".aiwf" / "config.yaml"
+    config = load_aiwf_config(root)
+    filters: dict[str, Any] = {
+        "dates": sorted(dates),
+        "tasks": list(options.task or []),
+        "status": list(options.status or []),
+        "workflow_phase": list(options.workflow_phase or []),
+        "review_status": list(options.review_status or []),
+        "project": list(options.project or []),
+        "tags": list(options.tag or []),
+    }
+    if from_date is not None:
+        filters["from_date"] = from_date
+    if to_date is not None:
+        filters["to_date"] = to_date
+    redaction_profile = options.redaction_profile or "safe"
+    included_artifacts, excluded_artifacts = _package_records_build_artifact_inventory(
+        root,
+        selected_tasks,
+        redaction_profile=redaction_profile,
+    )
+    redaction_summary, redaction_findings, prohibited_artifacts = _package_records_redaction_summary(
+        root,
+        profile=redaction_profile,
+        included_artifacts=included_artifacts,
+        selected_tasks=selected_tasks,
+    )
+    excluded_artifacts = stable_sort(
+        [*excluded_artifacts, *prohibited_artifacts],
+        key=lambda item: (item.get("source_path", ""), item.get("reason", "")),
+    )
+    findings.extend(redaction_findings)
+    identity = _package_records_identity(included_artifacts)
+
+    manifest = {
+        "schema_version": AIWF_PACKAGE_RECORDS_MANIFEST_SCHEMA_VERSION,
+        "package_type": "aiwf-package-records",
+        "package_version": AIWF_PACKAGE_RECORDS_PACKAGE_VERSION,
+        "capabilities": {
+            "canonical_events": True,
+            "dataset": include_dataset,
+            "redaction": True,
+            "package_identity": True,
+            "referential_validation": True,
+        },
+        "generator": {
+            "tool": "aiwf",
+            "tool_version": AIWF_TOOL_VERSION,
+            "workflow_protocol_version": WORKFLOW_PROTOCOL_VERSION,
+        },
+        "options": {
+            "format": options.format or "zip",
+            "include_dataset": include_dataset,
+            "include_global_events": include_global_events,
+            "include_related": bool(options.include_related),
+            "redaction_profile": redaction_profile,
+            "strict": bool(options.strict),
+        },
+        "redaction_profile": redaction_profile,
+        "redaction_count": redaction_summary["redaction_count"],
+        "excluded_artifact_count": redaction_summary["excluded_artifact_count"],
+        "records_root": {
+            "source_path": rel(root, records_root),
+            "layout_version": config.layout.aiwf_layout_version,
+            "config_path": rel(root, config_path) if config_path.exists() else ".aiwf/config.yaml",
+        },
+        "filters": filters,
+        "selected_tasks": selected_tasks,
+        "excluded_tasks": excluded_tasks,
+        "artifacts": {
+            "included": included_artifacts,
+            "excluded": excluded_artifacts,
+            "prohibited_count": len(prohibited_artifacts),
+        },
+        "events": event_summary,
+        "dataset": dataset_metadata,
+        "redaction": redaction_summary,
+        "repository": _package_records_repository_metadata(root),
+        "identity": identity,
+        "validation": _package_records_validation_status(findings),
+    }
+    return manifest
+
+
+def _package_records_safe_output_path(
+    root: Path,
+    raw_output: str,
+    selected_tasks: Sequence[dict[str, str]],
+    *,
+    force: bool = False,
+) -> tuple[Optional[Path], Optional[str]]:
+    target = Path(raw_output)
+    if not target.is_absolute():
+        target = root / target
+    target = target.resolve()
+    if target.exists() and not force:
+        return None, f"refusing to overwrite existing output path: {target}"
+
+    records_root = get_record_root(root)
+    if _package_records_is_under(target, records_root):
+        return None, f"refusing to write package records output inside workflow records: {rel(root, target)}"
+
+    events_root = get_event_log_path(root).parent
+    if _package_records_is_under(target, events_root):
+        return None, f"refusing to write package records output inside workflow events: {rel(root, target)}"
+
+    for task in selected_tasks:
+        source_path = task.get("source_path")
+        if not source_path:
+            continue
+        task_dir = (root / source_path).resolve()
+        if _package_records_is_under(target, task_dir):
+            return None, f"refusing to write package records output inside selected task directory: {rel(root, target)}"
+
+    return target, None
+
+
+def _package_records_prepare_output_path(output_path: Path, *, force: bool) -> None:
+    if not output_path.exists():
+        return
+    if not force:
+        raise SystemExit(f"ERROR: refusing to overwrite existing output path: {output_path}")
+    if output_path.is_dir() and not output_path.is_symlink():
+        shutil.rmtree(output_path)
+    else:
+        output_path.unlink()
+
+
+def _package_records_parse_filters(options: argparse.Namespace) -> tuple[Optional[str], Optional[str], set[str], Optional[int]]:
+    try:
+        from_date = _package_records_parse_date(options.from_date, field="from-date") if options.from_date else None
+        to_date = _package_records_parse_date(options.to_date, field="to-date") if options.to_date else None
+        dates = {_package_records_parse_date(item, field="date") for item in (options.date or [])}
+    except DateValidationError as exc:
+        _print_date_validation_error(exc)
+        return None, None, set(), 2
+    return from_date, to_date, dates, None
+
+
+def _package_records_deferred_option_error(options: argparse.Namespace) -> Optional[str]:
+    deferred: dict[str, Any] = {}
+    for name, value in deferred.items():
+        if value:
+            option = "--" + name.replace("_", "-")
+            return f"{option} is not implemented in this package records slice"
+    return None
+
+
+def package_records_command(root: Path, options: argparse.Namespace) -> int:
+    deferred_error = _package_records_deferred_option_error(options)
+    if deferred_error:
+        print(f"ERROR: {deferred_error}", file=sys.stderr)
+        return 2
+    if options.include_dataset and options.no_dataset:
+        print("ERROR: --include-dataset and --no-dataset cannot be used together", file=sys.stderr)
+        return 2
+    if options.redaction_profile and options.redaction_profile not in AIWF_PACKAGE_RECORDS_REDACTION_PROFILES:
+        print(
+            "ERROR: --redaction-profile must be one of: " + ", ".join(sorted(AIWF_PACKAGE_RECORDS_REDACTION_PROFILES)),
+            file=sys.stderr,
+        )
+        return 2
+    if options.include_global_events and options.task_local_events_only:
+        print("ERROR: --include-global-events and --task-local-events-only cannot be used together", file=sys.stderr)
+        return 2
+    if options.include_related:
+        print("ERROR: --include-related is not implemented in this package records slice", file=sys.stderr)
+        return 2
+    if not options.output:
+        print("ERROR: --output is required for package records", file=sys.stderr)
+        return 2
+
+    from_date, to_date, dates, date_error = _package_records_parse_filters(options)
+    if date_error is not None:
+        return date_error
+
+    records_root = get_record_root(root)
+    selected_tasks, excluded_tasks, findings, selector_error = _package_records_select_tasks(
+        root,
+        from_date=from_date,
+        to_date=to_date,
+        dates=dates,
+        task_selectors=options.task or [],
+        statuses=set(options.status or []),
+        workflow_phases=set(options.workflow_phase or []),
+        review_statuses=set(options.review_status or []),
+        projects=set(options.project or []),
+        tags=set(options.tag or []),
+    )
+    if selector_error:
+        print(f"ERROR: {selector_error}", file=sys.stderr)
+        return 2
+    if options.strict and any(item.get("severity") in {"warn", "error"} for item in findings):
+        print("ERROR: --strict rejected package records dry-run findings", file=sys.stderr)
+        return 2
+
+    output_path, output_error = _package_records_safe_output_path(root, options.output, selected_tasks, force=bool(options.force))
+    if output_error:
+        print(f"ERROR: {output_error}", file=sys.stderr)
+        return 2
+    assert output_path is not None
+
+    manifest = _package_records_manifest(
+        root,
+        options=options,
+        records_root=records_root,
+        from_date=from_date,
+        to_date=to_date,
+        dates=dates,
+        selected_tasks=selected_tasks,
+        excluded_tasks=excluded_tasks,
+        findings=findings,
+    )
+    manifest_errors = _package_records_validate_manifest_schema(manifest)
+    if manifest_errors:
+        _package_records_print_status(manifest, stream=sys.stderr, package_generation="fail", manifest_schema="fail")
+        _package_records_print_manifest_schema_errors(manifest_errors)
+        return 2
+    if any(
+        item.get("severity") == "error" and item.get("code") == "AIWF-PACKAGE-RECORDS-SECRET-DETECTED"
+        for item in manifest["validation"]["findings"]
+    ):
+        _package_records_print_status(manifest, stream=sys.stderr, package_generation="fail", privacy_security="fail")
+        print("ERROR: package records failed closed due to privacy/security validation errors", file=sys.stderr)
+        return 2
+    if options.strict and any(item.get("severity") in {"warn", "error"} for item in manifest["validation"]["findings"]):
+        _package_records_print_status(manifest, stream=sys.stderr, package_generation="fail")
+        print("ERROR: --strict rejected workflow evidence findings", file=sys.stderr)
+        return 2
+
+    if options.dry_run:
+        ensure_dir(output_path.parent)
+        output_path.write_text(stable_json_dump(manifest), encoding="utf-8")
+        _package_records_print_status(manifest)
+        print(f"WROTE  {_package_records_manifest_output_label(root, output_path)}")
+        return 0
+
+    package_files = _package_records_package_files(
+        root,
+        manifest,
+        selected_tasks,
+        redaction_profile=options.redaction_profile or "safe",
+        include_global_events=not bool(options.task_local_events_only),
+    )
+    try:
+        _package_records_prepare_output_path(output_path, force=bool(options.force))
+    except SystemExit as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    output_format = options.format or "zip"
+    if output_format == "directory":
+        _package_records_write_directory(output_path, package_files)
+    elif output_format == "zip":
+        _package_records_write_zip(output_path, package_files)
+    else:
+        print(f"ERROR: unsupported package records format: {output_format}", file=sys.stderr)
+        return 2
+    _package_records_print_status(manifest)
+    print(f"WROTE  {_package_records_manifest_output_label(root, output_path)}")
     return 0
 
 
@@ -6032,6 +8117,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--output", required=True, help="repo-relative or absolute output path")
     p_export.add_argument("--format", choices=["json"], default="json", help="dataset export format")
     p_export.set_defaults(func=lambda a, r: dataset_export_command(r, a.output, a.format))
+
+    p = sub.add_parser("package", help="create AIWF packages")
+    package_sub = p.add_subparsers(dest="package_command", required=True)
+
+    p_records = package_sub.add_parser(
+        "records",
+        help="package AIWF workflow execution records and related workflow evidence",
+        description=(
+            "Package AIWF workflow execution records and related workflow evidence "
+            "for analysis and engineering handoff. This command does not export the repository."
+        ),
+    )
+    p_records.add_argument("--dry-run", action="store_true", help="write only a dry-run manifest")
+    p_records.add_argument("--output", default=None, help="repo-relative or absolute package output path")
+    p_records.add_argument("--from-date", default=None, help="include tasks created on or after YYYY-MM-DD")
+    p_records.add_argument("--to-date", default=None, help="include tasks created on or before YYYY-MM-DD")
+    p_records.add_argument("--date", action="append", default=[], help="include tasks for YYYY-MM-DD; may repeat")
+    p_records.add_argument("--task", action="append", default=[], help="exact task path or unambiguous task id; may repeat")
+    p_records.add_argument("--status", action="append", default=[], help="task metadata status; may repeat")
+    p_records.add_argument("--workflow-phase", action="append", default=[], help="task metadata workflow_phase; may repeat")
+    p_records.add_argument("--review-status", action="append", default=[], help="task metadata review_status; may repeat")
+    p_records.add_argument("--project", action="append", default=[], help="task metadata project; may repeat")
+    p_records.add_argument("--tag", action="append", default=[], help="task metadata tag; may repeat")
+    p_records.add_argument("--include-related", action="store_true", help="not implemented in this release")
+    p_records.add_argument("--strict", action="store_true", help="fail when warnings are present")
+    p_records.add_argument("--format", choices=["zip", "directory"], default="zip", help="package output format; default: zip")
+    p_records.add_argument("--include-dataset", action="store_true", help="include dataset export metadata; default behavior")
+    p_records.add_argument("--no-dataset", action="store_true", help="omit dataset export metadata")
+    p_records.add_argument("--include-global-events", action="store_true", help="include deterministically associated global events")
+    p_records.add_argument("--task-local-events-only", action="store_true", help="exclude repository-global event scanning")
+    p_records.add_argument("--redaction-profile", choices=sorted(AIWF_PACKAGE_RECORDS_REDACTION_PROFILES), default=None, help="redaction profile; default: safe")
+    p_records.add_argument("--force", action="store_true", help="replace an existing output path after safety checks")
+    p_records.set_defaults(func=lambda a, r: package_records_command(r, a))
 
     p = sub.add_parser("metadata", help="manage AIWF research metadata")
     metadata_sub = p.add_subparsers(dest="metadata_command", required=True)

@@ -60,7 +60,8 @@ The agent must:
 5. Record:
    - Create a new AI work record under `.aiwf/records/ai_<current YYYYMMDD>/NNN_<backfill_name>/`.
    - Task ID allocation must come from workflow tooling (`new-task`/`next-id`), not manual inference.
-   - Include `task.md`, `agent.md`, `task_record.md`, `self_validation.md`, `review_codex.md`, and `review_final.md`.
+   - Include `task.md`, `agent.md`, `task_record.md`, `self_validation.md`, `review_agent.md`, and `review_final.md`.
+   - Treat `review_codex.md` as a legacy alias when reading existing historical records; do not rename historical evidence unless explicitly requested.
 
 6. Safety:
    - Do not run real DUT tests.

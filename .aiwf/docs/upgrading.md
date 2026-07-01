@@ -37,7 +37,7 @@ chmod +x ./aiwf
 ./aiwf upgrade --apply --source /path/to/new_aiwf_repo
 ```
 
-This sequence was verified against the current v1.7.8.post1 runtime.
+This sequence was verified against the current v1.7.9 runtime.
 
 ## Upgrade Modes
 
@@ -61,11 +61,34 @@ The upgrade command preserves:
 
 Preserved means the source package must not overwrite those paths in the target repository.
 
+## Package Records Upgrade Impact
+
+Package Records is an optional capability exposed through:
+
+```bash
+./aiwf package records --output records.zip
+```
+
+No migration is required to use existing AIWF task creation, validation, review,
+or finalize workflows. Package Records does not change workflow protocol
+semantics, task front matter schema, event schema, finalize behavior, or
+upgrade relocation behavior.
+
+Use Package Records when you need to hand off workflow execution records and
+related workflow evidence for analysis. It does not export the source
+repository.
+
+AIWF v1.7.9 introduces `review_agent.md` as the canonical AI/agent review
+artifact for new task records. Existing records that contain only
+`review_codex.md` remain supported through a legacy alias and do not require
+migration.
+
 ## Relocation Behavior
 
 Project-level `docs/`, `tools/`, and `scripts/` directories are project-owned.
 AIWF does not require, copy, move, or delete a project-level `tools/ai_workflow.py`; if one exists from an older integration, upgrade preserves it unchanged and reports it as legacy project-owned content.
 Remove it manually only after confirming no external caller depends on it.
+AIWF upgrade and relocation must not create, overwrite, move, or assume ownership of files under root `scripts/` unless the user explicitly requests a project-specific integration.
 
 Legacy root `docs/` migration is disabled by default.
 When the target repository still contains older AIWF-owned `docs/ai_*` content, `upgrade --check` and `upgrade --dry-run` report relocation only if `--migrate-legacy-docs` is used after reviewing ownership.
@@ -117,6 +140,7 @@ Recommended spot checks:
 - confirm `./aiwf agents check --path AGENTS.md` passes when the template is present
 - confirm `.aiwf/records/ai_YYYYMMDD/` is still the active records root
 - confirm project-level `docs/`, `tools/`, and `scripts/` were not modified unless you explicitly chose a legacy AIWF docs migration
+- confirm existing project-owned files under root `scripts/` remain unchanged
 - confirm no copied generated state was accidentally staged for commit
 
 ## Troubleshooting

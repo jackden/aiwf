@@ -6,6 +6,19 @@
 ./aiwf report --path .aiwf/records --format markdown
 ```
 
+## Package Records
+
+Use Package Records when workflow execution records and related workflow
+evidence need to leave the repository for analysis or engineering handoff:
+
+```bash
+./aiwf package records --output records.zip
+```
+
+Package Records produces an analysis package with a manifest, inventories,
+copied workflow records, events, optional dataset output, redaction metadata,
+and integrity metadata. It does not export the source repository.
+
 ## Metrics
 - `task_count`: total discovered tasks
 - `event_backed_task_count`: tasks with readable event evidence
@@ -45,3 +58,4 @@ When analyzing output, split data by:
 ## Related References
 - Diagnostic catalog: [diagnostics.md](diagnostics.md)
 - Release baseline: [releases/v1.6.1.md](releases/v1.6.1.md)
+- Package Records release preparation: [releases/package_records_release_preparation.md](releases/package_records_release_preparation.md)

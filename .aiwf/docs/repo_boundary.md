@@ -38,6 +38,7 @@ AIWF owns only:
 - the `.aiwf/` namespace
 
 AIWF does not require, copy, move, delete, or rewrite project-level `docs/`, `tools/`, or `scripts/` as part of the public runtime boundary.
+AIWF installation, upgrade, relocation, and packaging operations must not create, overwrite, move, or assume ownership of files under project-level `scripts/` unless the user explicitly requests a project-specific integration.
 If an older repository contains a project-level `tools/ai_workflow.py`, treat it as a project-owned legacy file; use `./aiwf` for new public usage and remove the legacy file manually only after confirming no external caller depends on it.
 
 ## Evidence Boundary Principle

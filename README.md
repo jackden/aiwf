@@ -20,11 +20,13 @@ This repository is organized around AIWF workflow tooling as a repository-native
 - v1.7.7 AIWF Upgrade Mechanism v1: [.aiwf/docs/releases/v1.7.7.md](.aiwf/docs/releases/v1.7.7.md)
 - v1.7.8 shared date validation hardening: [.aiwf/docs/releases/v1.7.8.md](.aiwf/docs/releases/v1.7.8.md)
 - v1.7.8.post1 public release baseline: [.aiwf/docs/releases/v1.7.8.post1.md](.aiwf/docs/releases/v1.7.8.post1.md)
+- v1.7.9 Package Records evidence portability: [.aiwf/docs/releases/v1.7.9.md](.aiwf/docs/releases/v1.7.9.md)
+- Package Records release preparation: [.aiwf/docs/releases/package_records_release_preparation.md](.aiwf/docs/releases/package_records_release_preparation.md)
 
 ## AIWF Governance Docs
 - Agent managed block integration: [.aiwf/docs/agent_integration.md](.aiwf/docs/agent_integration.md)
 - Metadata attribution and profile rules: [.aiwf/docs/metadata.md](.aiwf/docs/metadata.md)
-- Repository snapshot packaging guideline: [.aiwf/docs/packaging.md](.aiwf/docs/packaging.md)
+- Repository source packaging guideline: [.aiwf/docs/packaging.md](.aiwf/docs/packaging.md)
 
 ## What AIWF Is
 AIWF provides deterministic, repo-native workflow controls to:
@@ -78,6 +80,7 @@ Expected result:
 - root `AGENTS.md` has a managed block.
 - task records are created under `.aiwf/records/ai_YYYYMMDD/`.
 - project-level `docs/`, `tools/`, and `scripts/` remain project-owned and are not required by AIWF.
+- AIWF install does not create, overwrite, or assume ownership of files under root `scripts/` unless explicitly requested for a project-specific integration.
 
 Validation:
 ```bash
@@ -110,6 +113,7 @@ Expected result:
 - `./aiwf`, `.aiwf/bin/ai_workflow.py`, and `.aiwf/docs/` come from the new source package.
 - `.aiwf/records/`, `.aiwf/events/`, `.aiwf/migrations/`, and `.aiwf/config.yaml` are preserved.
 - project-level `docs/`, `tools/`, and `scripts/` remain project-owned.
+- existing project-owned files under root `scripts/` remain unchanged.
 - legacy AIWF root `docs/` migration is disabled by default and runs only with explicit opt-in after reviewing ownership.
 
 Validation:
@@ -172,12 +176,12 @@ AGENTS root entrypoint helpers:
 
 Root `AGENTS.md` is a thin managed bootstrap entrypoint. The managed block source of truth is [`.aiwf/templates/AGENTS.block.md`](.aiwf/templates/AGENTS.block.md). The canonical rules live under `.aiwf/docs/agent_rules/`, starting with [`.aiwf/docs/agent_rules/00_root_entrypoint.md`](.aiwf/docs/agent_rules/00_root_entrypoint.md).
 
-### Version Metadata Policy (v1.7.8.post1)
-For this public baseline patch, release identity and tool provenance advance to `1.7.8.post1` while workflow protocol semantics remain at `1.7.8`.
+### Version Metadata Policy (v1.7.9)
+For this release, release identity and tool provenance advance to `1.7.9` while workflow protocol semantics remain at `1.7.8`.
 
 Current metadata version boundary:
-- release version: `1.7.8.post1`
-- tool version: `1.7.8.post1`
+- release version: `1.7.9`
+- tool version: `1.7.9`
 - workflow protocol version: `1.7.8`
 
 The upgrade mechanism is additive and does not imply a package manager, a database migration framework, or silent overwrites of workflow evidence.
@@ -217,6 +221,11 @@ During `./aiwf metadata init`, enter `?` to show allowed values for the current 
 - `check --finalize-ready` is the recommended pre-finalize gate.
 - v1.7.0 adds task-level pre-edit governance via `guard --pre-edit --path <task_dir>`.
 - v1.7.0 remains evidence-driven for finalize semantics. Strict phase-gated finalize is still deferred.
+
+### Agent Review Artifact Naming
+New AIWF task records use `review_agent.md` as the canonical AI/agent review
+artifact. Existing records that contain only `review_codex.md` remain supported
+through a legacy alias and should not be bulk-renamed.
 
 ### Finalized Artifact Drift Governance (v1.7.x Clarification)
 - AIWF does not guarantee physical immutability of finalized artifacts.
@@ -258,6 +267,66 @@ Report commands:
 ./aiwf report --path .aiwf/records --format json
 ./aiwf report --path .aiwf/records --format markdown
 ```
+
+## New in v1.7.9
+
+AIWF v1.7.9 adds Package Records as an optional workflow evidence portability
+capability:
+
+```bash
+./aiwf package records --output records.zip
+```
+
+The package includes a manifest, inventories, copied workflow records, event
+evidence, optional dataset output, redaction metadata, and integrity metadata.
+It is intended for workflow evidence analysis and engineering handoff, not as a
+repository backup or source archive.
+
+This release also introduces `review_agent.md` as the canonical agent review
+artifact for new tasks while retaining `review_codex.md` as a legacy alias for
+existing records.
+
+No workflow protocol, event schema, or finalize behavior change is introduced.
+
+## Package Records
+
+Package Records creates a deterministic workflow evidence package for analysis,
+review, and engineering handoff:
+
+```bash
+./aiwf package records --output records.zip
+```
+
+Additional examples:
+```bash
+./aiwf package records --output aiwf_records_package.zip
+./aiwf package records --output aiwf-records-package --format directory
+./aiwf package records --dry-run --output package_manifest.json
+```
+
+Package Records is:
+
+- a workflow evidence package
+- an analysis package
+- an engineering handoff package
+
+Package Records is not:
+
+- a repository backup
+- a source archive
+- a tamper-proof audit ledger
+
+The package contains `package_manifest.json`, summary and inventory files,
+copied task records, canonical events, optional dataset output, and integrity
+metadata. The default redaction profile is `safe`; use `--redaction-profile
+internal` or `--redaction-profile none` only when the sharing boundary allows
+it. Secret findings fail closed.
+
+Package records output separates package status from source workflow evidence
+quality. `Package Generation`, `Manifest Schema`, `Package Integrity`, and
+`Privacy/Security` describe whether the package was produced safely. `Workflow
+Evidence Findings` describes historical findings preserved from the packaged
+records, and may be `WARNING` or `FAIL` even when package generation succeeded.
 
 ## AIWF Record Retention Policy
 AIWF task records under `.aiwf/records/ai_YYYYMMDD/` are intended to be committed by default.

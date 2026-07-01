@@ -94,7 +94,8 @@ runtime code
 - `record --kind validation --command "<...>"` records command evidence only; it does not execute commands.
 - A finalized task is closed. Do not append `validation`, `review`, `fix`, or `safety_ack` evidence after finalize.
 - If additional work is required post-finalize, create a follow-up task.
-- Finalized required artifacts are governance-controlled evidence (`task.md`, `task_record.md`, `self_validation.md`, `review_codex.md`, `review_final.md`).
+- Finalized required artifacts are governance-controlled evidence (`task.md`, `task_record.md`, `self_validation.md`, `review_agent.md`, `review_final.md`).
+- `review_agent.md` is the canonical AI/agent review artifact for new records; `review_codex.md` is a legacy alias retained for backward compatibility.
 - AIWF does not guarantee physical immutability of finalized artifacts.
 - AIWF governance guarantee is drift handling: detect, diagnose, repair, preserve evidence.
 - Follow-up tasks must not silently rewrite finalized evidence from earlier tasks.
@@ -119,8 +120,11 @@ For non-trivial code/test/safety/workflow changes:
 - `agent.md`
 - `task_record.md`
 - `self_validation.md`
-- `review_codex.md`
+- `review_agent.md`
 - `review_final.md`
+
+Legacy records that contain only `review_codex.md` remain compatible and should
+not be renamed as part of unrelated work.
 
 ## Legacy Compatibility Policy
 

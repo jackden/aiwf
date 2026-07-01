@@ -6,13 +6,17 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import time
+import zipfile
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+REMOVED_ROOT_PACKAGE_HELPER = Path("scripts") / ("package_aiwf" + "_repo.sh")
 
 
 def _load_aiwf_runtime():
@@ -87,6 +91,35 @@ def _snapshot_text_files(paths: list[Path]) -> dict[Path, str]:
 def _assert_text_files_unchanged(before: dict[Path, str]) -> None:
     for path, content in before.items():
         assert path.read_text(encoding="utf-8") == content
+
+
+def _copy_supported_install_set(source_root: Path, target_root: Path) -> None:
+    (target_root / ".aiwf").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_root / "aiwf", target_root / "aiwf")
+    (target_root / "aiwf").chmod(0o755)
+    for dirname in ("bin", "docs", "templates"):
+        shutil.copytree(
+            source_root / ".aiwf" / dirname,
+            target_root / ".aiwf" / dirname,
+            dirs_exist_ok=True,
+        )
+    shutil.copy2(source_root / ".aiwf" / "config.yaml", target_root / ".aiwf" / "config.yaml")
+
+
+def test_supported_first_install_preserves_project_scripts_and_does_not_create_removed_helper(tmp_path: Path):
+    root = tmp_path
+    project_script = root / "scripts" / "project_build.sh"
+    project_script.parent.mkdir(parents=True)
+    project_script.write_text("#!/usr/bin/env bash\necho project\n", encoding="utf-8")
+    before = _snapshot_text_files([project_script])
+
+    _copy_supported_install_set(REPO_ROOT, root)
+    rc = ai_workflow.agents_install_command(root, "AGENTS.md", yes=True)
+
+    assert rc == 0
+    _assert_text_files_unchanged(before)
+    assert not (root / REMOVED_ROOT_PACKAGE_HELPER).exists()
+    assert (root / ".aiwf" / "bin" / "package_review_bundle.sh").exists()
 
 
 def _seed_upgrade_target_repo(root: Path) -> Path:
@@ -203,6 +236,43 @@ def _create_v2_task(root: Path, *, name: str = "fix_ddf_cleanup", date: str = "2
     return tasks[0]
 
 
+def _redaction_fixture_internal_url() -> str:
+    return "https" + "://ci." + "internal/build/1"
+
+
+def _redaction_fixture_user_path() -> str:
+    return "/Users/" + "alice/project/repo"
+
+
+def _redaction_fixture_private_ip() -> str:
+    return "10." + "1.2.3"
+
+
+def test_new_task_creates_review_agent_and_not_review_codex(tmp_path: Path):
+    root = _init_repo(tmp_path)
+
+    task_dir = _create_task(root, date="20260513")
+
+    assert (task_dir / "review_agent.md").is_file()
+    assert not (task_dir / "review_codex.md").exists()
+    assert "# Agent Self Review" in (task_dir / "review_agent.md").read_text(encoding="utf-8")
+    assert ai_workflow.check_path(root, str(task_dir), strict=False) == 0
+
+
+def test_legacy_review_codex_alias_is_accepted_without_migration(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    (task_dir / "review_agent.md").rename(task_dir / "review_codex.md")
+
+    assert ai_workflow.check_path(root, str(task_dir), strict=False) == 0
+    guard_rc, guard_text = ai_workflow.guard_pre_edit(root, str(task_dir), pre_edit=True)
+
+    assert guard_rc == 0
+    assert "AIWF-GUARD-PASS" in guard_text
+    assert (task_dir / "review_codex.md").exists()
+    assert not (task_dir / "review_agent.md").exists()
+
+
 def _seed_backfill_target(root: Path, *, date: str = "20260501", name: str = "001_legacy_task") -> Path:
     target = root / "docs" / f"ai_{date}" / name
     target.mkdir(parents=True, exist_ok=True)
@@ -309,10 +379,10 @@ def _write_finalize_ready_docs(task_dir: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
-    (task_dir / "review_codex.md").write_text(
+    (task_dir / "review_agent.md").write_text(
         "\n".join(
             [
-                "# Codex Self Review",
+                "# Agent Self Review",
                 "Implementation reviewed.",
             ]
         )
@@ -658,6 +728,80 @@ def test_new_task_rejects_bad_reference_input(tmp_path: Path):
     assert not (root / "docs" / "ai_20260601" / "001_bad_ref_input").exists()
 
 
+def test_new_task_rolls_back_directory_when_write_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _init_repo(tmp_path)
+    original_write_file = ai_workflow.write_file
+
+    def fail_after_first_file(root_arg: Path, path: Path, content: str, update_existing: bool = False):
+        result = original_write_file(root_arg, path, content, update_existing)
+        if path.name == "task.md":
+            raise RuntimeError("simulated task creation failure")
+        return result
+
+    monkeypatch.setattr(ai_workflow, "write_file", fail_after_first_file)
+
+    with pytest.raises(RuntimeError, match="simulated task creation failure"):
+        ai_workflow.create_task(root, "interrupted_task", "20260602", update_existing=False, allow_non_today_date=True)
+
+    assert not (root / "docs" / "ai_20260602" / "001_interrupted_task").exists()
+
+
+def test_new_task_rolls_back_directory_and_index_when_append_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _init_repo(tmp_path)
+    original_append_index = ai_workflow.append_index
+
+    def fail_after_index_write(index_path: Path, entry: str):
+        result = original_append_index(index_path, entry)
+        raise RuntimeError("simulated index failure")
+
+    monkeypatch.setattr(ai_workflow, "append_index", fail_after_index_write)
+
+    with pytest.raises(RuntimeError, match="simulated index failure"):
+        ai_workflow.create_task(root, "late_failure_task", "20260602", update_existing=False, allow_non_today_date=True)
+
+    index_path = root / "docs" / "ai_20260602" / "index.md"
+    assert not (root / "docs" / "ai_20260602" / "001_late_failure_task").exists()
+    assert not index_path.exists()
+
+
+def test_new_task_failure_does_not_remove_existing_task_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _init_repo(tmp_path)
+    existing_task = _create_task(root, name="existing_task", date="20260602")
+    marker = existing_task / "preserve.txt"
+    marker.write_text("keep\n", encoding="utf-8")
+
+    def existing_task_dir(_root: Path, _date: str, _task_name: str) -> Path:
+        return existing_task
+
+    def fail_before_write(_root: Path, _path: Path, _content: str, _update_existing: bool = False):
+        raise RuntimeError("simulated existing task failure")
+
+    monkeypatch.setattr(ai_workflow, "resolve_task_dir", existing_task_dir)
+    monkeypatch.setattr(ai_workflow, "write_file", fail_before_write)
+
+    with pytest.raises(RuntimeError, match="simulated existing task failure"):
+        ai_workflow.create_task(root, "existing_task", "20260602", update_existing=True, allow_non_today_date=True)
+
+    assert existing_task.exists()
+    assert marker.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_new_task_keyboard_interrupt_leaves_no_orphan_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _init_repo(tmp_path)
+
+    def interrupt_after_directory_create(root_arg: Path, path: Path, _content: str, _update_existing: bool = False):
+        ai_workflow.safe_write_path(root_arg, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(ai_workflow, "write_file", interrupt_after_directory_create)
+
+    with pytest.raises(KeyboardInterrupt):
+        ai_workflow.create_task(root, "keyboard_interrupt_task", "20260602", update_existing=False, allow_non_today_date=True)
+
+    assert not (root / "docs" / "ai_20260602" / "001_keyboard_interrupt_task").exists()
+
+
 def test_check_passes_for_valid_v16_task(tmp_path: Path):
     root = _init_repo(tmp_path)
     task_dir = _create_task(root)
@@ -995,6 +1139,26 @@ def test_relocate_apply_preserves_legacy_tools_runtime(tmp_path: Path, capsys):
     assert legacy_runtime.read_text(encoding="utf-8") == before
 
 
+def test_relocate_apply_ignores_project_scripts_by_default(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    _seed_legacy_relocation_layout(root)
+    project_script = root / "scripts" / "project_build.sh"
+    project_script.parent.mkdir(parents=True)
+    project_script.write_text("#!/usr/bin/env bash\necho project\n", encoding="utf-8")
+    before = _snapshot_text_files([project_script])
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "relocate", "--apply"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "AIWF-RELOCATE-OK" in out
+    assert "scripts/project_build.sh" not in out
+    _assert_text_files_unchanged(before)
+    assert not (root / REMOVED_ROOT_PACKAGE_HELPER).exists()
+    assert not (root / ".aiwf" / "scripts").exists()
+
+
 def test_relocate_apply_writes_config(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
     _seed_legacy_relocation_layout(root)
@@ -1145,6 +1309,28 @@ def test_upgrade_apply_preserves_project_docs_by_default(tmp_path: Path, capsys)
     assert "validation result" in report_text.lower()
 
 
+def test_upgrade_apply_preserves_project_scripts_and_does_not_create_removed_helper(tmp_path: Path, capsys):
+    root = _seed_upgrade_target_repo(tmp_path)
+    project_script = root / "scripts" / "project_build.sh"
+    project_script.parent.mkdir(parents=True)
+    project_script.write_text("#!/usr/bin/env bash\necho project\n", encoding="utf-8")
+    before = _snapshot_text_files([project_script])
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--apply", "--source", str(REPO_ROOT)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "[INFO] AIWF-UPGRADE-OK" in out
+    assert "scripts/project_build.sh" not in out
+    _assert_text_files_unchanged(before)
+    assert not (root / REMOVED_ROOT_PACKAGE_HELPER).exists()
+    report_paths = sorted((root / ".aiwf" / "migrations").glob("*_upgrade.md"))
+    assert report_paths
+    report_text = report_paths[0].read_text(encoding="utf-8")
+    assert "scripts/project_build.sh" not in report_text
+
+
 def test_upgrade_apply_migrate_legacy_docs_moves_reviewed_docs(tmp_path: Path, capsys):
     root = _seed_upgrade_target_repo(tmp_path)
 
@@ -1220,6 +1406,22 @@ def test_dataset_export_basic_schema_and_allowed_fields(tmp_path: Path):
     assert len(payload["tasks"]) == 1
     record = payload["tasks"][0]
     assert set(record.keys()) == set(ai_workflow.DATASET_ALLOWED_TASK_FIELDS)
+    assert record["has_agent_review_artifact"] is True
+    assert record["has_review_codex_artifact"] is False
+
+
+def test_dataset_export_normalizes_legacy_review_codex_to_agent_review(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    (task_dir / "review_agent.md").rename(task_dir / "review_codex.md")
+
+    payload = _run_dataset_export(root)
+    record = payload["tasks"][0]
+
+    assert record["has_agent_review_artifact"] is True
+    assert record["has_review_codex_artifact"] is True
+    assert (task_dir / "review_codex.md").exists()
+    assert not (task_dir / "review_agent.md").exists()
 
 
 def test_dataset_export_missing_artifacts_is_tolerant(tmp_path: Path):
@@ -1354,7 +1556,7 @@ def test_dataset_export_does_not_modify_existing_files(tmp_path: Path):
         task_dir / "task.md",
         task_dir / "task_record.md",
         task_dir / "self_validation.md",
-        task_dir / "review_codex.md",
+        task_dir / "review_agent.md",
         task_dir / "review_final.md",
         root / ".aiwf" / "events" / "events.jsonl",
     ]
@@ -1370,6 +1572,1202 @@ def test_dataset_export_does_not_modify_existing_files(tmp_path: Path):
         for path in protected_paths
     }
     assert before == after
+
+
+def test_package_records_dry_run_manifest_required_fields_and_capabilities(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="core_selection", date="20260601")
+
+    payload = _run_package_records_dry_run(root, "package_records_required.json")
+
+    assert {
+        "schema_version",
+        "package_type",
+        "package_version",
+        "capabilities",
+        "generator",
+        "options",
+        "redaction_profile",
+        "redaction_count",
+        "excluded_artifact_count",
+        "records_root",
+        "filters",
+        "selected_tasks",
+        "excluded_tasks",
+        "artifacts",
+        "events",
+        "dataset",
+        "redaction",
+        "repository",
+        "identity",
+        "validation",
+    }.issubset(payload)
+    assert payload["schema_version"] == ai_workflow.AIWF_PACKAGE_RECORDS_MANIFEST_SCHEMA_VERSION
+    assert payload["package_type"] == "aiwf-package-records"
+    assert payload["capabilities"]["canonical_events"] is True
+    assert payload["capabilities"]["referential_validation"] is True
+    assert payload["capabilities"]["package_identity"] is True
+    assert payload["capabilities"]["dataset"] is True
+    assert payload["capabilities"]["redaction"] is True
+    assert payload["options"]["redaction_profile"] == "safe"
+    assert payload["redaction_profile"] == "safe"
+    assert payload["redaction_count"] == 0
+    assert payload["excluded_artifact_count"] == 0
+    assert payload["redaction"] == {
+        "excluded_artifact_count": 0,
+        "exclusion_report": [],
+        "profile": "safe",
+        "redaction_count": 0,
+        "redaction_report": [],
+        "secret_finding_count": 0,
+    }
+    assert payload["options"]["include_dataset"] is True
+    assert payload["dataset"] == {
+        "included": True,
+        "path": ai_workflow.AIWF_PACKAGE_RECORDS_DATASET_PATH,
+        "schema_version": ai_workflow.AIWF_DATASET_SCHEMA_VERSION,
+        "warning_count": 0,
+    }
+    assert payload["events"]["canonical_event_count"] == 0
+    assert payload["identity"]["content_file_count"] == len(payload["artifacts"]["included"])
+    assert payload["identity"]["content_total_bytes"] == sum(item["bytes"] for item in payload["artifacts"]["included"])
+    assert payload["validation"]["scope"] == "workflow_evidence"
+    assert payload["validation"]["package_generation"]["result"] == "pass"
+    assert payload["validation"]["manifest_schema"]["result"] == "pass"
+    assert payload["validation"]["package_integrity"]["result"] == "pass"
+    assert payload["validation"]["privacy_security"]["result"] == "pass"
+    assert payload["validation"]["workflow_evidence"]["result"] == payload["validation"]["result"]
+    assert payload["validation"]["workflow_evidence"]["finding_count"] == payload["validation"]["finding_count"]
+    task_md_artifact = next(item for item in payload["artifacts"]["included"] if item["package_path"].endswith("/task.md"))
+    assert task_md_artifact["source_path"] == ai_workflow.rel(root, task_dir / "task.md")
+    assert task_md_artifact["artifact_class"] == "task_content"
+    assert task_md_artifact["mode"] == "100644"
+    assert task_md_artifact["sha256"] == hashlib.sha256((task_dir / "task.md").read_bytes()).hexdigest()
+    agent_review_artifact = next(item for item in payload["artifacts"]["included"] if item["package_path"].endswith("/review_agent.md"))
+    assert agent_review_artifact["source_path"] == ai_workflow.rel(root, task_dir / "review_agent.md")
+    assert agent_review_artifact["artifact_class"] == "agent_review"
+    assert not any(item["package_path"].endswith("/review_codex.md") for item in payload["artifacts"]["included"])
+    assert payload["selected_tasks"] == [
+        {
+            "task_id": "001",
+            "task_name": "core_selection",
+            "source_path": ai_workflow.rel(root, task_dir),
+            "package_path": "records/ai_20260601/001_core_selection",
+            "status": "draft",
+            "workflow_phase": "implementation",
+            "review_status": "pending",
+        }
+    ]
+
+
+def test_package_records_includes_legacy_review_codex_when_canonical_absent(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="legacy_review_alias_task", date="20260601")
+    (task_dir / "review_agent.md").rename(task_dir / "review_codex.md")
+
+    payload = _run_package_records_dry_run(root, "package_records_legacy_review_alias.json")
+
+    agent_review_artifact = next(item for item in payload["artifacts"]["included"] if item["package_path"].endswith("/review_codex.md"))
+    assert agent_review_artifact["source_path"] == ai_workflow.rel(root, task_dir / "review_codex.md")
+    assert agent_review_artifact["artifact_class"] == "agent_review"
+    assert not any(item["package_path"].endswith("/review_agent.md") for item in payload["artifacts"]["included"])
+    assert not (task_dir / "review_agent.md").exists()
+
+
+def test_package_records_prefers_review_agent_when_legacy_alias_also_exists(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="duplicate_review_alias_task", date="20260601")
+    legacy_path = task_dir / "review_codex.md"
+    legacy_path.write_text("# Codex Self Review\nlegacy alias\n", encoding="utf-8")
+
+    payload = _run_package_records_dry_run(root, "package_records_duplicate_review_alias.json")
+
+    assert any(item["package_path"].endswith("/review_agent.md") and item["artifact_class"] == "agent_review" for item in payload["artifacts"]["included"])
+    assert not any(item["package_path"].endswith("/review_codex.md") for item in payload["artifacts"]["included"])
+    assert {
+        "source_path": ai_workflow.rel(root, legacy_path),
+        "reason": "legacy_duplicate_agent_review_alias",
+    } in payload["artifacts"]["excluded"]
+
+
+def test_package_records_generation_passes_with_workflow_evidence_warning(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="workflow_warning_task", date="20260601")
+    _write_task_event_log(task_dir, {"timestamp": "not-a-timestamp", "event": "historical-warning"})
+
+    payload = _run_package_records_dry_run(root, "package_records_workflow_warning.json")
+
+    validation = payload["validation"]
+    assert validation["package_generation"]["result"] == "pass"
+    assert validation["manifest_schema"]["result"] == "pass"
+    assert validation["package_integrity"]["result"] == "pass"
+    assert validation["privacy_security"]["result"] == "pass"
+    assert validation["workflow_evidence"]["result"] == "warn"
+    assert validation["result"] == "warn"
+    assert validation["workflow_evidence"]["finding_count"] == validation["finding_count"]
+    assert any(item["code"] == "AIWF-PACKAGE-RECORDS-INVALID-EVENT-TIMESTAMP" for item in validation["findings"])
+
+
+def test_package_records_cli_distinguishes_package_status_from_workflow_findings(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="cli_workflow_warning_task", date="20260601")
+    _write_task_event_log(task_dir, {"timestamp": "not-a-timestamp", "event": "historical-warning"})
+    output_path = root / "package_records_cli_warning.json"
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(output_path),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert output_path.exists()
+    assert "Package Generation: PASS" in captured.out
+    assert "Manifest Schema: PASS" in captured.out
+    assert "Package Integrity: PASS" in captured.out
+    assert "Privacy/Security: PASS" in captured.out
+    assert "Workflow Evidence Findings: WARNING" in captured.out
+    assert "Package validation failed" not in captured.out
+    assert "Package validation failed" not in captured.err
+
+
+def test_package_records_no_dataset_records_explicit_omission(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="dataset_omitted", date="20260601")
+
+    payload = _run_package_records_dry_run(root, "package_records_no_dataset.json", ["--no-dataset"])
+
+    assert payload["capabilities"]["dataset"] is False
+    assert payload["options"]["include_dataset"] is False
+    assert payload["dataset"] == {"included": False, "warning_count": 0}
+
+
+def test_package_records_include_dataset_conflict_fails_closed(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="dataset_conflict", date="20260601")
+    output_path = root / "package_records_dataset_conflict.json"
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(output_path),
+            "--include-dataset",
+            "--no-dataset",
+        ]
+    )
+
+    assert rc == 2
+    assert not output_path.exists()
+
+
+def test_package_records_dataset_warnings_are_propagated(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="dataset_warning_task", date="20260601")
+    _rewrite_task_metadata(task_dir / "task.md", related_tasks="002")
+
+    payload = _run_package_records_dry_run(root, "package_records_dataset_warning.json")
+
+    assert payload["dataset"]["included"] is True
+    assert payload["dataset"]["warning_count"] == 1
+    assert any(
+        item["code"] == "AIWF-PACKAGE-RECORDS-DATASET-WARNING"
+        and "AIWF-DATASET-INVALID-RELATIONSHIP-FIELD" in item["message"]
+        and item["path"] == ai_workflow.AIWF_PACKAGE_RECORDS_DATASET_PATH
+        for item in payload["validation"]["findings"]
+    )
+
+
+def test_package_records_safe_profile_reports_redactions(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="safe_redaction_task", date="20260601")
+    (task_dir / "task_record.md").write_text(
+        "\n".join(
+            [
+                f"Internal service: {_redaction_fixture_internal_url()}",
+                f"Local path: {_redaction_fixture_user_path()}",
+                f"Private address: {_redaction_fixture_private_ip()}",
+                "Host: build.local",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = _run_package_records_dry_run(root, "package_records_safe_redaction.json", ["--redaction-profile", "safe"])
+
+    assert payload["redaction_profile"] == "safe"
+    assert payload["redaction"]["profile"] == "safe"
+    assert payload["redaction_count"] >= 4
+    assert payload["redaction"]["redaction_count"] == payload["redaction_count"]
+    assert {item["rule"] for item in payload["redaction"]["redaction_report"]} >= {
+        "absolute_path",
+        "hostname",
+        "internal_url",
+        "private_ip",
+    }
+    assert payload["validation"]["result"] in {"pass", "warn"}
+
+
+def test_package_records_internal_and_none_profiles_do_not_redact_internal_references(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="non_safe_redaction_task", date="20260601")
+    (task_dir / "task_record.md").write_text(f"Internal service: {_redaction_fixture_internal_url()}\n", encoding="utf-8")
+
+    internal_payload = _run_package_records_dry_run(
+        root,
+        "package_records_internal_redaction.json",
+        ["--redaction-profile", "internal"],
+    )
+    none_payload = _run_package_records_dry_run(
+        root,
+        "package_records_none_redaction.json",
+        ["--redaction-profile", "none"],
+    )
+
+    assert internal_payload["redaction_profile"] == "internal"
+    assert internal_payload["redaction_count"] == 0
+    assert internal_payload["redaction"]["redaction_report"] == []
+    assert none_payload["redaction_profile"] == "none"
+    assert none_payload["redaction_count"] == 0
+    assert none_payload["redaction"]["redaction_report"] == []
+
+
+def test_package_records_secret_detection_fails_closed(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="secret_detection_task", date="20260601")
+    output_path = root / "package_records_secret_detection.json"
+    (task_dir / "task_record.md").write_text(
+        "access_token = ghp_1234567890abcdef\npassword = hunter2\n",
+        encoding="utf-8",
+    )
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(output_path),
+            "--redaction-profile",
+            "safe",
+        ]
+    )
+
+    assert rc == 2
+    assert not output_path.exists()
+    captured = capsys.readouterr()
+    assert "Package Generation: FAIL" in captured.err
+    assert "Privacy/Security: FAIL" in captured.err
+    assert "package validation failed" not in captured.err.lower()
+
+
+def test_package_records_private_key_detection_fails_closed(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="private_key_detection_task", date="20260601")
+    output_path = root / "package_records_private_key_detection.json"
+    (task_dir / "self_validation.md").write_text(
+        "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
+        encoding="utf-8",
+    )
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert rc == 2
+    assert not output_path.exists()
+
+
+def test_package_records_prohibited_artifacts_are_excluded(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="prohibited_artifact_task", date="20260601")
+    secret_file = task_dir / ".env"
+    secret_file.write_text("TOKEN=do-not-package\n", encoding="utf-8")
+
+    payload = _run_package_records_dry_run(root, "package_records_prohibited_artifact.json")
+
+    expected = {"source_path": ai_workflow.rel(root, secret_file), "reason": "prohibited_secret_path"}
+    assert payload["excluded_artifact_count"] == 1
+    assert payload["redaction"]["excluded_artifact_count"] == 1
+    assert expected in payload["artifacts"]["excluded"]
+    assert expected in payload["redaction"]["exclusion_report"]
+    assert payload["artifacts"]["prohibited_count"] == 1
+
+
+def test_package_records_directory_package_layout_and_redacted_content(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="directory_package_task", date="20260601")
+    _write_task_event_log(task_dir, {"timestamp": "2026-06-01T10:00:00Z", "event": "validation", "task_id": "001"})
+    (task_dir / "task_record.md").write_text(f"Local path: {_redaction_fixture_user_path()}\n", encoding="utf-8")
+    output_dir = root / ai_workflow.AIWF_PACKAGE_RECORDS_ROOT_DIR
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--output",
+            str(output_dir),
+            "--format",
+            "directory",
+            "--redaction-profile",
+            "safe",
+        ]
+    )
+
+    assert rc == 0
+    for rel_path in [
+        "package_manifest.json",
+        "package_summary.md",
+        "task_inventory.csv",
+        "event_inventory.csv",
+        "artifact_inventory.tsv",
+        "events/events.jsonl",
+        "dataset/aiwf_dataset.json",
+        "integrity/package_tree_manifest.tsv",
+        "integrity/package_identity.json",
+        "integrity/redaction_report.json",
+        "integrity/exclusion_report.json",
+    ]:
+        assert (output_dir / rel_path).is_file()
+
+    copied_record = output_dir / "records" / "ai_20260601" / "001_directory_package_task" / "task_record.md"
+    copied_text = copied_record.read_text(encoding="utf-8")
+    assert _redaction_fixture_user_path().split("/project", 1)[0] not in copied_text
+    assert "[AIWF-REDACTED:absolute_path]" in copied_text
+
+    manifest = json.loads((output_dir / "package_manifest.json").read_text(encoding="utf-8"))
+    summary_text = (output_dir / "package_summary.md").read_text(encoding="utf-8")
+    assert manifest["options"]["format"] == "directory"
+    assert manifest["dataset"]["included"] is True
+    assert manifest["events"]["canonical_event_count"] == 1
+    assert ai_workflow._package_records_validate_manifest_schema(manifest) == []
+    assert "- Package Generation: PASS" in summary_text
+    assert "- Manifest Schema: PASS" in summary_text
+    assert "- Package Integrity: PASS" in summary_text
+    assert "- Privacy/Security: PASS" in summary_text
+    assert "- Workflow Evidence Findings: PASS" in summary_text
+    assert "do not by themselves mean package generation failed" in summary_text
+    record_artifact = next(item for item in manifest["artifacts"]["included"] if item["package_path"].endswith("/task_record.md"))
+    assert record_artifact["redaction"] == "redacted"
+    assert record_artifact["sha256"] == hashlib.sha256(copied_record.read_bytes()).hexdigest()
+    assert "records/ai_20260601/001_directory_package_task/task_record.md" in (
+        output_dir / "integrity" / "package_tree_manifest.tsv"
+    ).read_text(encoding="utf-8")
+
+
+def test_package_records_zip_is_reproducible_and_rooted(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="zip_package_task", date="20260601")
+    _write_task_event_log(task_dir, {"timestamp": "2026-06-01T10:00:00Z", "event": "validation", "task_id": "001"})
+    first_zip = root / "first_package.zip"
+    second_zip = root / "second_package.zip"
+
+    first_rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--output",
+            str(first_zip),
+            "--format",
+            "zip",
+        ]
+    )
+    second_rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--output",
+            str(second_zip),
+            "--format",
+            "zip",
+        ]
+    )
+
+    assert first_rc == 0
+    assert second_rc == 0
+    assert first_zip.read_bytes() == second_zip.read_bytes()
+    with zipfile.ZipFile(first_zip) as archive:
+        names = sorted(archive.namelist())
+        assert all(name.startswith(f"{ai_workflow.AIWF_PACKAGE_RECORDS_ROOT_DIR}/") for name in names)
+        assert f"{ai_workflow.AIWF_PACKAGE_RECORDS_ROOT_DIR}/package_manifest.json" in names
+        assert f"{ai_workflow.AIWF_PACKAGE_RECORDS_ROOT_DIR}/events/events.jsonl" in names
+        assert f"{ai_workflow.AIWF_PACKAGE_RECORDS_ROOT_DIR}/dataset/aiwf_dataset.json" in names
+        infos = {item.filename: item for item in archive.infolist()}
+        assert all(item.date_time == (1980, 1, 1, 0, 0, 0) for item in infos.values())
+
+
+def test_package_records_force_replaces_existing_output_after_safety_checks(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="force_package_task", date="20260601")
+    output_dir = root / "records_package_dir"
+    output_dir.mkdir()
+    (output_dir / "stale.txt").write_text("stale\n", encoding="utf-8")
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--output",
+            str(output_dir),
+            "--format",
+            "directory",
+            "--force",
+        ]
+    )
+
+    assert rc == 0
+    assert not (output_dir / "stale.txt").exists()
+    assert (output_dir / "package_manifest.json").exists()
+
+
+def test_package_records_repository_metadata_reports_git_clean_and_dirty_tree(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _init_repo(root)
+    _create_v2_task(root, name="repository_metadata_task", date="20260601")
+    subprocess.run(["git", "init"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=AIWF Test",
+            "-c",
+            "user.email=aiwf-test@example.invalid",
+            "commit",
+            "-m",
+            "seed",
+        ],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    clean_path = tmp_path / "clean_repository_manifest.json"
+    clean_rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(clean_path),
+        ]
+    )
+    (root / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+    dirty_path = tmp_path / "dirty_repository_manifest.json"
+    dirty_rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(dirty_path),
+        ]
+    )
+
+    assert clean_rc == 0
+    assert dirty_rc == 0
+    clean_payload = json.loads(clean_path.read_text(encoding="utf-8"))
+    dirty_payload = json.loads(dirty_path.read_text(encoding="utf-8"))
+    assert clean_payload["repository"]["git_available"] is True
+    assert clean_payload["repository"]["dirty_tree"] is False
+    assert re.fullmatch(r"[0-9a-f]{40}", clean_payload["repository"]["commit"])
+    assert clean_payload["repository"]["branch"]
+    assert dirty_payload["repository"]["git_available"] is True
+    assert dirty_payload["repository"]["dirty_tree"] is True
+
+
+def test_package_records_discovers_all_valid_task_directories(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    first = _create_v2_task(root, name="first_package_task", date="20260601")
+    second = _create_v2_task(root, name="second_package_task", date="20260602")
+    invalid_dir = root / ".aiwf" / "records" / "ai_20260602" / "not_a_task"
+    invalid_dir.mkdir(parents=True)
+
+    payload = _run_package_records_dry_run(root, "package_records_discover.json")
+
+    assert [item["source_path"] for item in payload["selected_tasks"]] == [
+        ai_workflow.rel(root, first),
+        ai_workflow.rel(root, second),
+    ]
+    assert {"source_path": ai_workflow.rel(root, invalid_dir), "reason": "invalid_task_dir"} in payload["excluded_tasks"]
+
+
+def test_package_records_date_filter_selects_expected_tasks(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    selected = _create_v2_task(root, name="selected_date_task", date="20260601")
+    excluded = _create_v2_task(root, name="excluded_date_task", date="20260602")
+
+    payload = _run_package_records_dry_run(
+        root,
+        "package_records_date.json",
+        ["--date", "2026-06-01"],
+    )
+
+    assert [item["source_path"] for item in payload["selected_tasks"]] == [ai_workflow.rel(root, selected)]
+    assert {"source_path": ai_workflow.rel(root, excluded), "reason": "filtered_by_date"} in payload["excluded_tasks"]
+
+
+def test_package_records_metadata_filters_select_expected_tasks(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    excluded = _create_v2_task(root, name="draft_filtered_task", date="20260601")
+    selected = _create_v2_task(root, name="reviewed_filtered_task", date="20260601")
+    _rewrite_task_metadata(
+        selected / "task.md",
+        status="review",
+        workflow_phase="validation",
+        review_status="pass",
+    )
+
+    payload = _run_package_records_dry_run(
+        root,
+        "package_records_metadata_filters.json",
+        ["--status", "review", "--workflow-phase", "validation", "--review-status", "pass"],
+    )
+
+    assert [item["source_path"] for item in payload["selected_tasks"]] == [ai_workflow.rel(root, selected)]
+    assert {"source_path": ai_workflow.rel(root, excluded), "reason": "filtered_by_status"} in payload["excluded_tasks"]
+
+
+def test_package_records_task_id_selector_fails_when_ambiguous(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="first_ambiguous_task", date="20260601")
+    _create_v2_task(root, name="second_ambiguous_task", date="20260602")
+    output_path = root / "package_records_ambiguous.json"
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(output_path),
+            "--task",
+            "001",
+        ]
+    )
+
+    assert rc == 2
+    assert not output_path.exists()
+
+
+def test_package_records_task_path_selector_selects_exact_task(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    excluded = _create_v2_task(root, name="path_selector_excluded", date="20260601")
+    selected = _create_v2_task(root, name="path_selector_selected", date="20260602")
+
+    payload = _run_package_records_dry_run(
+        root,
+        "package_records_path_selector.json",
+        ["--task", ai_workflow.rel(root, selected)],
+    )
+
+    assert [item["source_path"] for item in payload["selected_tasks"]] == [ai_workflow.rel(root, selected)]
+    assert {"source_path": ai_workflow.rel(root, excluded), "reason": "filtered_by_task"} in payload["excluded_tasks"]
+
+
+def test_package_records_excluded_reasons_are_recorded(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    draft_task = _create_v2_task(root, name="excluded_draft_task", date="20260601")
+    reviewed_task = _create_v2_task(root, name="included_review_task", date="20260601")
+    _rewrite_task_metadata(reviewed_task / "task.md", status="review")
+
+    payload = _run_package_records_dry_run(
+        root,
+        "package_records_excluded_reasons.json",
+        ["--status", "review"],
+    )
+
+    assert [item["source_path"] for item in payload["selected_tasks"]] == [ai_workflow.rel(root, reviewed_task)]
+    assert {"source_path": ai_workflow.rel(root, draft_task), "reason": "filtered_by_status"} in payload["excluded_tasks"]
+
+
+def test_package_records_rejects_output_inside_records_root(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="records_output_rejected", date="20260601")
+    output_path = root / ".aiwf" / "records" / "package_records_manifest.json"
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert rc == 2
+    assert not output_path.exists()
+
+
+def test_package_records_dry_run_does_not_generate_archive_or_directory(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="no_archive_task", date="20260601")
+
+    _run_package_records_dry_run(root, "package_records_no_archive.json")
+
+    assert not (root / "aiwf_records_package").exists()
+    assert not (root / "aiwf_records_package.zip").exists()
+    assert not (root / ai_workflow.AIWF_PACKAGE_RECORDS_DATASET_PATH).exists()
+    assert not list(root.glob("*.zip"))
+
+
+def test_package_records_repeated_manifest_generation_is_byte_identical(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="stable_manifest_task", date="20260601")
+
+    first_path = _run_package_records_dry_run_file(root, "package_records_stable_1.json")
+    second_path = _run_package_records_dry_run_file(root, "package_records_stable_2.json")
+
+    assert first_path.read_bytes() == second_path.read_bytes()
+
+
+def test_package_records_task_ordering_is_deterministic(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    third = _create_v2_task(root, name="third_order_task", date="20260602")
+    first = _create_v2_task(root, name="first_order_task", date="20260601")
+    second = _create_v2_task(root, name="second_order_task", date="20260601")
+
+    payload = _run_package_records_dry_run(root, "package_records_task_order.json")
+
+    assert [item["source_path"] for item in payload["selected_tasks"]] == [
+        ai_workflow.rel(root, first),
+        ai_workflow.rel(root, second),
+        ai_workflow.rel(root, third),
+    ]
+
+
+def test_package_records_package_path_normalization_is_stable():
+    assert ai_workflow.normalize_package_path(r"./records\ai_20260601//001_task/task.md") == "records/ai_20260601/001_task/task.md"
+
+
+def test_package_records_package_path_rejects_absolute_path():
+    with pytest.raises(ValueError):
+        ai_workflow.normalize_package_path("/records/ai_20260601/001_task/task.md")
+
+
+def test_package_records_package_path_rejects_parent_traversal():
+    with pytest.raises(ValueError):
+        ai_workflow.normalize_package_path("records/ai_20260601/../001_task/task.md")
+
+
+def test_package_records_package_tree_manifest_rows_are_ordered(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="tree_manifest_task", date="20260601")
+
+    payload = _run_package_records_dry_run(root, "package_records_tree_manifest.json")
+    tree_manifest = ai_workflow._package_records_package_tree_manifest_tsv(payload["artifacts"]["included"])
+    rows = [line.split("\t") for line in tree_manifest.splitlines()]
+    paths = [row[3] for row in rows]
+
+    assert paths == sorted(paths)
+    assert all(len(row) == 4 for row in rows)
+    assert all(re.fullmatch(r"[0-9a-f]{64}", row[0]) for row in rows)
+    assert all(row[1] in {"100644", "100755", "120000"} for row in rows)
+
+
+def test_package_records_identity_is_stable_across_repeated_runs(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="stable_identity_task", date="20260601")
+
+    first = _run_package_records_dry_run(root, "package_records_identity_1.json")
+    second = _run_package_records_dry_run(root, "package_records_identity_2.json")
+
+    assert first["identity"]["reproducible_evidence_sha256"] == second["identity"]["reproducible_evidence_sha256"]
+    assert first["artifacts"]["included"] == second["artifacts"]["included"]
+
+
+def test_package_records_instance_metadata_is_excluded_from_identity(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="identity_exclusion_task", date="20260601")
+
+    payload = _run_package_records_dry_run(root, "package_records_identity_exclusion.json")
+    original_identity = payload["identity"]["reproducible_evidence_sha256"]
+    payload["generated_at_utc"] = "2026-06-30T00:00:00Z"
+    payload["repository"]["dirty_tree"] = not payload["repository"]["dirty_tree"]
+
+    recomputed = ai_workflow._package_records_identity(payload["artifacts"]["included"])
+
+    assert recomputed["reproducible_evidence_sha256"] == original_identity
+    assert "generated_at_utc" in payload["identity"]["excluded_identity_fields"]
+    assert "repository.dirty_tree" in payload["identity"]["excluded_identity_fields"]
+
+
+def test_package_records_stable_json_orders_keys():
+    assert ai_workflow.stable_json_dump({"b": 1, "a": 2}) == '{\n  "a": 2,\n  "b": 1\n}\n'
+
+
+def test_package_records_valid_manifest_passes_schema_validation(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="valid_schema_task", date="20260601")
+
+    payload = _run_package_records_dry_run(root, "package_records_schema_valid.json")
+
+    assert ai_workflow._package_records_validate_manifest_schema(payload) == []
+
+
+def test_package_records_schema_validation_rejects_missing_required_top_level_field(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="missing_schema_field_task", date="20260601")
+    payload = _run_package_records_dry_run(root, "package_records_schema_missing.json")
+    del payload["capabilities"]
+
+    errors = ai_workflow._package_records_validate_manifest_schema(payload)
+
+    assert {"path": "$.capabilities", "message": "required field is missing"} in errors
+
+
+def test_package_records_schema_validation_rejects_wrong_capability_type(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="bad_capability_task", date="20260601")
+    payload = _run_package_records_dry_run(root, "package_records_schema_capability.json")
+    payload["capabilities"]["dataset"] = "false"
+
+    errors = ai_workflow._package_records_validate_manifest_schema(payload)
+
+    assert {"path": "$.capabilities.dataset", "message": "expected boolean"} in errors
+
+
+def test_package_records_schema_validation_rejects_wrong_artifact_class(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="bad_artifact_class_task", date="20260601")
+    payload = _run_package_records_dry_run(root, "package_records_schema_artifact_class.json")
+    payload["artifacts"]["included"][0]["artifact_class"] = "runtime_policy"
+
+    errors = ai_workflow._package_records_validate_manifest_schema(payload)
+
+    assert any(error["path"] == "$.artifacts.included[0].artifact_class" for error in errors)
+    assert any("derived_analysis" in error["message"] and "workflow_evidence" in error["message"] for error in errors)
+
+
+def test_package_records_schema_validation_rejects_invalid_identity_hash_policy(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="bad_hash_policy_task", date="20260601")
+    payload = _run_package_records_dry_run(root, "package_records_schema_hash_policy.json")
+    payload["identity"]["hash_policy"] = "wrong-policy"
+
+    errors = ai_workflow._package_records_validate_manifest_schema(payload)
+
+    assert {"path": "$.identity.hash_policy", "message": 'expected "aiwf-package-records-v1"'} in errors
+
+
+def test_package_records_schema_validation_rejects_invalid_validation_status(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="bad_validation_status_task", date="20260601")
+    payload = _run_package_records_dry_run(root, "package_records_schema_validation_status.json")
+    payload["validation"]["package_generation"]["result"] = "maybe"
+
+    errors = ai_workflow._package_records_validate_manifest_schema(payload)
+
+    assert {
+        "path": "$.validation.package_generation.result",
+        "message": "expected one of: fail, pass, warn",
+    } in errors
+
+
+def test_package_records_schema_validation_failure_does_not_write_output(tmp_path: Path, monkeypatch, capsys):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="schema_failure_no_write_task", date="20260601")
+    output_path = root / "package_records_schema_failure.json"
+    monkeypatch.setattr(
+        ai_workflow,
+        "_package_records_validate_manifest_schema",
+        lambda _manifest: [{"path": "$.identity.hash_policy", "message": 'expected "aiwf-package-records-v1"'}],
+    )
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert rc == 2
+    assert not output_path.exists()
+    captured = capsys.readouterr()
+    assert "Package Generation: FAIL" in captured.err
+    assert "Manifest Schema: FAIL" in captured.err
+    assert "package records manifest schema validation failed" in captured.err
+
+
+def test_package_records_schema_validation_errors_are_deterministically_ordered(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="schema_error_order_task", date="20260601")
+    payload = _run_package_records_dry_run(root, "package_records_schema_order.json")
+    payload["identity"]["hash_policy"] = "wrong-policy"
+    payload["capabilities"]["dataset"] = "false"
+    payload["artifacts"]["included"][0]["artifact_class"] = "runtime_policy"
+
+    errors = ai_workflow._package_records_validate_manifest_schema(payload)
+
+    assert errors == sorted(errors, key=lambda item: (item["path"], item["message"]))
+    assert [error["path"] for error in errors] == [
+        "$.artifacts.included[0].artifact_class",
+        "$.capabilities.dataset",
+        "$.identity.hash_policy",
+    ]
+
+
+def test_package_records_task_local_events_counted_for_selected_task(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="task_local_events", date="20260601")
+    _write_task_event_log(
+        task_dir,
+        {"timestamp": "2026-06-01T10:00:00Z", "event": "start"},
+        {"timestamp": "2026-06-01T10:01:00Z", "event": "check"},
+    )
+
+    payload = _run_package_records_dry_run(
+        root,
+        "package_records_task_local_events.json",
+        ["--task", ai_workflow.rel(root, task_dir)],
+    )
+
+    source_path = ai_workflow.rel(root, task_dir / ".aiwf" / "events.jsonl")
+    assert payload["events"]["task_local_event_count"] == 2
+    assert payload["events"]["global_event_count"] == 0
+    assert payload["events"]["canonical_event_count"] == 2
+    assert {
+        "source_path": source_path,
+        "event_count": 2,
+        "malformed_count": 0,
+    } in payload["events"]["sources"]
+
+
+def test_package_records_global_events_associated_by_task_path(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    selected = _create_v2_task(root, name="global_task_path_selected", date="20260601")
+    unselected = _create_v2_task(root, name="global_task_path_unselected", date="20260602")
+    _write_repo_event_log(
+        root,
+        json.dumps(
+            {
+                "timestamp": "2026-06-01T10:00:00Z",
+                "event": "selected",
+                "task_path": ai_workflow.rel(root, selected),
+            }
+        ),
+        json.dumps(
+            {
+                "timestamp": "2026-06-01T10:01:00Z",
+                "event": "unselected",
+                "task_path": ai_workflow.rel(root, unselected),
+            }
+        ),
+    )
+
+    payload = _run_package_records_dry_run(
+        root,
+        "package_records_global_task_path.json",
+        ["--task", ai_workflow.rel(root, selected)],
+    )
+
+    assert payload["events"]["global_event_count"] == 1
+    assert payload["events"]["canonical_event_count"] == 1
+    assert payload["events"]["unassociated_event_count"] == 1
+    assert any(item["source_path"] == ".aiwf/events/events.jsonl" and item["event_count"] == 1 for item in payload["events"]["sources"])
+
+
+def test_package_records_global_events_associated_by_unambiguous_task_id(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="global_task_id_selected", date="20260601")
+    _write_repo_event_log(
+        root,
+        json.dumps({"timestamp": "2026-06-01T10:00:00Z", "event": "selected", "task_id": "001"}),
+    )
+
+    payload = _run_package_records_dry_run(
+        root,
+        "package_records_global_task_id.json",
+        ["--task", ai_workflow.rel(root, task_dir)],
+    )
+
+    assert payload["events"]["global_event_count"] == 1
+    assert payload["events"]["canonical_event_count"] == 1
+    assert payload["events"]["unassociated_event_count"] == 0
+
+
+def test_package_records_task_path_precedence_wins_over_ambiguous_task_id(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    selected = _create_v2_task(root, name="precedence_selected", date="20260601")
+    _create_v2_task(root, name="precedence_ambiguous_id_peer", date="20260602")
+    _write_repo_event_log(
+        root,
+        json.dumps(
+            {
+                "timestamp": "2026-06-01T10:00:00Z",
+                "event": "precedence",
+                "task_path": ai_workflow.rel(root, selected),
+                "task_id": "001",
+            }
+        ),
+    )
+
+    payload = _run_package_records_dry_run(root, "package_records_task_path_precedence.json")
+
+    assert payload["events"]["global_event_count"] == 1
+    assert payload["events"]["unassociated_event_count"] == 0
+    assert not any(item["code"] == "AIWF-PACKAGE-RECORDS-AMBIGUOUS-EVENT-TASK-ID" for item in payload["validation"]["findings"])
+
+
+def test_package_records_legacy_record_path_mapping_associates_global_event(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    selected = _create_v2_task(root, name="legacy_record_path_selected", date="20260601")
+    _write_repo_event_log(
+        root,
+        json.dumps(
+            {
+                "timestamp": "2026-06-01T10:00:00Z",
+                "event": "legacy-record-path",
+                "record_path": f"{ai_workflow.rel(root, selected)}/task_record.md",
+            }
+        ),
+    )
+
+    payload = _run_package_records_dry_run(root, "package_records_legacy_record_path.json")
+
+    assert payload["events"]["global_event_count"] == 1
+    assert payload["events"]["canonical_event_count"] == 1
+    assert payload["events"]["unassociated_event_count"] == 0
+
+
+def test_package_records_task_id_precedence_wins_over_legacy_record_path(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_id_selected = _create_v2_task(root, name="task_id_precedence_selected", date="20260601")
+    legacy_peer = _create_v2_task(root, name="legacy_precedence_peer", date="20260602")
+    _write_repo_event_log(
+        root,
+        json.dumps(
+            {
+                "timestamp": "2026-06-01T10:00:00Z",
+                "event": "task-id-precedence",
+                "task_id": "001",
+                "record_path": f"{ai_workflow.rel(root, legacy_peer)}/task_record.md",
+            }
+        ),
+    )
+
+    payload = _run_package_records_dry_run(
+        root,
+        "package_records_task_id_precedence.json",
+        ["--task", ai_workflow.rel(root, task_id_selected)],
+    )
+
+    assert payload["events"]["global_event_count"] == 1
+    assert payload["events"]["unassociated_event_count"] == 0
+    assert not any(item["code"] == "AIWF-PACKAGE-RECORDS-UNASSOCIATED-EVENT" for item in payload["validation"]["findings"])
+
+
+def test_package_records_ambiguous_task_id_association_reports_finding_and_strict_fails(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="first_ambiguous_event_task", date="20260601")
+    _create_v2_task(root, name="second_ambiguous_event_task", date="20260602")
+    _write_repo_event_log(
+        root,
+        json.dumps({"timestamp": "2026-06-01T10:00:00Z", "event": "ambiguous", "task_id": "001"}),
+    )
+
+    payload = _run_package_records_dry_run(root, "package_records_ambiguous_event_task_id.json")
+    strict_output = root / "package_records_ambiguous_event_task_id_strict.json"
+    strict_rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(strict_output),
+            "--strict",
+        ]
+    )
+
+    assert payload["events"]["global_event_count"] == 0
+    assert payload["events"]["unassociated_event_count"] == 1
+    assert any(item["code"] == "AIWF-PACKAGE-RECORDS-AMBIGUOUS-EVENT-TASK-ID" for item in payload["validation"]["findings"])
+    assert strict_rc == 2
+    assert not strict_output.exists()
+
+
+def test_package_records_unassociated_global_events_are_excluded_and_counted(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="unassociated_global_event_task", date="20260601")
+    _write_repo_event_log(
+        root,
+        json.dumps({"timestamp": "2026-06-01T10:00:00Z", "event": "repo-wide"}),
+    )
+
+    payload = _run_package_records_dry_run(root, "package_records_unassociated_global_event.json")
+
+    assert payload["events"]["global_event_count"] == 0
+    assert payload["events"]["canonical_event_count"] == 0
+    assert payload["events"]["unassociated_event_count"] == 1
+    assert any(item["code"] == "AIWF-PACKAGE-RECORDS-UNASSOCIATED-EVENT" for item in payload["validation"]["findings"])
+
+
+def test_package_records_malformed_jsonl_row_is_counted_and_reported(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="malformed_task_local_event", date="20260601")
+    _write_task_event_log(
+        task_dir,
+        '{"timestamp": "2026-06-01T10:00:00Z", "event": "valid"}',
+        '{"timestamp":',
+    )
+
+    payload = _run_package_records_dry_run(root, "package_records_malformed_event.json")
+
+    assert payload["events"]["task_local_event_count"] == 1
+    assert payload["events"]["malformed_event_count"] == 1
+    assert any(item["code"] == "AIWF-PACKAGE-RECORDS-MALFORMED-EVENT" for item in payload["validation"]["findings"])
+
+
+def test_package_records_invalid_timestamp_reports_finding_and_sort_key_is_deterministic(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="invalid_timestamp_event", date="20260601")
+    _write_task_event_log(
+        task_dir,
+        {"timestamp": "not-a-timestamp", "event": "bad"},
+        {"timestamp": "2026-06-01T10:00:00Z", "event": "good"},
+    )
+
+    payload = _run_package_records_dry_run(root, "package_records_invalid_timestamp.json")
+    sorted_items = sorted(
+        [
+            {
+                "parsed_timestamp": None,
+                "source_path": "b/events.jsonl",
+                "source_line": 1,
+            },
+            {
+                "parsed_timestamp": ai_workflow.dt.datetime.fromisoformat("2026-06-01T10:00:00+00:00"),
+                "source_path": "a/events.jsonl",
+                "source_line": 2,
+            },
+        ],
+        key=ai_workflow._package_records_canonical_event_sort_key,
+    )
+
+    assert payload["events"]["canonical_event_count"] == 2
+    assert any(item["code"] == "AIWF-PACKAGE-RECORDS-INVALID-EVENT-TIMESTAMP" for item in payload["validation"]["findings"])
+    assert sorted_items[0]["source_path"] == "a/events.jsonl"
+
+
+def test_package_records_task_local_events_only_excludes_global_event_counts(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="task_local_only_events", date="20260601")
+    _write_task_event_log(task_dir, {"timestamp": "2026-06-01T10:00:00Z", "event": "local"})
+    _write_repo_event_log(
+        root,
+        json.dumps(
+            {
+                "timestamp": "2026-06-01T10:01:00Z",
+                "event": "global",
+                "task_path": ai_workflow.rel(root, task_dir),
+            }
+        ),
+    )
+
+    payload = _run_package_records_dry_run(
+        root,
+        "package_records_task_local_only.json",
+        ["--task-local-events-only"],
+    )
+
+    assert payload["options"]["include_global_events"] is False
+    assert payload["events"]["task_local_event_count"] == 1
+    assert payload["events"]["global_event_count"] == 0
+    assert payload["events"]["canonical_event_count"] == 1
+    assert all(item["source_path"] != ".aiwf/events/events.jsonl" for item in payload["events"]["sources"])
+
+
+def test_package_records_conflicting_global_event_options_fail_closed(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root, name="conflicting_global_options", date="20260601")
+    output_path = root / "package_records_conflicting_global_options.json"
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "package",
+            "records",
+            "--dry-run",
+            "--output",
+            str(output_path),
+            "--include-global-events",
+            "--task-local-events-only",
+        ]
+    )
+
+    assert rc == 2
+    assert not output_path.exists()
+
+
+def test_package_records_manifest_remains_schema_valid_after_event_packaging(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, name="schema_valid_event_packaging", date="20260601")
+    _write_task_event_log(task_dir, {"timestamp": "2026-06-01T10:00:00Z", "event": "local"})
+    _write_repo_event_log(
+        root,
+        json.dumps(
+            {
+                "timestamp": "2026-06-01T10:01:00Z",
+                "event": "global",
+                "task_path": ai_workflow.rel(root, task_dir),
+            }
+        ),
+    )
+
+    payload = _run_package_records_dry_run(root, "package_records_event_schema_valid.json")
+
+    assert payload["events"]["canonical_event_count"] == 2
+    assert ai_workflow._package_records_validate_manifest_schema(payload) == []
 
 
 def test_invalid_workflow_phase_fails(tmp_path: Path):
@@ -2223,11 +3621,50 @@ def _write_repo_event_log(root: Path, *lines: str) -> Path:
     return event_path
 
 
+def _write_task_event_log(task_dir: Path, *events_or_lines: object) -> Path:
+    event_path = task_dir / ".aiwf" / "events.jsonl"
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(item, sort_keys=True) if isinstance(item, dict) else str(item) for item in events_or_lines]
+    event_path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    return event_path
+
+
 def _run_dataset_export(root: Path, output_name: str = "dataset.json") -> dict[str, object]:
     output_path = root / output_name
     rc = ai_workflow.dataset_export_command(root, output_name, "json")
     assert rc == 0
     return json.loads(output_path.read_text(encoding="utf-8"))
+
+
+def _run_package_records_dry_run(
+    root: Path,
+    output_name: str = "package_manifest.json",
+    extra_args: list[str] | None = None,
+) -> dict[str, object]:
+    output_path = _run_package_records_dry_run_file(root, output_name, extra_args)
+    return json.loads(output_path.read_text(encoding="utf-8"))
+
+
+def _run_package_records_dry_run_file(
+    root: Path,
+    output_name: str = "package_manifest.json",
+    extra_args: list[str] | None = None,
+) -> Path:
+    output_path = root / output_name
+    args = [
+        "--repo-root",
+        str(root),
+        "package",
+        "records",
+        "--dry-run",
+        "--output",
+        str(output_path),
+    ]
+    if extra_args:
+        args.extend(extra_args)
+    rc = ai_workflow.main(args)
+    assert rc == 0
+    return output_path
 
 
 def _event_result_status(event: dict[str, object]) -> str:
