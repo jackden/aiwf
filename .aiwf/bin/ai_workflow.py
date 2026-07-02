@@ -59,6 +59,15 @@ AIWF_BIN_DIR = Path(__file__).resolve().parent
 if str(AIWF_BIN_DIR) not in sys.path:
     sys.path.insert(0, str(AIWF_BIN_DIR))
 
+from safe_paths import (  # noqa: E402
+    SafePathError,
+    find_symlink_component,
+    find_tree_symlink,
+    lexical_relative,
+    safe_copy_file_no_symlink,
+    safe_copy_tree_no_symlink,
+)
+
 from lib.package_core import (  # noqa: E402
     build_manifest_row,
     compute_sha256,
@@ -88,7 +97,7 @@ SCHEMA_V16 = "ai-workflow-v1.6"
 CURRENT_SCHEMA_VERSION = SCHEMA_V16
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16}
 WORKFLOW_PROTOCOL_VERSION = "1.7.8"
-AIWF_TOOL_VERSION = "1.7.9"
+AIWF_TOOL_VERSION = "1.7.10"
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.1"
 AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.2"
 AIWF_EXPERIMENT_SCHEMA_VERSION = "aiwf-experiment-v0.1"
@@ -1865,6 +1874,20 @@ def _upgrade_source_requirements(source_root: Path) -> list[tuple[str, Path]]:
     ]
 
 
+def _upgrade_source_info_unknown() -> dict[str, Any]:
+    return {
+        "tool_version": "unknown",
+        "protocol_version": "unknown",
+        "layout_version": 2,
+        "runtime": ".aiwf/bin/ai_workflow.py",
+        "records_root": ".aiwf/records",
+    }
+
+
+def _upgrade_source_rel(source_root: Path, path: Path) -> str:
+    return lexical_relative(path, source_root)
+
+
 def _upgrade_validate_source(source_root: Path) -> list[str]:
     blockers: list[str] = []
     if not source_root.exists():
@@ -1874,11 +1897,31 @@ def _upgrade_validate_source(source_root: Path) -> list[str]:
         blockers.append(f"source path is not a directory: {source_root}")
         return blockers
     for label, path in _upgrade_source_requirements(source_root):
+        symlink_path = find_symlink_component(path, source_root)
+        if symlink_path is not None:
+            blockers.append(
+                "source package member must not be a symlink: "
+                f"{_upgrade_source_rel(source_root, symlink_path)}"
+            )
+            continue
         if not path.exists():
-            blockers.append(f"missing {label}: {rel(source_root, path)}")
+            blockers.append(f"missing {label}: {_upgrade_source_rel(source_root, path)}")
+            continue
+        if label == ".aiwf/docs":
+            if not path.is_dir():
+                blockers.append(f"{label} is not a directory: {_upgrade_source_rel(source_root, path)}")
+                continue
+            symlink_path = find_tree_symlink(path)
+            if symlink_path is not None:
+                blockers.append(
+                    "source package tree must not contain symlinks: "
+                    f"{_upgrade_source_rel(source_root, symlink_path)}"
+                )
+        elif not path.is_file():
+            blockers.append(f"{label} is not a file: {_upgrade_source_rel(source_root, path)}")
     aiwf_entrypoint = source_root / "aiwf"
-    if aiwf_entrypoint.exists() and not os.access(aiwf_entrypoint, os.X_OK):
-        blockers.append(f"aiwf is not executable: {rel(source_root, aiwf_entrypoint)}")
+    if not blockers and aiwf_entrypoint.exists() and not os.access(aiwf_entrypoint, os.X_OK):
+        blockers.append(f"aiwf is not executable: {_upgrade_source_rel(source_root, aiwf_entrypoint)}")
     return blockers
 
 
@@ -1948,10 +1991,13 @@ def _copy_upgrade_artifacts(source_root: Path, target_root: Path) -> list[str]:
         if source.resolve() == destination.resolve():
             continue
         ensure_dir(destination.parent)
-        if source.is_dir():
-            shutil.copytree(source, destination, dirs_exist_ok=True)
-        else:
-            shutil.copy2(source, destination)
+        try:
+            if source.is_dir():
+                safe_copy_tree_no_symlink(source, destination, source_root)
+            else:
+                safe_copy_file_no_symlink(source, destination, source_root)
+        except SafePathError as exc:
+            raise SystemExit(f"ERROR: {exc}") from exc
         copied.append(rel_path)
     return copied
 
@@ -2027,7 +2073,7 @@ def upgrade_command(
     source_root = Path(source).expanduser().resolve()
     blockers = _upgrade_validate_source(source_root)
     current_info = _upgrade_current_info(root)
-    source_info = _upgrade_source_info(source_root)
+    source_info = _upgrade_source_info_unknown() if blockers else _upgrade_source_info(source_root)
     relocation_entries = [
         entry
         for entry in (_candidate_legacy_docs_relocation_paths(root) if migrate_legacy_docs else [])

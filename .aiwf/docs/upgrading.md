@@ -37,7 +37,7 @@ chmod +x ./aiwf
 ./aiwf upgrade --apply --source /path/to/new_aiwf_repo
 ```
 
-This sequence was verified against the current v1.7.9 runtime.
+This sequence was verified against the current v1.7.10 runtime.
 
 ## Upgrade Modes
 

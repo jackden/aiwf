@@ -93,6 +93,13 @@ def _assert_text_files_unchanged(before: dict[Path, str]) -> None:
         assert path.read_text(encoding="utf-8") == content
 
 
+def _symlink_or_skip(link: Path, target: Path | str, *, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+
 def _copy_supported_install_set(source_root: Path, target_root: Path) -> None:
     (target_root / ".aiwf").mkdir(parents=True, exist_ok=True)
     shutil.copy2(source_root / "aiwf", target_root / "aiwf")
@@ -176,6 +183,27 @@ def _seed_current_v2_repo(root: Path, *, with_legacy_docs: bool = False) -> Path
         + "\n",
         encoding="utf-8",
     )
+    return root
+
+
+def _seed_minimal_upgrade_source(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "aiwf").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (root / "aiwf").chmod(0o755)
+    runtime = root / ".aiwf" / "bin" / "ai_workflow.py"
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    runtime.write_text(
+        "\n".join(
+            [
+                'AIWF_TOOL_VERSION = "9.9.9"',
+                'WORKFLOW_PROTOCOL_VERSION = "9.9.9"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / ".aiwf" / "docs").mkdir(parents=True, exist_ok=True)
+    (root / ".aiwf" / "docs" / "workflow_protocol.md").write_text("protocol\n", encoding="utf-8")
     return root
 
 
@@ -1394,6 +1422,76 @@ def test_upgrade_check_rejects_missing_source_runtime(tmp_path: Path, capsys):
 
     assert rc == 2
     assert "missing .aiwf/bin/ai_workflow.py" in out
+
+
+def test_upgrade_check_rejects_source_runtime_symlink(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    root = _seed_upgrade_target_repo(target)
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    runtime = source / ".aiwf" / "bin" / "ai_workflow.py"
+    real_runtime = source / "real_runtime.py"
+    real_runtime.write_text(runtime.read_text(encoding="utf-8"), encoding="utf-8")
+    runtime.unlink()
+    _symlink_or_skip(runtime, real_runtime)
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(source)])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "source package member must not be a symlink: .aiwf/bin/ai_workflow.py" in out
+
+
+def test_upgrade_check_rejects_source_docs_symlink(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    root = _seed_upgrade_target_repo(target)
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    docs = source / ".aiwf" / "docs"
+    real_docs = source / "real_docs"
+    shutil.rmtree(docs)
+    real_docs.mkdir()
+    (real_docs / "workflow_protocol.md").write_text("protocol\n", encoding="utf-8")
+    _symlink_or_skip(docs, real_docs, target_is_directory=True)
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(source)])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "source package member must not be a symlink: .aiwf/docs" in out
+
+
+def test_upgrade_check_rejects_nested_source_docs_symlink(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    root = _seed_upgrade_target_repo(target)
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    private_doc = tmp_path / "private_doc.md"
+    private_doc.write_text("private\n", encoding="utf-8")
+    _symlink_or_skip(source / ".aiwf" / "docs" / "linked.md", private_doc)
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(source)])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "source package tree must not contain symlinks: .aiwf/docs/linked.md" in out
+
+
+def test_upgrade_check_normal_minimal_source_without_symlinks_still_succeeds(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    root = _seed_upgrade_target_repo(target)
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(source)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "blockers: none" in out
 
 
 def test_dataset_export_basic_schema_and_allowed_fields(tmp_path: Path):
