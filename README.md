@@ -71,8 +71,8 @@ Current metadata version boundary:
 
 | Field | Value |
 |-------|-------|
-| Release version | `1.7.10` |
-| AIWF Tool Version | `1.7.10` |
+| Release version | `1.7.10.post2` |
+| AIWF Tool Version | `1.7.10.post2` |
 | Workflow Protocol Version | `1.7.8` |
 
 ## Documentation
@@ -106,6 +106,7 @@ Current metadata version boundary:
 - v1.7.8.post1 public release baseline: [.aiwf/docs/releases/v1.7.8.post1.md](.aiwf/docs/releases/v1.7.8.post1.md)
 - v1.7.9 Package Records evidence portability: [.aiwf/docs/releases/v1.7.9.md](.aiwf/docs/releases/v1.7.9.md)
 - v1.7.10 filesystem trust-boundary security hardening: [.aiwf/docs/releases/v1.7.10.md](.aiwf/docs/releases/v1.7.10.md)
+- v1.7.10.post2 upgrade runtime dependency and template copy-scope fix: [.aiwf/docs/releases/v1.7.10.post2.md](.aiwf/docs/releases/v1.7.10.post2.md)
 - Package Records release preparation: [.aiwf/docs/releases/package_records_release_preparation.md](.aiwf/docs/releases/package_records_release_preparation.md)
 
 ## Install AIWF in a New Repository
@@ -160,7 +161,7 @@ chmod +x ./aiwf
 ```
 
 Expected result:
-- `./aiwf`, `.aiwf/bin/ai_workflow.py`, and `.aiwf/docs/` come from the new source package.
+- `./aiwf`, `.aiwf/bin/**`, `.aiwf/docs/**`, and `.aiwf/templates/**` come from the new source package.
 - `.aiwf/records/`, `.aiwf/events/`, `.aiwf/migrations/`, and `.aiwf/config.yaml` are preserved.
 - project-level `docs/`, `tools/`, and `scripts/` remain project-owned.
 - existing project-owned files under root `scripts/` remain unchanged.
@@ -168,6 +169,7 @@ Expected result:
 
 Validation:
 ```bash
+./aiwf --help
 ./aiwf upgrade --check --source /path/to/new_aiwf_repo
 ./aiwf upgrade --dry-run --source /path/to/new_aiwf_repo
 ./aiwf agents check --path AGENTS.md
@@ -226,12 +228,12 @@ AGENTS root entrypoint helpers:
 
 Root `AGENTS.md` is a thin managed bootstrap entrypoint. The managed block source of truth is [`.aiwf/templates/AGENTS.block.md`](.aiwf/templates/AGENTS.block.md). The canonical rules live under `.aiwf/docs/agent_rules/`, starting with [`.aiwf/docs/agent_rules/00_root_entrypoint.md`](.aiwf/docs/agent_rules/00_root_entrypoint.md).
 
-### Version Metadata Policy (v1.7.10)
-For this release, release identity and tool provenance advance to `1.7.10` while workflow protocol semantics remain at `1.7.8`.
+### Version Metadata Policy (v1.7.10.post2)
+For this release, release identity and tool provenance advance to `1.7.10.post2` while workflow protocol semantics remain at `1.7.8`.
 
 Current metadata version boundary:
-- release version: `1.7.10`
-- tool version: `1.7.10`
+- release version: `1.7.10.post2`
+- tool version: `1.7.10.post2`
 - workflow protocol version: `1.7.8`
 
 The upgrade mechanism is additive and does not imply a package manager, a database migration framework, or silent overwrites of workflow evidence.
@@ -317,6 +319,24 @@ Report commands:
 ./aiwf report --path .aiwf/records --format json
 ./aiwf report --path .aiwf/records --format markdown
 ```
+
+## New in v1.7.10.post2
+
+AIWF v1.7.10.post2 fixes public package upgrade reliability for multi-file
+runtime installs.
+
+This patch ensures `upgrade --apply` installs:
+
+- `aiwf`
+- `.aiwf/bin/**`
+- `.aiwf/docs/**`
+- `.aiwf/templates/**`
+
+`upgrade --check` now validates source package completeness and detects
+same-version target repositories that are missing runtime dependencies or the
+managed AGENTS template. No workflow protocol semantic change, event schema
+change, finalize gate change, phase state machine change, or records migration
+is introduced.
 
 ## New in v1.7.10
 

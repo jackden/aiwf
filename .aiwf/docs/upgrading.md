@@ -10,11 +10,21 @@ For a brand-new repository, use [adoption_guide.md](adoption_guide.md) instead.
 The source repository used with `./aiwf upgrade --source <path>` must contain:
 
 - `aiwf`
-- `.aiwf/bin/ai_workflow.py`
+- `.aiwf/bin/**`
 - `.aiwf/docs/`
+- `.aiwf/templates/`
 
-That is the runtime/source package the current upgrade command validates.
-If you want root `AGENTS.md` helpers to work immediately after upgrade, the repository package also needs `.aiwf/templates/AGENTS.block.md` because the AGENTS commands read that template.
+At minimum, `upgrade --check` validates that the source package contains `aiwf`,
+`.aiwf/bin/ai_workflow.py`, `.aiwf/bin/safe_paths.py`, `.aiwf/bin/lib/`,
+`.aiwf/bin/lib/package_core.py`, `.aiwf/docs/`, and
+`.aiwf/templates/AGENTS.block.md`.
+
+The runtime dependency set must include `.aiwf/bin/safe_paths.py` and
+`.aiwf/bin/lib/package_core.py`.
+
+GitHub ZIP downloads and git clones are both supported as source packages when
+`--source` points to the extracted package root that contains `aiwf` and
+`.aiwf/`.
 
 ## Install or Upgrade
 
@@ -37,14 +47,14 @@ chmod +x ./aiwf
 ./aiwf upgrade --apply --source /path/to/new_aiwf_repo
 ```
 
-This sequence was verified against the current v1.7.10 runtime.
+This sequence was verified against the current v1.7.10.post2 runtime.
 
 ## Upgrade Modes
 
 | Mode | Writes files? | What it validates | What it reports | Stop when | Exit behavior |
 |---|---|---|---|---|---|
-| `--check` | No | Source package validity, current vs target versions, layout state, and whether relocation is needed | Current/target summary, blockers, planned updates, preserved paths, relocation plan, and a suggested next step | Any blockers are reported, or the plan is not what you want | `0` on success, `2` on blockers or invalid source |
-| `--dry-run` | No | The same comparison as `--check` | The same plan without changing files | Any blockers are reported, or the planned relocations/updates are not what you want | `0` on success, `2` on blockers or invalid source |
+| `--check` | No | Source package validity, target dependency completeness, current vs target versions, layout state, and whether relocation is needed | Current/target summary, blockers, planned updates or repairs, preserved paths, relocation plan, and a suggested next step | Any blockers are reported, or the plan is not what you want | `0` on success, `2` on blockers or invalid source |
+| `--dry-run` | No | The same comparison as `--check` | The same plan without changing files; no-op plans report `Will update: none` | Any blockers are reported, or the planned relocations/updates are not what you want | `0` on success, `2` on blockers or invalid source |
 | `--apply` | Yes | The validated plan is executed and written to disk | Installed files, preserved paths, relocated legacy paths, and a migration report path | The dry-run output does not match your expectations | `0` on success or no-op, `2` on blockers or invalid source |
 
 `--no-relocate` skips legacy layout relocation and leaves the old layout in place.
@@ -119,13 +129,16 @@ Upgrade preserves the file and does not relocate it.
 - `./aiwf agents check --path AGENTS.md` validates the installed block and reports `AIWF-AGENTS-OUTDATED` when the managed block drifts.
 - `./aiwf agents install --path AGENTS.md --yes` creates or updates only the managed block and preserves the rest of the file.
 
-If the template file is missing in the upgraded repository, copy `.aiwf/templates/AGENTS.block.md` from the source package before relying on the AGENTS helpers.
+If the target repository is already on the same tool version but is missing
+`.aiwf/templates/AGENTS.block.md`, `upgrade --check` reports repair as needed and
+`upgrade --apply` reinstalls `.aiwf/templates/**`.
 
 ## Post-Upgrade Validation
 
 After `upgrade --apply`, validate the repository with:
 
 ```bash
+./aiwf --help >/tmp/aiwf_help.txt
 ./aiwf upgrade --check --source /path/to/new_aiwf_repo
 ./aiwf upgrade --dry-run --source /path/to/new_aiwf_repo
 ./aiwf agents check --path AGENTS.md
@@ -136,8 +149,10 @@ Recommended spot checks:
 
 - confirm the `tool_version` and `layout_version` reported by `upgrade --check`
 - confirm `./aiwf` resolves the repo-local runtime at `.aiwf/bin/ai_workflow.py`
+- confirm `.aiwf/bin/safe_paths.py` and `.aiwf/bin/lib/package_core.py` exist in the upgraded repository
 - confirm `.aiwf/docs/` exists in the upgraded repository
-- confirm `./aiwf agents check --path AGENTS.md` passes when the template is present
+- confirm `.aiwf/templates/AGENTS.block.md` exists in the upgraded repository
+- confirm `./aiwf agents check --path AGENTS.md` does not fail because the managed block template is missing
 - confirm `.aiwf/records/ai_YYYYMMDD/` is still the active records root
 - confirm project-level `docs/`, `tools/`, and `scripts/` were not modified unless you explicitly chose a legacy AIWF docs migration
 - confirm existing project-owned files under root `scripts/` remain unchanged
@@ -147,12 +162,13 @@ Recommended spot checks:
 
 | Symptom | Cause | Recommended correction |
 |---|---|---|
-| `upgrade --check` reports missing `aiwf` or `.aiwf/bin/ai_workflow.py` | Only part of the new package was copied into the source repo or target repo | Copy the missing package paths and rerun `--check` |
+| `upgrade --check` reports a missing required source package path | Only part of the new package was copied into the source repo | Use a source package that contains `aiwf`, `.aiwf/bin/**`, `.aiwf/docs/**`, and `.aiwf/templates/**`, then rerun `--check` |
+| `upgrade --check` reports `repair_required: yes` for the same tool version | The target repo is missing runtime dependencies or managed templates | Run `./aiwf upgrade --apply --source <source_repo>` to reinstall the missing AIWF-owned package paths |
 | `upgrade --check` or `--dry-run` reports `relocation_required: yes` | The target repo still has legacy `docs/ai_*` paths | Review the relocation plan, then run `--apply` or intentionally use `--no-relocate` |
 | `upgrade --check` warns that `tools/ai_workflow.py` exists | An older project-owned legacy file is still present | Keep it if callers depend on it, or remove it manually after confirming it is unused |
 | `upgrade --dry-run` shows a destination already exists | The target repo already contains a file at the relocation destination | Resolve the duplicate path before `--apply` |
 | `AIWF-AGENTS-OUTDATED` after upgrade | The managed block no longer matches `.aiwf/templates/AGENTS.block.md` | Re-run `./aiwf agents install --path AGENTS.md --yes` |
-| `./aiwf agents check --path AGENTS.md` fails because the template is missing | The package copy did not include `.aiwf/templates/AGENTS.block.md` | Copy the template from the source package, then rerun the AGENTS command |
+| `./aiwf agents check --path AGENTS.md` fails because the template is missing | The target was upgraded by an older package copy scope | Run `./aiwf upgrade --check --source <source_repo>` and apply the reported repair |
 | `git status` shows copied datasets or backup files | Generated state was copied from another repository | Remove those files from the commit set and keep only the AIWF package files |
 
 ## Reference Example

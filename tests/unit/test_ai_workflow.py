@@ -156,15 +156,8 @@ def _seed_current_v2_repo(root: Path, *, with_legacy_docs: bool = False) -> Path
     _init_repo(root)
     if with_legacy_docs:
         _seed_legacy_relocation_layout(root)
-    (root / ".aiwf").mkdir(parents=True, exist_ok=True)
-    (root / ".aiwf" / "bin").mkdir(parents=True, exist_ok=True)
-    (root / ".aiwf" / "docs").mkdir(parents=True, exist_ok=True)
     (root / ".aiwf" / "records").mkdir(parents=True, exist_ok=True)
-    (root / ".aiwf" / "bin" / "ai_workflow.py").write_text(
-        (REPO_ROOT / ".aiwf" / "bin" / "ai_workflow.py").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    (root / ".aiwf" / "bin" / "ai_workflow.py").chmod(0o755)
+    _copy_supported_install_set(REPO_ROOT, root)
     (root / "tools").mkdir(parents=True, exist_ok=True)
     (root / "tools" / "ai_workflow.py").write_text(
         "print('project-owned legacy tools file')\n",
@@ -202,8 +195,13 @@ def _seed_minimal_upgrade_source(root: Path) -> Path:
         + "\n",
         encoding="utf-8",
     )
+    (root / ".aiwf" / "bin" / "safe_paths.py").write_text("class SafePathError(ValueError):\n    pass\n", encoding="utf-8")
+    (root / ".aiwf" / "bin" / "lib").mkdir(parents=True, exist_ok=True)
+    (root / ".aiwf" / "bin" / "lib" / "package_core.py").write_text("# package core\n", encoding="utf-8")
     (root / ".aiwf" / "docs").mkdir(parents=True, exist_ok=True)
     (root / ".aiwf" / "docs" / "workflow_protocol.md").write_text("protocol\n", encoding="utf-8")
+    (root / ".aiwf" / "templates").mkdir(parents=True, exist_ok=True)
+    (root / ".aiwf" / "templates" / "AGENTS.block.md").write_text("managed block\n", encoding="utf-8")
     return root
 
 
@@ -1245,8 +1243,10 @@ def test_upgrade_check_current_v2_repo_no_upgrade_needed(tmp_path: Path, capsys)
     assert "[INFO] AIWF-UPGRADE-CHECK" in out
     assert f"tool_version: {ai_workflow.AIWF_TOOL_VERSION}" in out
     assert "upgrade_required: no" in out
+    assert "repair_required: no" in out
     assert "relocation_required: no" in out
     assert "blockers: none" in out
+    assert "Will update:\n  - none" in out
 
 
 def test_upgrade_check_current_v2_repo_no_relocation_needed(tmp_path: Path, capsys):
@@ -1317,6 +1317,9 @@ def test_upgrade_apply_preserves_project_docs_by_default(tmp_path: Path, capsys)
     runtime_text = (root / ".aiwf" / "bin" / "ai_workflow.py").read_text(encoding="utf-8")
     assert f'AIWF_TOOL_VERSION = "{ai_workflow.AIWF_TOOL_VERSION}"' in runtime_text
     assert (root / ".aiwf" / "docs" / "workflow_protocol.md").exists()
+    assert (root / ".aiwf" / "bin" / "safe_paths.py").exists()
+    assert (root / ".aiwf" / "bin" / "lib" / "package_core.py").exists()
+    assert (root / ".aiwf" / "templates" / "AGENTS.block.md").exists()
     assert (root / ".aiwf" / "docs" / "adoption_guide.md").exists()
     assert (root / ".aiwf" / "docs" / "agent_rules" / "00_index.md").exists()
     assert (root / ".aiwf" / "docs" / "examples" / "basic_lifecycle.md").exists()
@@ -1337,6 +1340,11 @@ def test_upgrade_apply_preserves_project_docs_by_default(tmp_path: Path, capsys)
     assert "# AIWF Upgrade Report" in report_text
     assert f"source_tool_version: {ai_workflow.AIWF_TOOL_VERSION}" in report_text
     assert "validation result" in report_text.lower()
+    assert "- .aiwf/bin" in report_text
+    assert "- .aiwf/templates" in report_text
+
+    help_result = subprocess.run([str(root / "aiwf"), "--help"], cwd=root, text=True, capture_output=True, check=False)
+    assert help_result.returncode == 0
 
 
 def test_upgrade_apply_preserves_project_scripts_and_does_not_create_removed_helper(tmp_path: Path, capsys):
@@ -1421,7 +1429,136 @@ def test_upgrade_check_rejects_missing_source_runtime(tmp_path: Path, capsys):
     out = capsys.readouterr().out
 
     assert rc == 2
-    assert "missing .aiwf/bin/ai_workflow.py" in out
+    assert "missing required source package path: .aiwf/bin/ai_workflow.py" in out
+
+
+def test_upgrade_check_rejects_missing_source_safe_paths(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    root = _seed_upgrade_target_repo(target)
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    (source / ".aiwf" / "bin" / "safe_paths.py").unlink()
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(source)])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "blockers: 1" in out
+    assert "missing required source package path: .aiwf/bin/safe_paths.py" in out
+
+
+def test_upgrade_check_rejects_missing_source_lib(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    root = _seed_upgrade_target_repo(target)
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    shutil.rmtree(source / ".aiwf" / "bin" / "lib")
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(source)])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "blockers: 2" in out
+    assert "missing required source package path: .aiwf/bin/lib" in out
+    assert "missing required source package path: .aiwf/bin/lib/package_core.py" in out
+
+
+def test_upgrade_check_rejects_missing_source_package_core(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    root = _seed_upgrade_target_repo(target)
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    (source / ".aiwf" / "bin" / "lib" / "package_core.py").unlink()
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(source)])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "blockers: 1" in out
+    assert "missing required source package path: .aiwf/bin/lib/package_core.py" in out
+
+
+def test_upgrade_check_rejects_missing_source_agents_template(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    root = _seed_upgrade_target_repo(target)
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    (source / ".aiwf" / "templates" / "AGENTS.block.md").unlink()
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(source)])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "blockers: 1" in out
+    assert "missing required source package path: .aiwf/templates/AGENTS.block.md" in out
+
+
+def test_upgrade_check_same_version_missing_runtime_dependency_requires_repair(tmp_path: Path, capsys):
+    root = _seed_current_v2_repo(tmp_path)
+    (root / ".aiwf" / "bin" / "safe_paths.py").unlink()
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(REPO_ROOT)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "upgrade_required: yes" in out
+    assert "repair_required: yes" in out
+    assert "Will update:\n  - .aiwf/bin/**" in out
+    assert "Next:\n  none" not in out
+
+
+def test_upgrade_check_same_version_missing_package_core_requires_repair(tmp_path: Path, capsys):
+    root = _seed_current_v2_repo(tmp_path)
+    (root / ".aiwf" / "bin" / "lib" / "package_core.py").unlink()
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(REPO_ROOT)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "upgrade_required: yes" in out
+    assert "repair_required: yes" in out
+    assert "Will update:\n  - .aiwf/bin/**" in out
+    assert "upgrade_required: no\n  repair_required: no" not in out
+    assert "Next:\n  none" not in out
+
+
+def test_upgrade_check_same_version_missing_template_requires_repair(tmp_path: Path, capsys):
+    root = _seed_current_v2_repo(tmp_path)
+    (root / ".aiwf" / "templates" / "AGENTS.block.md").unlink()
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--check", "--source", str(REPO_ROOT)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "upgrade_required: yes" in out
+    assert "repair_required: yes" in out
+    assert "Will update:\n  - .aiwf/templates/**" in out
+
+
+def test_upgrade_apply_same_version_repairs_missing_runtime_and_template(tmp_path: Path, capsys):
+    root = _seed_current_v2_repo(tmp_path)
+    (root / ".aiwf" / "bin" / "safe_paths.py").unlink()
+    shutil.rmtree(root / ".aiwf" / "bin" / "lib")
+    shutil.rmtree(root / ".aiwf" / "templates")
+
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "upgrade", "--apply", "--source", str(REPO_ROOT)])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "[INFO] AIWF-UPGRADE-OK" in out
+    assert (root / ".aiwf" / "bin" / "safe_paths.py").exists()
+    assert (root / ".aiwf" / "bin" / "lib" / "package_core.py").exists()
+    assert (root / ".aiwf" / "templates" / "AGENTS.block.md").exists()
+    assert "- installed .aiwf/bin" in out
+    assert "- installed .aiwf/templates" in out
 
 
 def test_upgrade_check_rejects_source_runtime_symlink(tmp_path: Path, capsys):

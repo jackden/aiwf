@@ -97,7 +97,7 @@ SCHEMA_V16 = "ai-workflow-v1.6"
 CURRENT_SCHEMA_VERSION = SCHEMA_V16
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16}
 WORKFLOW_PROTOCOL_VERSION = "1.7.8"
-AIWF_TOOL_VERSION = "1.7.10"
+AIWF_TOOL_VERSION = "1.7.10.post2"
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.1"
 AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.2"
 AIWF_EXPERIMENT_SCHEMA_VERSION = "aiwf-experiment-v0.1"
@@ -1866,11 +1866,52 @@ def _read_version_constant(path: Path, symbol: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def _upgrade_source_requirements(source_root: Path) -> list[tuple[str, Path]]:
+UPGRADE_REQUIRED_SOURCE_PATHS: tuple[tuple[str, str], ...] = (
+    ("aiwf", "file"),
+    (".aiwf/bin/ai_workflow.py", "file"),
+    (".aiwf/bin/safe_paths.py", "file"),
+    (".aiwf/bin/lib", "dir"),
+    (".aiwf/bin/lib/package_core.py", "file"),
+    (".aiwf/docs", "dir"),
+    (".aiwf/templates/AGENTS.block.md", "file"),
+)
+UPGRADE_SOURCE_TREE_PATHS: tuple[str, ...] = (
+    ".aiwf/bin/lib",
+    ".aiwf/docs",
+    ".aiwf/templates",
+)
+UPGRADE_TARGET_REQUIRED_PATHS: tuple[tuple[str, str], ...] = (
+    ("aiwf", "file"),
+    (".aiwf/bin/ai_workflow.py", "file"),
+    (".aiwf/bin/safe_paths.py", "file"),
+    (".aiwf/bin/lib", "dir"),
+    (".aiwf/bin/lib/package_core.py", "file"),
+    (".aiwf/templates/AGENTS.block.md", "file"),
+)
+UPGRADE_FULL_UPDATE_PLAN: tuple[str, ...] = (
+    "aiwf",
+    ".aiwf/bin/**",
+    ".aiwf/docs/**",
+    ".aiwf/templates/**",
+)
+UPGRADE_PRESERVED_PATHS: tuple[str, ...] = (
+    ".aiwf/records/**",
+    ".aiwf/events/**",
+    ".aiwf/migrations/**",
+    ".aiwf/config.yaml",
+)
+UPGRADE_COPY_SPECS: Mapping[str, tuple[str, str]] = {
+    "aiwf": ("aiwf", "aiwf"),
+    ".aiwf/bin/**": (".aiwf/bin", ".aiwf/bin"),
+    ".aiwf/docs/**": (".aiwf/docs", ".aiwf/docs"),
+    ".aiwf/templates/**": (".aiwf/templates", ".aiwf/templates"),
+}
+
+
+def _upgrade_source_requirements(source_root: Path) -> list[tuple[str, Path, str]]:
     return [
-        ("aiwf", source_root / "aiwf"),
-        (".aiwf/bin/ai_workflow.py", source_root / ".aiwf" / "bin" / "ai_workflow.py"),
-        (".aiwf/docs", source_root / ".aiwf" / "docs"),
+        (rel_path, source_root / rel_path, expected_type)
+        for rel_path, expected_type in UPGRADE_REQUIRED_SOURCE_PATHS
     ]
 
 
@@ -1896,7 +1937,7 @@ def _upgrade_validate_source(source_root: Path) -> list[str]:
     if not source_root.is_dir():
         blockers.append(f"source path is not a directory: {source_root}")
         return blockers
-    for label, path in _upgrade_source_requirements(source_root):
+    for label, path, expected_type in _upgrade_source_requirements(source_root):
         symlink_path = find_symlink_component(path, source_root)
         if symlink_path is not None:
             blockers.append(
@@ -1905,24 +1946,64 @@ def _upgrade_validate_source(source_root: Path) -> list[str]:
             )
             continue
         if not path.exists():
-            blockers.append(f"missing {label}: {_upgrade_source_rel(source_root, path)}")
+            blockers.append(f"missing required source package path: {_upgrade_source_rel(source_root, path)}")
             continue
-        if label == ".aiwf/docs":
+        if expected_type == "dir":
             if not path.is_dir():
-                blockers.append(f"{label} is not a directory: {_upgrade_source_rel(source_root, path)}")
+                blockers.append(f"required source package path is not a directory: {_upgrade_source_rel(source_root, path)}")
                 continue
-            symlink_path = find_tree_symlink(path)
-            if symlink_path is not None:
-                blockers.append(
-                    "source package tree must not contain symlinks: "
-                    f"{_upgrade_source_rel(source_root, symlink_path)}"
-                )
         elif not path.is_file():
-            blockers.append(f"{label} is not a file: {_upgrade_source_rel(source_root, path)}")
+            blockers.append(f"required source package path is not a file: {_upgrade_source_rel(source_root, path)}")
+    for rel_path in UPGRADE_SOURCE_TREE_PATHS:
+        path = source_root / rel_path
+        if not path.exists() or not path.is_dir():
+            continue
+        symlink_path = find_tree_symlink(path)
+        if symlink_path is not None:
+            blockers.append(
+                "source package tree must not contain symlinks: "
+                f"{_upgrade_source_rel(source_root, symlink_path)}"
+            )
     aiwf_entrypoint = source_root / "aiwf"
     if not blockers and aiwf_entrypoint.exists() and not os.access(aiwf_entrypoint, os.X_OK):
         blockers.append(f"aiwf is not executable: {_upgrade_source_rel(source_root, aiwf_entrypoint)}")
     return blockers
+
+
+def _upgrade_target_requirement_gaps(root: Path) -> list[str]:
+    gaps: list[str] = []
+    for rel_path, expected_type in UPGRADE_TARGET_REQUIRED_PATHS:
+        path = root / rel_path
+        if expected_type == "dir":
+            if not path.is_dir():
+                gaps.append(rel_path)
+        elif not path.is_file():
+            gaps.append(rel_path)
+    return gaps
+
+
+def _upgrade_repair_plan(target_gaps: Sequence[str]) -> list[str]:
+    plan: list[str] = []
+    if "aiwf" in target_gaps:
+        plan.append("aiwf")
+    if any(path.startswith(".aiwf/bin/") for path in target_gaps):
+        plan.append(".aiwf/bin/**")
+    if any(path.startswith(".aiwf/docs/") or path == ".aiwf/docs" for path in target_gaps):
+        plan.append(".aiwf/docs/**")
+    if any(path.startswith(".aiwf/templates/") for path in target_gaps):
+        plan.append(".aiwf/templates/**")
+    return plan
+
+
+def _upgrade_update_plan(
+    *,
+    package_update_required: bool,
+    relocation_required: bool,
+    target_gaps: Sequence[str],
+) -> list[str]:
+    if package_update_required or relocation_required:
+        return list(UPGRADE_FULL_UPDATE_PLAN)
+    return _upgrade_repair_plan(target_gaps)
 
 
 def _upgrade_target_runtime_path(root: Path) -> Path:
@@ -1983,11 +2064,12 @@ def _ensure_aiwf_upgrade_skeleton(root: Path) -> tuple[str, str]:
     return config_action, event_log_action
 
 
-def _copy_upgrade_artifacts(source_root: Path, target_root: Path) -> list[str]:
+def _copy_upgrade_artifacts(source_root: Path, target_root: Path, update_plan: Sequence[str]) -> list[str]:
     copied: list[str] = []
-    for rel_path in ("aiwf", ".aiwf/bin/ai_workflow.py", ".aiwf/docs"):
-        source = source_root / rel_path
-        destination = target_root / rel_path
+    for plan_item in update_plan:
+        source_rel, installed_label = UPGRADE_COPY_SPECS[plan_item]
+        source = source_root / source_rel
+        destination = target_root / source_rel
         if source.resolve() == destination.resolve():
             continue
         ensure_dir(destination.parent)
@@ -1998,7 +2080,7 @@ def _copy_upgrade_artifacts(source_root: Path, target_root: Path) -> list[str]:
                 safe_copy_file_no_symlink(source, destination, source_root)
         except SafePathError as exc:
             raise SystemExit(f"ERROR: {exc}") from exc
-        copied.append(rel_path)
+        copied.append(installed_label)
     return copied
 
 
@@ -2074,17 +2156,28 @@ def upgrade_command(
     blockers = _upgrade_validate_source(source_root)
     current_info = _upgrade_current_info(root)
     source_info = _upgrade_source_info_unknown() if blockers else _upgrade_source_info(source_root)
+    target_gaps = _upgrade_target_requirement_gaps(root)
     relocation_entries = [
         entry
         for entry in (_candidate_legacy_docs_relocation_paths(root) if migrate_legacy_docs else [])
         if entry.group in {"docs", "records"} and entry.exists
     ]
     relocation_required = bool(relocation_entries)
-    upgrade_required = (
+    package_update_required = (
         current_info["layout_version"] != source_info["layout_version"]
         or current_info["tool_version"] != source_info["tool_version"]
         or current_info["protocol_version"] != source_info["protocol_version"]
+    )
+    repair_required = bool(target_gaps)
+    upgrade_required = (
+        package_update_required
         or relocation_required
+        or repair_required
+    )
+    update_plan = _upgrade_update_plan(
+        package_update_required=package_update_required,
+        relocation_required=relocation_required,
+        target_gaps=target_gaps,
     )
     warnings = []
     if no_relocate:
@@ -2112,6 +2205,7 @@ def upgrade_command(
         print(f"  records: {source_info['records_root']}")
         print("Status:")
         print(f"  upgrade_required: {'yes' if upgrade_required else 'no'}")
+        print(f"  repair_required: {'yes' if repair_required else 'no'}")
         print(f"  relocation_required: {'yes' if relocation_required else 'no'}")
         print(f"  blockers: {len(blockers)}")
         for blocker in blockers:
@@ -2139,13 +2233,17 @@ def upgrade_command(
         print(f"  records: {source_info['records_root']}")
         print("Status:")
         print(f"  upgrade_required: {'yes' if upgrade_required else 'no'}")
+        print(f"  repair_required: {'yes' if repair_required else 'no'}")
         print(f"  relocation_required: {'yes' if relocation_required else 'no'}")
         print("  blockers: none")
         print("Will update:")
-        for path in ("aiwf", ".aiwf/bin/ai_workflow.py", ".aiwf/docs/**"):
-            print(f"  - {path}")
+        if update_plan:
+            for path in update_plan:
+                print(f"  - {path}")
+        else:
+            print("  - none")
         print("Will preserve:")
-        for path in (".aiwf/records/**", ".aiwf/events/**", ".aiwf/migrations/**", ".aiwf/config.yaml"):
+        for path in UPGRADE_PRESERVED_PATHS:
             print(f"  - {path}")
         print("Will relocate:")
         if relocation_entries and migrate_legacy_docs and not no_relocate:
@@ -2189,8 +2287,8 @@ def upgrade_command(
         config_action = "relocated"
         event_log_action = "relocated"
 
-    copied = _copy_upgrade_artifacts(source_root, root)
-    preserved = [".aiwf/records/**", ".aiwf/events/**", ".aiwf/migrations/**", ".aiwf/config.yaml"]
+    copied = _copy_upgrade_artifacts(source_root, root, update_plan)
+    preserved = list(UPGRADE_PRESERVED_PATHS)
     relocated = [
         f"{entry.label}: {rel(root, entry.source)} -> {rel(root, entry.destination)}"
         for entry in relocation_entries

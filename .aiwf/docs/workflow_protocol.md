@@ -2,18 +2,18 @@
 
 This document is the canonical protocol semantics reference for repository-native AI workflow governance.
 
-## Version Identity Policy (v1.7.10)
+## Version Identity Policy (v1.7.10.post2)
 
 For the current lightweight, repository-native AIWF project, release identity and tool provenance normally move together.
-The `v1.7.10` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
+The `v1.7.10.post2` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
 This does not introduce a package manager, database migration framework, or silent overwrite of workflow evidence.
 
 Current version state:
-- release version: `1.7.10`
-- tool version: `1.7.10`
+- release version: `1.7.10.post2`
+- tool version: `1.7.10.post2`
 - workflow protocol version: `1.7.8`
 
-This release identity is a runtime security hardening decision for filesystem trust-boundary handling. It does not imply workflow protocol semantic changes, event schema changes, finalize gate changes, or phase state machine changes.
+This release identity is an upgrade packaging reliability decision. It does not imply workflow protocol semantic changes, event schema changes, finalize gate changes, or phase state machine changes.
 
 Version-separation strategy may be revisited only if AIWF later requires:
 - external compatibility guarantees
