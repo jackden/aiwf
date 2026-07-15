@@ -792,26 +792,108 @@ def test_new_task_rolls_back_directory_and_index_when_append_fails(tmp_path: Pat
     assert not index_path.exists()
 
 
-def test_new_task_failure_does_not_remove_existing_task_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_new_task_update_existing_fails_closed_without_writes(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
-    existing_task = _create_task(root, name="existing_task", date="20260602")
-    marker = existing_task / "preserve.txt"
-    marker.write_text("keep\n", encoding="utf-8")
+    rc = ai_workflow.create_task(
+        root,
+        "new_task",
+        "20260602",
+        update_existing=True,
+        allow_non_today_date=True,
+    )
 
-    def existing_task_dir(_root: Path, _date: str, _task_name: str) -> Path:
-        return existing_task
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-NEW-TASK-001" in out
+    assert "No files were written." in out
+    assert not (root / "docs" / "ai_20260602").exists()
 
-    def fail_before_write(_root: Path, _path: Path, _content: str, _update_existing: bool = False):
-        raise RuntimeError("simulated existing task failure")
 
-    monkeypatch.setattr(ai_workflow, "resolve_task_dir", existing_task_dir)
-    monkeypatch.setattr(ai_workflow, "write_file", fail_before_write)
+def test_new_task_cli_dispatch_update_existing_fails_closed_without_writes(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    day_dir = root / "docs" / f"ai_{ai_workflow.today()}"
 
-    with pytest.raises(RuntimeError, match="simulated existing task failure"):
-        ai_workflow.create_task(root, "existing_task", "20260602", update_existing=True, allow_non_today_date=True)
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "new-task",
+            "sample_task",
+            "--update-existing",
+        ]
+    )
 
-    assert existing_task.exists()
-    assert marker.read_text(encoding="utf-8") == "keep\n"
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-NEW-TASK-001" in out
+    assert "new-task is create-only" in out
+    assert not day_dir.exists()
+    assert not (day_dir / "index.md").exists()
+
+
+def test_new_task_duplicate_normalized_name_fails_before_allocation(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    existing_task = _create_task(root, name="Same Task", date="20260602")
+    day_dir = existing_task.parent
+    before_index = (day_dir / "index.md").read_text(encoding="utf-8")
+    before_dirs = sorted(path.name for path in day_dir.iterdir())
+
+    rc = ai_workflow.create_task(
+        root,
+        "same-task",
+        "20260602",
+        update_existing=False,
+        allow_non_today_date=True,
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-TASK-NAME-001" in out
+    assert str(existing_task.relative_to(root)) in out
+    assert "002_same_task" not in out
+    assert sorted(path.name for path in day_dir.iterdir()) == before_dirs
+    assert (day_dir / "index.md").read_text(encoding="utf-8") == before_index
+
+
+def test_new_task_same_name_is_allowed_on_a_different_date(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    _create_task(root, name="same_task", date="20260602")
+
+    rc = ai_workflow.create_task(
+        root,
+        "same-task",
+        "20260603",
+        update_existing=False,
+        allow_non_today_date=True,
+    )
+
+    assert rc == 0
+    assert (root / "docs" / "ai_20260603" / "001_same_task").exists()
+
+
+def test_check_doctor_and_finalize_block_preexisting_duplicate_task_names(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    canonical = _create_task(root, name="canonical_task", date="20260602")
+    other = _create_task(root, name="other_task", date="20260602")
+    duplicate = other.with_name("002_canonical_task")
+    other.rename(duplicate)
+
+    rc = ai_workflow.check_path(root, str(canonical), strict=False)
+    check_out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-TASK-NAME-001" in check_out
+    assert str(canonical.relative_to(root)) in check_out
+    assert str(duplicate.relative_to(root)) in check_out
+
+    rc = ai_workflow.doctor_command(root, str(canonical))
+    doctor_out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-TASK-NAME-001" in doctor_out
+
+    rc = ai_workflow.finalize_command(root, str(canonical))
+    finalize_out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-TASK-NAME-001" in finalize_out
 
 
 def test_new_task_keyboard_interrupt_leaves_no_orphan_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

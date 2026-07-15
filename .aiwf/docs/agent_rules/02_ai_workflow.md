@@ -79,6 +79,8 @@ runtime code
 ## Deterministic Invariants
 
 - Use `new-task` / `next-id` for task ID allocation.
+- `new-task` is create-only; `new-task --update-existing` fails closed before any file write.
+- Within one `ai_YYYYMMDD` directory, normalized task names must be unique. New-task rejects duplicates before ID allocation, and task diagnostics report existing duplicates as blockers.
 - Use `check` and `doctor` for diagnostics.
 - `task.md` metadata is source of truth; `.aiwf/records/ai_YYYYMMDD/index.md` is a derived projection.
 - Use `sync-index --path <task_dir>` to repair stale index status from metadata.

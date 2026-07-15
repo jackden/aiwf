@@ -34,7 +34,8 @@ Safety:
 - Does not run pytest, DUT, destructive, mkfs, RAID, firmware, power-cycle, or git commands.
 - Does not delete existing workflow records. Failed new-task creation may roll back
   files and directories created by the failed command before a valid task exists.
-- Does not overwrite existing files unless --update-existing is passed.
+- new-task is create-only and never overwrites existing task artifacts.
+- Commands with an explicit existing target may support --update-existing where documented.
 """
 
 from __future__ import annotations
@@ -97,7 +98,7 @@ SCHEMA_V16 = "ai-workflow-v1.6"
 CURRENT_SCHEMA_VERSION = SCHEMA_V16
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16}
 WORKFLOW_PROTOCOL_VERSION = "1.7.8"
-AIWF_TOOL_VERSION = "1.7.10.post2"
+AIWF_TOOL_VERSION = "1.7.11"
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.1"
 AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.2"
 AIWF_EXPERIMENT_SCHEMA_VERSION = "aiwf-experiment-v0.1"
@@ -620,6 +621,8 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-DATE-001": {"severity": "error", "message": "new-task date {date} does not match today {today}.", "suggested_fix": "Omit --date for normal new tasks, or use --allow-non-today-date for explicit historical/recovery work."},
     "AIWF-DATE-002": {"severity": "error", "message": "Invalid {field} format: {date}.", "suggested_fix": "Use YYYYMMDD format, for example: 20260603."},
     "AIWF-DATE-003": {"severity": "error", "message": "Invalid {field} value: {date}.", "suggested_fix": "Use a valid calendar date in YYYYMMDD format, for example: 20260603."},
+    "AIWF-NEW-TASK-001": {"severity": "error", "message": "new-task is create-only; --update-existing is not supported. No files were written.", "suggested_fix": "Use the existing task path with path-based commands, or create a distinctly named follow-up task."},
+    "AIWF-TASK-NAME-001": {"severity": "error", "message": "Duplicate normalized task name `{task_name}` exists within the same AI record date: {matches}.", "suggested_fix": "Preserve one canonical task and resolve the accidental duplicate before continuing. Use a distinct name for intentional follow-up work."},
     "AIWF-META-REF-001": {"severity": "error", "message": "Invalid task reference input for field {field}: {value}.", "suggested_fix": "Use a task id such as 014, or a task directory name such as 014_task_name."},
     "AIWF-PHASE-001": {"severity": "error", "message": "status done requires workflow_phase finalized.", "suggested_fix": "Do not set status done manually; run `ai_workflow.py finalize --path <task_dir>`."},
     "AIWF-PHASE-002": {"severity": "error", "message": "Illegal phase transition: {from_phase} -> {to_phase}.", "suggested_fix": "Use an allowed transition from the current phase."},
@@ -2557,6 +2560,20 @@ def split_task_dir_name(task_dir: Path) -> tuple[Optional[str], Optional[str]]:
     return m.group(1), m.group(2)
 
 
+def find_same_name_task_dirs(ai_day_dir: Path, task_name: str) -> list[Path]:
+    normalized = normalize_name(task_name)
+    if not ai_day_dir.exists():
+        return []
+    matches: list[Path] = []
+    for child in ai_day_dir.iterdir():
+        if not child.is_dir():
+            continue
+        _task_id, existing_name = split_task_dir_name(child)
+        if existing_name == normalized:
+            matches.append(child)
+    return sorted(matches, key=lambda item: item.name)
+
+
 def _is_valid_repo_relative_path(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -3934,6 +3951,20 @@ def _collect_task_diagnostics(
     if not is_task_specific_dir(task_dir):
         return [make_diagnostic("AIWF-PATH-002", rel(root, task_dir), blocker=True)]
 
+    task_id, task_name = split_task_dir_name(task_dir)
+    if task_id is not None and task_name is not None:
+        matches = find_same_name_task_dirs(task_dir.parent, task_name)
+        if len(matches) > 1:
+            diagnostics.append(
+                make_diagnostic(
+                    "AIWF-TASK-NAME-001",
+                    rel(root, task_dir.parent),
+                    blocker=True,
+                    task_name=task_name,
+                    matches=", ".join(rel(root, path) for path in matches),
+                )
+            )
+
     for filename, path, legacy, group in _resolved_required_artifacts(
         task_dir,
         (("task_record.md",), ("self_validation.md",), AGENT_REVIEW_FILES, ("review_final.md",)),
@@ -4309,8 +4340,28 @@ def create_task(
     related_files: Optional[list[str]] = None,
     allow_non_today_date: bool = False,
 ) -> int:
+    if update_existing:
+        _print_diagnostics([make_diagnostic("AIWF-NEW-TASK-001", "new-task", blocker=True)])
+        return 2
+
     selected_date = resolve_new_task_date(date, allow_non_today_date=allow_non_today_date)
     if selected_date is None:
+        return 2
+    normalized_name = normalize_name(name)
+    ai_day = resolve_ai_day_dir(root, selected_date)
+    existing = find_same_name_task_dirs(ai_day, normalized_name)
+    if existing:
+        _print_diagnostics(
+            [
+                make_diagnostic(
+                    "AIWF-TASK-NAME-001",
+                    rel(root, ai_day),
+                    blocker=True,
+                    task_name=normalized_name,
+                    matches=", ".join(rel(root, path) for path in existing),
+                )
+            ]
+        )
         return 2
     task_dir = resolve_task_dir(root, selected_date, name)
     task_id, norm = split_task_dir_name(task_dir)
@@ -4372,7 +4423,7 @@ def create_task(
         f"| priority: {metadata['priority']} | note: created by .aiwf/bin/ai_workflow.py"
     )
     try:
-        results = [write_file(root, task_dir / fn, content, update_existing) for fn, content in files.items()]
+        results = [write_file(root, task_dir / fn, content, False) for fn, content in files.items()]
         results.append(append_index(index_path, entry))
         metadata_payload = load_task_metadata(task_dir)
         diagnostics = validate_task_metadata(root, task_dir, metadata_payload)

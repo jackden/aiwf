@@ -2,18 +2,18 @@
 
 This document is the canonical protocol semantics reference for repository-native AI workflow governance.
 
-## Version Identity Policy (v1.7.10.post2)
+## Version Identity Policy (v1.7.11)
 
 For the current lightweight, repository-native AIWF project, release identity and tool provenance normally move together.
-The `v1.7.10.post2` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
+The `v1.7.11` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
 This does not introduce a package manager, database migration framework, or silent overwrite of workflow evidence.
 
 Current version state:
-- release version: `1.7.10.post2`
-- tool version: `1.7.10.post2`
+- release version: `1.7.11`
+- tool version: `1.7.11`
 - workflow protocol version: `1.7.8`
 
-This release identity is an upgrade packaging reliability decision. It does not imply workflow protocol semantic changes, event schema changes, finalize gate changes, or phase state machine changes.
+This release identity is a fail-closed task creation safety correction. It does not imply workflow protocol semantic changes, event schema changes, finalize gate changes, or phase state machine changes.
 
 Version-separation strategy may be revisited only if AIWF later requires:
 - external compatibility guarantees
@@ -273,6 +273,13 @@ runtime code
 `review_final.md` may include a lightweight, optional knowledge extraction section with pattern, bug, decision, and suggested artifact path candidates. This section is advisory only, non-blocking, and not part of `check --finalize-ready` or `finalize` semantics.
 
 ## 8. Task Naming Reviewability Guidance
+
+Task creation identity enforcement:
+
+- `new-task` is create-only; `--update-existing` is rejected before any file write.
+- Within one `ai_YYYYMMDD` directory, normalized task names are unique.
+- New-task checks for an existing normalized name before allocating an ID and reports the exact existing task path on failure.
+- `check`, `doctor`, and `finalize` report same-date duplicate normalized names as blockers.
 
 For future task naming, avoid duplicated numeric prefixes when possible to reduce reviewer confusion.
 

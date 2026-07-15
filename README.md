@@ -71,8 +71,8 @@ Current metadata version boundary:
 
 | Field | Value |
 |-------|-------|
-| Release version | `1.7.10.post2` |
-| AIWF Tool Version | `1.7.10.post2` |
+| Release version | `1.7.11` |
+| AIWF Tool Version | `1.7.11` |
 | Workflow Protocol Version | `1.7.8` |
 
 ## Documentation
@@ -107,6 +107,7 @@ Current metadata version boundary:
 - v1.7.9 Package Records evidence portability: [.aiwf/docs/releases/v1.7.9.md](.aiwf/docs/releases/v1.7.9.md)
 - v1.7.10 filesystem trust-boundary security hardening: [.aiwf/docs/releases/v1.7.10.md](.aiwf/docs/releases/v1.7.10.md)
 - v1.7.10.post2 upgrade runtime dependency and template copy-scope fix: [.aiwf/docs/releases/v1.7.10.post2.md](.aiwf/docs/releases/v1.7.10.post2.md)
+- v1.7.11 fail-closed task creation identity safety: [.aiwf/docs/releases/v1.7.11.md](.aiwf/docs/releases/v1.7.11.md)
 - Package Records release preparation: [.aiwf/docs/releases/package_records_release_preparation.md](.aiwf/docs/releases/package_records_release_preparation.md)
 
 ## Install AIWF in a New Repository
@@ -228,12 +229,12 @@ AGENTS root entrypoint helpers:
 
 Root `AGENTS.md` is a thin managed bootstrap entrypoint. The managed block source of truth is [`.aiwf/templates/AGENTS.block.md`](.aiwf/templates/AGENTS.block.md). The canonical rules live under `.aiwf/docs/agent_rules/`, starting with [`.aiwf/docs/agent_rules/00_root_entrypoint.md`](.aiwf/docs/agent_rules/00_root_entrypoint.md).
 
-### Version Metadata Policy (v1.7.10.post2)
-For this release, release identity and tool provenance advance to `1.7.10.post2` while workflow protocol semantics remain at `1.7.8`.
+### Version Metadata Policy (v1.7.11)
+For this release, release identity and tool provenance advance to `1.7.11` while workflow protocol semantics remain at `1.7.8`.
 
 Current metadata version boundary:
-- release version: `1.7.10.post2`
-- tool version: `1.7.10.post2`
+- release version: `1.7.11`
+- tool version: `1.7.11`
 - workflow protocol version: `1.7.8`
 
 The upgrade mechanism is additive and does not imply a package manager, a database migration framework, or silent overwrites of workflow evidence.
@@ -319,6 +320,17 @@ Report commands:
 ./aiwf report --path .aiwf/records --format json
 ./aiwf report --path .aiwf/records --format markdown
 ```
+
+## New in v1.7.11
+
+AIWF v1.7.11 makes task creation fail closed around task identity.
+
+- `new-task --update-existing` is rejected without writing files.
+- Same-date duplicate normalized task names are rejected before ID allocation.
+- `check`, `doctor`, and `finalize` report existing duplicates as blockers.
+
+The workflow protocol remains `1.7.8`; no event schema, finalize semantic,
+phase state machine, or historical-record migration is introduced.
 
 ## New in v1.7.10.post2
 
