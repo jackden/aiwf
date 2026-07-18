@@ -37,6 +37,18 @@ The design for a future workflow-record analysis package is documented in
 That design is explicitly separate from review bundles, public tree export,
 dataset export alone, and general repository snapshots.
 
+Before package record discovery, the command validates `--from-date` and
+`--to-date` (including the reversed-range case) and validates repeated
+`--status`, `--workflow-phase`, and `--review-status` selectors against the
+canonical, case-sensitive metadata values. Invalid input returns `2` without
+creating output parents or replacing an existing `--force` target. Valid
+selectors that match no records still produce a successful empty manifest.
+
+The status line `Workflow Evidence Findings` reports workflow evidence findings
+discovered during package construction; it does not claim that findings were
+themselves packaged as a separate artifact. Manifest fields such as
+`validation.findings` and `finding_count` retain their existing schema.
+
 ## Rationale
 AIWF task artifacts are workflow evidence.
 Environment secrets are not workflow evidence and must not be included in shared review packages.

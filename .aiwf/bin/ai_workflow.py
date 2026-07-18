@@ -98,7 +98,7 @@ SCHEMA_V16 = "ai-workflow-v1.6"
 CURRENT_SCHEMA_VERSION = SCHEMA_V16
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16}
 WORKFLOW_PROTOCOL_VERSION = "1.7.8"
-AIWF_TOOL_VERSION = "1.7.11"
+AIWF_TOOL_VERSION = "1.7.12"
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.1"
 AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.2"
 AIWF_EXPERIMENT_SCHEMA_VERSION = "aiwf-experiment-v0.1"
@@ -111,6 +111,17 @@ AIWF_PACKAGE_RECORDS_MANIFEST_ERROR = "AIWF-PKG-MANIFEST-001"
 AIWF_PACKAGE_RECORDS_DATASET_PATH = "dataset/aiwf_dataset.json"
 AIWF_PACKAGE_RECORDS_ROOT_DIR = "aiwf-records-package"
 AIWF_PACKAGE_RECORDS_REDACTION_PROFILES = {"safe", "internal", "none"}
+BACKFILL_PROVENANCE_FILENAME = "backfill_source.json"
+BACKFILL_PROVENANCE_SCHEMA_VERSION = "1"
+BACKFILL_REQUIRED_ARTIFACT_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("task.md",),
+    ("agent.md",),
+    ("task_record.md",),
+    ("self_validation.md",),
+    ("review_agent.md", "review_codex.md"),
+    ("review_final.md",),
+    (BACKFILL_PROVENANCE_FILENAME,),
+)
 ALLOWED_STATUS = {"draft", "active", "review", "blocked", "done", "archived"}
 ALLOWED_PRIORITY = {"P0", "P1", "P2", "P3"}
 ALLOWED_RISK = {"low", "medium", "high", "critical"}
@@ -547,6 +558,7 @@ class RelocationEntry:
     group: str
     exists: bool
     destination_exists: bool
+    classification: str
 
 
 @dataclass(frozen=True)
@@ -605,6 +617,77 @@ class DateValidationError(ValueError):
         self.suggested_fix = suggested_fix
 
 
+class TaskIdAllocationError(ValueError):
+    def __init__(self, ai_day_dir: Path):
+        super().__init__(f"AI date path is not a directory: {ai_day_dir}")
+        self.ai_day_dir = ai_day_dir
+
+
+class NewTaskMetadataInputError(ValueError):
+    def __init__(self, code: str, field: str, value: str):
+        super().__init__(value)
+        self.code = code
+        self.field = field
+        self.value = value
+
+
+class CommandPathInputError(ValueError):
+    def __init__(self, code: str, requested_path: str, resolved_path: Path, root: Path):
+        super().__init__(requested_path)
+        self.code = code
+        self.requested_path = requested_path
+        self.resolved_path = resolved_path
+        self.root = root
+
+
+@dataclass(frozen=True)
+class BackfillSourceIdentity:
+    source_path: str
+    source_date: Optional[str]
+    source_task_id: Optional[str]
+    source_task_name: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": BACKFILL_PROVENANCE_SCHEMA_VERSION,
+            "source_path": self.source_path,
+            "source_date": self.source_date,
+            "source_task_id": self.source_task_id,
+            "source_task_name": self.source_task_name,
+        }
+
+
+class AgentsPathBoundaryError(ValueError):
+    def __init__(self, raw_path: str, resolved_path: Path, root: Path):
+        super().__init__("the resolved AGENTS path is outside the repository boundary")
+        self.raw_path = raw_path
+        self.resolved_path = resolved_path
+        self.root = root
+
+
+class DatasetOutputBoundaryError(ValueError):
+    def __init__(
+        self,
+        requested_path: Path,
+        resolved_path: Path,
+        root: Path,
+        records_root: Path,
+        *,
+        code: str = "AIWF-DATASET-OUTPUT-001",
+    ):
+        message = (
+            "dataset output resolves outside the repository boundary"
+            if code == "AIWF-DATASET-OUTPUT-002"
+            else "dataset output must not be written under the configured AIWF records root"
+        )
+        super().__init__(message)
+        self.code = code
+        self.requested_path = requested_path
+        self.resolved_path = resolved_path
+        self.root = root
+        self.records_root = records_root
+
+
 DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-META-001": {"severity": "error", "message": "Front matter exists but metadata cannot be parsed.", "suggested_fix": "Use valid YAML front matter with key: value pairs and close it with ---."},
     "AIWF-META-LEGACY-001": {"severity": "warn", "message": "Legacy task without metadata front matter.", "suggested_fix": "Keep as legacy, or add metadata front matter if this task is migrated."},
@@ -618,9 +701,19 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-META-009": {"severity": "error", "message": "Invalid metadata list item for field {field}: {value}.", "suggested_fix": "Use canonical item format for this metadata field."},
     "AIWF-META-010": {"severity": "error", "message": "Invalid task reference for field {field}: {value}.", "suggested_fix": "Use canonical task id format, for example: 014."},
     "AIWF-META-011": {"severity": "error", "message": "Invalid repo-relative path for field {field}: {value}.", "suggested_fix": "Use a repo-relative path without absolute path or '..'."},
+    "AIWF-META-TAG-001": {"severity": "error", "message": "Invalid tag input for field {field}: {value}.", "suggested_fix": "Use a lowercase tag beginning with a letter or digit and containing only a-z, 0-9, underscore, or hyphen."},
     "AIWF-DATE-001": {"severity": "error", "message": "new-task date {date} does not match today {today}.", "suggested_fix": "Omit --date for normal new tasks, or use --allow-non-today-date for explicit historical/recovery work."},
     "AIWF-DATE-002": {"severity": "error", "message": "Invalid {field} format: {date}.", "suggested_fix": "Use YYYYMMDD format, for example: 20260603."},
     "AIWF-DATE-003": {"severity": "error", "message": "Invalid {field} value: {date}.", "suggested_fix": "Use a valid calendar date in YYYYMMDD format, for example: 20260603."},
+    "AIWF-DATE-RANGE-001": {"severity": "error", "message": "Invalid date range: from-date {from_date} is later than to-date {to_date}.", "suggested_fix": "Set --from-date to a date on or before --to-date."},
+    "AIWF-SELECTOR-001": {"severity": "error", "message": "Invalid {field} selector value(s): {invalid}. Allowed values: {allowed}.", "suggested_fix": "Use the exact, case-sensitive canonical value(s) listed above."},
+    "AIWF-TASK-ID-001": {"severity": "error", "message": "The AI record date path exists but is not a directory.", "suggested_fix": "Remove or rename the conflicting filesystem object before allocating a task ID."},
+    "AIWF-DATASET-OUTPUT-001": {"severity": "error", "message": "Dataset output must not be written under the configured AIWF records root.", "suggested_fix": "Choose a repository-local output outside AIWF records, for example artifacts/dataset.json or reports/aiwf/dataset.json."},
+    "AIWF-DATASET-OUTPUT-002": {"severity": "error", "message": "Dataset output resolves outside the repository boundary.", "suggested_fix": "Choose a repository-local output path outside the configured AIWF records root."},
+    "AIWF-BACKFILL-NOOP": {"severity": "info", "message": "Existing backfill target already matches the requested source.", "suggested_fix": ""},
+    "AIWF-BACKFILL-IDENTITY-001": {"severity": "error", "message": "An existing backfill task has the same normalized name but a different source identity.", "suggested_fix": "Review the existing task and requested legacy source. AIWF will not create a duplicate or select a canonical task automatically."},
+    "AIWF-BACKFILL-INCOMPLETE-001": {"severity": "error", "message": "The existing backfill target matches the source identity but required artifacts are missing: {missing}.", "suggested_fix": "Run backfill again with --update-existing to create missing artifacts only."},
+    "AIWF-BACKFILL-PRESERVE-001": {"severity": "error", "message": "Backfill will not modify an existing finalized historical evidence artifact: {artifact}.", "suggested_fix": "Review the existing artifact manually. Use a separate repair or migration task if historical correction is required."},
     "AIWF-NEW-TASK-001": {"severity": "error", "message": "new-task is create-only; --update-existing is not supported. No files were written.", "suggested_fix": "Use the existing task path with path-based commands, or create a distinctly named follow-up task."},
     "AIWF-TASK-NAME-001": {"severity": "error", "message": "Duplicate normalized task name `{task_name}` exists within the same AI record date: {matches}.", "suggested_fix": "Preserve one canonical task and resolve the accidental duplicate before continuing. Use a distinct name for intentional follow-up work."},
     "AIWF-META-REF-001": {"severity": "error", "message": "Invalid task reference input for field {field}: {value}.", "suggested_fix": "Use a task id such as 014, or a task directory name such as 014_task_name."},
@@ -633,7 +726,10 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-FILE-002": {"severity": "warn", "message": "Missing v1.1 file: {filename}.", "suggested_fix": "Create `{filename}` via ai_workflow new-task/backfill templates."},
     "AIWF-FILE-OK": {"severity": "info", "message": "{filename} exists.", "suggested_fix": ""},
     "AIWF-AGENTS-006": {"severity": "error", "message": "managed AIWF block template is missing.", "suggested_fix": "Create `.aiwf/templates/AGENTS.block.md` from the canonical managed block source."},
+    "AIWF-AGENTS-900": {"severity": "error", "message": "agents install requires explicit confirmation before writing AGENTS.md.", "suggested_fix": "Run agents install again with --yes after reviewing the target path."},
     "AIWF-AGENTS-OUTDATED": {"severity": "error", "message": "managed AIWF block does not match the template source.", "suggested_fix": "Run `./aiwf agents install --path AGENTS.md --yes` to rewrite the managed block from `.aiwf/templates/AGENTS.block.md`."},
+    "AIWF-AGENTS-PATH-001": {"severity": "error", "message": "The resolved AGENTS path is outside the repository boundary.", "suggested_fix": "Use a repository-relative path that resolves within the current repository. Do not use absolute outside paths, '..' traversal, or symlinks that escape the repository."},
+    "AIWF-RELOCATE-CONFLICT-001": {"severity": "error", "message": "Legacy source and canonical destination both exist. Source: {source}. Destination: {destination}.", "suggested_fix": "Review both paths and resolve the conflict explicitly before running relocate or upgrade apply. AIWF will not overwrite, merge, or delete either path automatically."},
     "AIWF-GUARD-PASS": {"severity": "info", "message": "task is open for pre-edit work", "suggested_fix": ""},
     "AIWF-GUARD-001": {"severity": "error", "message": "task path does not exist", "suggested_fix": "Provide a valid .aiwf/records/ai_YYYYMMDD/NNN_task_name path."},
     "AIWF-GUARD-002": {"severity": "error", "message": "required AIWF artifact missing", "suggested_fix": "Create the missing task artifacts before beginning pre-edit work."},
@@ -646,6 +742,9 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-PLACEHOLDER-OK": {"severity": "info", "message": "No placeholder markers detected in required documents.", "suggested_fix": ""},
     "AIWF-PATH-001": {"severity": "error", "message": "Task directory does not exist.", "suggested_fix": "Provide a valid .aiwf/records/ai_YYYYMMDD/NNN_task path."},
     "AIWF-PATH-002": {"severity": "error", "message": "Path is not a task-specific directory.", "suggested_fix": "Use a path like .aiwf/records/ai_YYYYMMDD/NNN_task_name."},
+    "AIWF-CLI-PATH-001": {"severity": "error", "message": "Requested command path does not exist.", "suggested_fix": "Provide an existing repository-local path supported by this command."},
+    "AIWF-CLI-PATH-002": {"severity": "error", "message": "Requested command path resolves outside the repository boundary.", "suggested_fix": "Use a repository-relative path that resolves within the current repository."},
+    "AIWF-BACKFILL-PATH-001": {"severity": "error", "message": "Backfill target must be a directory.", "suggested_fix": "Provide an existing directory path supported by backfill."},
     "AIWF-REVIEW-002": {"severity": "error", "message": "Finalize requires review_status to be pass or not_required.", "suggested_fix": "Set review_status to pass/not_required before finalize."},
     "AIWF-PATH-010": {"severity": "error", "message": "Missing validation pass before finalize.", "suggested_fix": "Record validation pass evidence before finalize."},
     "AIWF-PATH-011": {"severity": "error", "message": "Review fail without fix.", "suggested_fix": "Record a fix after the latest failed review before finalize."},
@@ -1425,9 +1524,24 @@ def aiwf_agents_managed_block(repo_root: Optional[Path] = None) -> str:
 
 
 def _resolve_agents_path(root: Path, raw_path: str) -> Path:
-    target = Path(raw_path)
-    target = (root / target).resolve() if not target.is_absolute() else target.resolve()
+    root_resolved = root.resolve()
+    raw_target = Path(raw_path)
+    target = raw_target.resolve() if raw_target.is_absolute() else (root_resolved / raw_target).resolve()
+    try:
+        target.relative_to(root_resolved)
+    except ValueError as exc:
+        raise AgentsPathBoundaryError(raw_path, target, root_resolved) from exc
     return target
+
+
+def _print_agents_path_boundary_error(exc: AgentsPathBoundaryError) -> None:
+    diagnostic = DIAGNOSTICS["AIWF-AGENTS-PATH-001"]
+    print("[ERROR] AIWF-AGENTS-PATH-001")
+    print(f"Requested path: {exc.raw_path}")
+    print(f"Resolved path: {exc.resolved_path}")
+    print(f"Repository root: {exc.root}")
+    print(f"Message: {diagnostic['message']}")
+    print(f"Suggested Fix: {diagnostic['suggested_fix']}")
 
 
 def _find_agents_block_bounds(text: str) -> tuple[Optional[int], Optional[int]]:
@@ -1447,7 +1561,11 @@ def agents_print_block_command(root: Path) -> int:
 
 
 def agents_check_command(root: Path, raw_path: str) -> int:
-    target = _resolve_agents_path(root, raw_path)
+    try:
+        target = _resolve_agents_path(root, raw_path)
+    except AgentsPathBoundaryError as exc:
+        _print_agents_path_boundary_error(exc)
+        return 2
     if not target.exists():
         print("[ERROR] AIWF-AGENTS-001")
         print(f"{rel(root, target)}: AGENTS.md file not found.")
@@ -1474,11 +1592,14 @@ def agents_check_command(root: Path, raw_path: str) -> int:
 
 
 def agents_install_command(root: Path, raw_path: str, yes: bool) -> int:
+    try:
+        target = _resolve_agents_path(root, raw_path)
+    except AgentsPathBoundaryError as exc:
+        _print_agents_path_boundary_error(exc)
+        return 2
     if not yes:
-        print("[ERROR] AIWF-AGENTS-900")
-        print("agents install requires --yes to write AGENTS.md.")
-        return 1
-    target = _resolve_agents_path(root, raw_path)
+        _print_diagnostics([make_diagnostic("AIWF-AGENTS-900", raw_path, blocker=True)])
+        return 2
     managed = aiwf_agents_managed_block(root).rstrip("\n")
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1576,10 +1697,26 @@ def _has_agent_review_artifact(task_dir: Path) -> bool:
 
 
 def safe_dataset_output_path(root: Path, path: Path) -> None:
+    root_resolved = root.resolve()
+    resolved_path = path.resolve()
+    records_root = get_record_root(root).resolve()
     try:
-        rp = path.resolve().relative_to(root.resolve())
+        rp = resolved_path.relative_to(root_resolved)
+    except ValueError as exc:
+        raise DatasetOutputBoundaryError(
+            path,
+            resolved_path,
+            root_resolved,
+            records_root,
+            code="AIWF-DATASET-OUTPUT-002",
+        ) from exc
+
+    try:
+        resolved_path.relative_to(records_root)
     except ValueError:
-        raise SystemExit(f"ERROR: refusing to write outside repo root: {path}")
+        pass
+    else:
+        raise DatasetOutputBoundaryError(path, resolved_path, root_resolved, records_root)
 
     if rp.name in {"task.md", "task_record.md", "self_validation.md", "review_agent.md", "review_codex.md", "review_final.md"}:
         raise SystemExit(f"ERROR: refusing to overwrite workflow evidence artifact: {rp}")
@@ -1589,10 +1726,6 @@ def safe_dataset_output_path(root: Path, path: Path) -> None:
         raise SystemExit("ERROR: refusing to overwrite .aiwf/events/events.jsonl during dataset export")
     if len(rp.parts) >= 3 and rp.parts[0] == ".aiwf" and rp.parts[1] == "docs" and rp.parts[2] == "releases":
         raise SystemExit(f"ERROR: refusing to overwrite release artifact path: {rp}")
-    if len(rp.parts) >= 3 and rp.parts[0] == ".aiwf" and rp.parts[1] == "records" and AI_DATE_RE.match(rp.parts[2]):
-        raise SystemExit(f"ERROR: refusing to write dataset output inside workflow records: {rp}")
-
-
 def _default_aiwf_layout_config_text() -> str:
     return "\n".join(
         [
@@ -1660,15 +1793,24 @@ def _candidate_legacy_docs_relocation_paths(root: Path) -> list[RelocationEntry]
     destination_records_root = get_aiwf_root(root) / "records"
 
     def maybe_add(label: str, source: Path, destination: Path, group: str, entries: list[RelocationEntry]) -> None:
-        if source.exists() or destination.exists():
+        source_exists = source.exists()
+        destination_exists = destination.exists()
+        if source_exists or destination_exists:
+            if source_exists and destination_exists:
+                classification = "conflict"
+            elif source_exists:
+                classification = "relocatable"
+            else:
+                classification = "already_relocated"
             entries.append(
                 RelocationEntry(
                     label=label,
                     source=source,
                     destination=destination,
                     group=group,
-                    exists=source.exists(),
-                    destination_exists=destination.exists(),
+                    exists=source_exists,
+                    destination_exists=destination_exists,
+                    classification=classification,
                 )
             )
 
@@ -1717,6 +1859,23 @@ def _candidate_legacy_docs_relocation_paths(root: Path) -> list[RelocationEntry]
             )
 
     return entries
+
+
+def _relocation_conflict_entries(entries: Sequence[RelocationEntry]) -> list[RelocationEntry]:
+    return [entry for entry in entries if entry.classification == "conflict"]
+
+
+def _relocation_conflict_diagnostics(root: Path, entries: Sequence[RelocationEntry]) -> list[Diagnostic]:
+    return [
+        make_diagnostic(
+            "AIWF-RELOCATE-CONFLICT-001",
+            rel(root, entry.source),
+            blocker=True,
+            source=rel(root, entry.source),
+            destination=rel(root, entry.destination),
+        )
+        for entry in entries
+    ]
 
 
 def _relocation_report_text(root: Path, *, entries: Sequence[dict[str, Any]], config_action: str, event_log_action: str, dry_run: bool) -> str:
@@ -1775,6 +1934,13 @@ def _relocation_report_text(root: Path, *, entries: Sequence[dict[str, Any]], co
 
 def relocate_command(root: Path, dry_run: bool, *, legacy_docs: bool = False) -> int:
     entries = _candidate_legacy_docs_relocation_paths(root) if legacy_docs else []
+    conflicts = _relocation_conflict_entries(entries)
+    if conflicts:
+        if dry_run:
+            print("[INFO] AIWF-RELOCATE-DRY-RUN")
+        _print_diagnostics(_relocation_conflict_diagnostics(root, conflicts))
+        return 2
+
     aiwf_root = get_aiwf_root(root)
     config_path = aiwf_root / "config.yaml"
     config_text, config_action = _prepare_aiwf_config(root)
@@ -1809,6 +1975,7 @@ def relocate_command(root: Path, dry_run: bool, *, legacy_docs: bool = False) ->
                 "destination": destination_rel,
                 "action": action,
                 "message": message,
+                "classification": entry.classification,
             }
         )
 
@@ -2165,6 +2332,11 @@ def upgrade_command(
         for entry in (_candidate_legacy_docs_relocation_paths(root) if migrate_legacy_docs else [])
         if entry.group in {"docs", "records"} and entry.exists
     ]
+    relocation_conflicts = (
+        _relocation_conflict_entries(relocation_entries)
+        if migrate_legacy_docs and not no_relocate
+        else []
+    )
     relocation_required = bool(relocation_entries)
     package_update_required = (
         current_info["layout_version"] != source_info["layout_version"]
@@ -2219,6 +2391,15 @@ def upgrade_command(
                 print(f"  - {warning}")
         print("Next:")
         print("  fix the blockers, then rerun upgrade --check")
+        return 2
+
+    if relocation_conflicts:
+        if check:
+            print("[INFO] AIWF-UPGRADE-CHECK")
+        elif dry_run:
+            print("[INFO] AIWF-UPGRADE-DRY-RUN")
+        _print_diagnostics(_relocation_conflict_diagnostics(root, relocation_conflicts))
+        print("[ERROR] AIWF upgrade blocked by relocation conflicts.")
         return 2
 
     if check or dry_run:
@@ -2524,7 +2705,10 @@ def is_task_specific_dir(path: Path) -> bool:
 
 
 def next_task_id(ai_day_dir: Path) -> str:
-    ensure_dir(ai_day_dir)
+    if not ai_day_dir.exists():
+        return "001"
+    if not ai_day_dir.is_dir():
+        raise TaskIdAllocationError(ai_day_dir)
     max_id = 0
     for child in ai_day_dir.iterdir():
         if child.is_dir():
@@ -2598,7 +2782,7 @@ def canonical_task_ref(raw: str, *, field: str) -> str:
     match = re.fullmatch(r"(\d{1,3})_[a-z0-9_]+", name)
     if match:
         return match.group(1).zfill(3)
-    raise ValueError(f"Invalid task reference for {field}: {raw}")
+    raise NewTaskMetadataInputError("AIWF-META-REF-001", field, str(raw))
 
 
 def canonical_task_ref_list(values: Optional[list[str]], *, field: str) -> list[str]:
@@ -2615,7 +2799,7 @@ def canonical_task_ref_list(values: Optional[list[str]], *, field: str) -> list[
 def canonical_tag(raw: str) -> str:
     text = str(raw).strip()
     if not re.fullmatch(r"^[a-z0-9][a-z0-9_-]*$", text):
-        raise ValueError(f"Invalid tag: {raw}")
+        raise NewTaskMetadataInputError("AIWF-META-TAG-001", "tags", str(raw))
     return text
 
 
@@ -2633,7 +2817,7 @@ def canonical_tag_list(values: Optional[list[str]]) -> list[str]:
 def canonical_related_file(raw: str) -> str:
     text = str(raw).strip().replace("\\", "/")
     if not _is_valid_repo_relative_path(text):
-        raise ValueError(f"Invalid related file path: {raw}")
+        raise NewTaskMetadataInputError("AIWF-META-011", "related_files", str(raw))
     return text
 
 
@@ -3439,15 +3623,30 @@ def _is_already_finalized(metadata: dict[str, Any]) -> bool:
 
 
 def _resolve_target_path(root: Path, raw_target: str) -> Path:
-    target = Path(raw_target)
-    target = (root / target).resolve() if not target.is_absolute() else target.resolve()
-    if not target.exists():
-        raise SystemExit(f"ERROR: path does not exist: {target}")
+    root_resolved = root.resolve()
+    requested = Path(raw_target)
+    target = (root_resolved / requested).resolve() if not requested.is_absolute() else requested.resolve()
     try:
-        target.relative_to(root.resolve())
-    except ValueError:
-        raise SystemExit(f"ERROR: path is outside repo root: {target}")
+        target.relative_to(root_resolved)
+    except ValueError as exc:
+        raise CommandPathInputError("AIWF-CLI-PATH-002", raw_target, target, root_resolved) from exc
+    if not target.exists():
+        raise CommandPathInputError("AIWF-CLI-PATH-001", raw_target, target, root_resolved)
     return target
+
+
+def _print_command_path_error(exc: CommandPathInputError) -> None:
+    _print_diagnostics([make_diagnostic(exc.code, exc.requested_path, blocker=True)])
+    print(f"Resolved path: {exc.resolved_path}")
+    print(f"Repository root: {exc.root}")
+
+
+def _resolve_command_target_path(root: Path, raw_target: str) -> Optional[Path]:
+    try:
+        return _resolve_target_path(root, raw_target)
+    except CommandPathInputError as exc:
+        _print_command_path_error(exc)
+        return None
 
 
 def _resolve_guard_target_path(root: Path, raw_target: str) -> Optional[Path]:
@@ -4128,6 +4327,11 @@ def _try_append_aiwf_event(
         print(f"WARN: failed to append AIWF event log: {exc}", file=sys.stderr)
 
 
+def _print_read_only_notice() -> None:
+    print("READ-ONLY")
+    print("No workflow artifacts or events were written.")
+
+
 def _finalize_task_metadata(root: Path, task_dir: Path) -> None:
     task_file = _metadata_path(root, task_dir)
     text = task_file.read_text(encoding="utf-8", errors="replace")
@@ -4166,7 +4370,9 @@ def _rewrite_task_metadata_file(task_dir: Path, metadata: dict[str, Any]) -> Non
 
 
 def transition_command(root: Path, raw_target: str, to_phase: str) -> int:
-    target = _resolve_target_path(root, raw_target)
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
     if not is_task_specific_dir(target):
         print("[ERROR] AIWF-PATH-002")
         print(f"{rel(root, target)}: {DIAGNOSTICS['AIWF-PATH-002']['message']}")
@@ -4238,7 +4444,9 @@ def record_command(
     reviewer: Optional[str],
     summary: Optional[str],
 ) -> int:
-    target = _resolve_target_path(root, raw_target)
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
     if not is_task_specific_dir(target):
         print("[ERROR] AIWF-PATH-002")
         print(f"{rel(root, target)}: {DIAGNOSTICS['AIWF-PATH-002']['message']}")
@@ -4349,6 +4557,70 @@ def create_task(
         return 2
     normalized_name = normalize_name(name)
     ai_day = resolve_ai_day_dir(root, selected_date)
+
+    normalized_priority = priority if priority else None
+    normalized_risk = risk if risk else None
+    normalized_project = project.strip() if project and project.strip() else None
+    canonical_parent_task: Optional[str] = None
+    canonical_related_tasks: list[str] = []
+    canonical_blocked_by: list[str] = []
+    canonical_supersedes: list[str] = []
+    canonical_tags: list[str] = []
+    canonical_related_files: list[str] = []
+    try:
+        if normalized_priority is not None and normalized_priority not in ALLOWED_PRIORITY:
+            _print_diagnostics(
+                [
+                    make_diagnostic(
+                        "AIWF-META-007",
+                        "new-task",
+                        blocker=True,
+                        field="priority",
+                        value=normalized_priority,
+                        allowed=", ".join(sorted(ALLOWED_PRIORITY)),
+                    )
+                ]
+            )
+            return 2
+        if normalized_risk is not None and normalized_risk not in ALLOWED_RISK:
+            _print_diagnostics(
+                [
+                    make_diagnostic(
+                        "AIWF-META-007",
+                        "new-task",
+                        blocker=True,
+                        field="risk",
+                        value=normalized_risk,
+                        allowed=", ".join(sorted(ALLOWED_RISK)),
+                    )
+                ]
+            )
+            return 2
+        if parent_task:
+            canonical_parent_task = canonical_task_ref(parent_task, field="parent_task")
+        canonical_related_tasks = canonical_task_ref_list(related_tasks, field="related_tasks")
+        canonical_blocked_by = canonical_task_ref_list(blocked_by, field="blocked_by")
+        canonical_supersedes = canonical_task_ref_list(supersedes, field="supersedes")
+        canonical_tags = canonical_tag_list(tags)
+        canonical_related_files = canonical_related_file_list(related_files)
+    except NewTaskMetadataInputError as exc:
+        _print_diagnostics(
+            [
+                make_diagnostic(
+                    exc.code,
+                    "new-task",
+                    blocker=True,
+                    field=exc.field,
+                    value=exc.value,
+                )
+            ]
+        )
+        return 2
+
+    if ai_day.exists() and not ai_day.is_dir():
+        _print_diagnostics([make_diagnostic("AIWF-TASK-ID-001", rel(root, ai_day), blocker=True)])
+        return 2
+
     existing = find_same_name_task_dirs(ai_day, normalized_name)
     if existing:
         _print_diagnostics(
@@ -4369,42 +4641,23 @@ def create_task(
         raise SystemExit(f"ERROR: failed to resolve task directory: {task_dir}")
     ai_day = task_dir.parent
     resolved_title = title or norm.replace("_", " ")
-    try:
-        metadata = default_task_metadata(task_id=task_id, task_name=norm, title=resolved_title, date=selected_date)
-        # owner/reviewer are workflow roles, not tool/provider/model provenance.
-        metadata["owner"] = "ai-agent"
-        metadata["reviewer"] = "human"
-        if priority:
-            metadata["priority"] = priority
-        if risk:
-            metadata["risk"] = risk
-        if project and project.strip():
-            metadata["project"] = project.strip()
-        if parent_task:
-            metadata["parent_task"] = canonical_task_ref(parent_task, field="parent_task")
-        metadata["related_tasks"] = canonical_task_ref_list(related_tasks, field="related_tasks")
-        metadata["blocked_by"] = canonical_task_ref_list(blocked_by, field="blocked_by")
-        metadata["supersedes"] = canonical_task_ref_list(supersedes, field="supersedes")
-        metadata["tags"] = canonical_tag_list(tags)
-        metadata["related_files"] = canonical_related_file_list(related_files)
-    except ValueError as exc:
-        field = "metadata"
-        value = str(exc)
-        match = re.match(r"Invalid task reference for ([a-z_]+): (.+)", str(exc))
-        if match:
-            field = match.group(1)
-            value = match.group(2)
-        elif str(exc).startswith("Invalid tag: "):
-            field = "tags"
-            value = str(exc)[len("Invalid tag: ") :]
-        elif str(exc).startswith("Invalid related file path: "):
-            field = "related_files"
-            value = str(exc)[len("Invalid related file path: ") :]
-        print("[ERROR] AIWF-META-REF-001")
-        print(f"Invalid task reference input for field {field}: {value}.")
-        print("Suggested Fix:")
-        print(DIAGNOSTICS["AIWF-META-REF-001"]["suggested_fix"])
-        return 2
+    metadata = default_task_metadata(task_id=task_id, task_name=norm, title=resolved_title, date=selected_date)
+    # owner/reviewer are workflow roles, not tool/provider/model provenance.
+    metadata["owner"] = "ai-agent"
+    metadata["reviewer"] = "human"
+    if normalized_priority is not None:
+        metadata["priority"] = normalized_priority
+    if normalized_risk is not None:
+        metadata["risk"] = normalized_risk
+    if normalized_project is not None:
+        metadata["project"] = normalized_project
+    if canonical_parent_task is not None:
+        metadata["parent_task"] = canonical_parent_task
+    metadata["related_tasks"] = canonical_related_tasks
+    metadata["blocked_by"] = canonical_blocked_by
+    metadata["supersedes"] = canonical_supersedes
+    metadata["tags"] = canonical_tags
+    metadata["related_files"] = canonical_related_files
     files = {
         "task.md": task_md(resolved_title, metadata=metadata),
         "agent.md": agent_md(resolved_title),
@@ -4452,15 +4705,178 @@ def create_task(
         raise
 
 
-def backfill(root: Path, raw_target: str, date: Optional[str], update_existing: bool, no_decision: bool) -> int:
-    target = Path(raw_target)
-    target = (root / target).resolve() if not target.is_absolute() else target.resolve()
-    if not target.exists() or not target.is_dir():
-        raise SystemExit(f"ERROR: target path does not exist or is not a directory: {target}")
+def resolve_backfill_source_identity(root: Path, target: Path) -> BackfillSourceIdentity:
+    target_id, target_name = split_task_dir_name(target)
+    if target_name is None:
+        target_name = normalize_name(target.name or title_from_path(target))
+    source_date: Optional[str] = None
+    if is_ai_date_dir(target):
+        source_date = target.name[len("ai_") :]
+    elif is_ai_date_dir(target.parent):
+        source_date = target.parent.name[len("ai_") :]
+    return BackfillSourceIdentity(
+        source_path=PurePosixPath(rel(root, target)).as_posix(),
+        source_date=source_date,
+        source_task_id=target_id,
+        source_task_name=target_name,
+    )
+
+
+def read_backfill_provenance(task_dir: Path) -> Optional[BackfillSourceIdentity]:
+    path = task_dir / BACKFILL_PROVENANCE_FILENAME
+    if not path.exists() or not path.is_file():
+        return None
     try:
-        target.relative_to(root.resolve())
-    except ValueError:
-        raise SystemExit(f"ERROR: target outside repo root: {target}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != BACKFILL_PROVENANCE_SCHEMA_VERSION:
+        return None
+    source_path = payload.get("source_path")
+    source_date = payload.get("source_date")
+    source_task_id = payload.get("source_task_id")
+    source_task_name = payload.get("source_task_name")
+    if not isinstance(source_path, str) or not isinstance(source_task_name, str):
+        return None
+    if source_date is not None and not isinstance(source_date, str):
+        return None
+    if source_task_id is not None and not isinstance(source_task_id, str):
+        return None
+    return BackfillSourceIdentity(source_path, source_date, source_task_id, source_task_name)
+
+
+def _backfill_task_name(task_dir: Path) -> str:
+    _task_id, task_name = split_task_dir_name(task_dir)
+    return task_name or normalize_name(task_dir.name)
+
+
+def _backfill_global_provenance_candidates(root: Path, task_name: str) -> list[Path]:
+    records_root = get_record_root(root)
+    if not records_root.exists() or not records_root.is_dir():
+        return []
+    candidates: list[Path] = []
+    for provenance in records_root.rglob(BACKFILL_PROVENANCE_FILENAME):
+        task_dir = provenance.parent
+        if task_dir.is_dir() and _backfill_task_name(task_dir) == task_name:
+            candidates.append(task_dir)
+    return candidates
+
+
+def _backfill_same_name_candidates(
+    root: Path,
+    selected: Path,
+    task_name: str,
+    candidate_parent: Optional[Path],
+) -> list[Path]:
+    candidates: dict[Path, Path] = {}
+    if candidate_parent is not None and candidate_parent.exists() and candidate_parent.is_dir():
+        for child in candidate_parent.iterdir():
+            if child.is_dir() and _backfill_task_name(child) == task_name:
+                candidates[child.resolve()] = child
+    if selected.exists() and selected.is_dir() and _backfill_task_name(selected) == task_name:
+        candidates[selected.resolve()] = selected
+    for child in _backfill_global_provenance_candidates(root, task_name):
+        candidates[child.resolve()] = child
+    return sorted(candidates.values(), key=lambda path: str(path))
+
+
+def _backfill_classify_candidates(
+    root: Path,
+    candidates: Sequence[Path],
+    identity: BackfillSourceIdentity,
+    *,
+    selected: Path,
+    allow_bootstrap: bool,
+) -> tuple[str, Optional[Path]]:
+    provenances = [(path, read_backfill_provenance(path)) for path in candidates]
+    known = [(path, provenance) for path, provenance in provenances if provenance is not None]
+    if known and all(provenance != identity for _path, provenance in known):
+        return "identity_conflict", known[0][0]
+    if len(candidates) > 1:
+        return "ambiguous", None
+    if not candidates:
+        return "no_existing", selected
+    candidate = candidates[0]
+    provenance = read_backfill_provenance(candidate)
+    if provenance is None:
+        if (candidate / BACKFILL_PROVENANCE_FILENAME).exists():
+            return "identity_conflict", candidate
+        if allow_bootstrap and candidate.resolve() == selected.resolve():
+            return "bootstrap", candidate
+        return "identity_conflict", candidate
+    if provenance != identity:
+        return "identity_conflict", candidate
+    return "same_identity", candidate
+
+
+def _backfill_missing_artifacts(task_dir: Path) -> list[str]:
+    missing: list[str] = []
+    for group in BACKFILL_REQUIRED_ARTIFACT_GROUPS:
+        if not any((task_dir / filename).exists() for filename in group):
+            missing.append(" or ".join(group))
+    return missing
+
+
+def _backfill_is_finalized(task_dir: Path) -> bool:
+    task_md = task_dir / "task.md"
+    if not task_md.exists():
+        return False
+    metadata = load_task_metadata(task_dir).get("metadata", {})
+    if not isinstance(metadata, dict):
+        return False
+    return bool(
+        str(metadata.get("status", "")) == "done"
+        or str(metadata.get("workflow_phase", "")) == "finalized"
+        or metadata.get("finalized_at")
+    )
+
+
+def _write_missing_file(root: Path, path: Path, content: str) -> WriteResult:
+    safe_write_path(root, path)
+    if path.exists():
+        return WriteResult(path, "exists")
+    ensure_dir(path.parent)
+    path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    return WriteResult(path, "created")
+
+
+def _write_missing_backfill_artifacts(root: Path, task_dir: Path, contents: dict[str, str]) -> list[WriteResult]:
+    results: list[WriteResult] = []
+    for group in BACKFILL_REQUIRED_ARTIFACT_GROUPS:
+        existing = next((task_dir / filename for filename in group if (task_dir / filename).exists()), None)
+        if existing is not None:
+            results.append(WriteResult(existing, "exists"))
+            continue
+        filename = group[0]
+        results.append(_write_missing_file(root, task_dir / filename, contents[filename]))
+    return results
+
+
+def _backfill_index_contains(index_path: Path, task_dir: Path) -> bool:
+    if not index_path.exists():
+        return False
+    return _find_task_index_line(index_path.read_text(encoding="utf-8", errors="replace").splitlines(), task_dir) is not None
+
+
+def _backfill_current_candidates(current_ai_day: Path, task_name: str) -> list[Path]:
+    if not current_ai_day.exists():
+        return []
+    if not current_ai_day.is_dir():
+        raise TaskIdAllocationError(current_ai_day)
+    return sorted(
+        [child for child in current_ai_day.iterdir() if child.is_dir() and _backfill_task_name(child) == task_name],
+        key=lambda path: str(path),
+    )
+
+
+def backfill(root: Path, raw_target: str, date: Optional[str], update_existing: bool, no_decision: bool) -> int:
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
+    if not target.is_dir():
+        _print_diagnostics([make_diagnostic("AIWF-BACKFILL-PATH-001", raw_target, blocker=True)])
+        print(f"Resolved path: {target}")
+        return 2
 
     if date is None:
         selected_date = today()
@@ -4473,25 +4889,139 @@ def backfill(root: Path, raw_target: str, date: Optional[str], update_existing: 
 
     target_rel = rel(root, target)
     title = title_from_path(target)
+    identity = resolve_backfill_source_identity(root, target)
 
     if is_task_specific_dir(target):
         selected = target
+        selected_parent: Optional[Path] = target.parent
+        selected_name = _backfill_task_name(target)
         selection_reason = "target is already a task-specific directory"
     elif is_ai_date_dir(target):
-        task_id = next_task_id(target)
-        selected = target / f"{task_id}_{normalize_name(title)}_backfill"
-        selection_reason = "target is a date-level directory; created task-specific backfill subdirectory"
+        selected = target / "000_placeholder"
+        selected_parent = target
+        selected_name = normalize_name(title) + "_backfill"
+        selection_reason = "target is a date-level directory; created a task-specific backfill subdirectory"
     elif is_ai_date_dir(target.parent):
-        task_id = next_task_id(target.parent)
-        selected = target.parent / f"{task_id}_{normalize_name(target.name)}_backfill"
-        selection_reason = "target is a legacy/mixed AI-date child; created sibling backfill subdirectory"
+        selected = target.parent / "000_placeholder"
+        selected_parent = target.parent
+        selected_name = normalize_name(target.name) + "_backfill"
+        selection_reason = "target is a legacy/mixed AI-date child; created a sibling backfill subdirectory"
     else:
         selected = target
+        selected_parent = None
+        selected_name = _backfill_task_name(target)
         selection_reason = "target is non-standard but not date-level; using target directly"
 
+    selected = selected_parent / f"000_{selected_name}" if selected_parent is not None and selected.name == "000_placeholder" else selected
+    selected_candidates = _backfill_same_name_candidates(root, selected, selected_name, selected_parent)
+    selected_state, selected_candidate = _backfill_classify_candidates(
+        root,
+        selected_candidates,
+        identity,
+        selected=selected,
+        allow_bootstrap=selected.resolve() == target.resolve(),
+    )
+    if selected_state == "ambiguous":
+        matches = ", ".join(rel(root, path) for path in selected_candidates)
+        _print_diagnostics(
+            [
+                make_diagnostic(
+                    "AIWF-TASK-NAME-001",
+                    rel(root, selected_parent or target),
+                    blocker=True,
+                    task_name=selected_name,
+                    matches=matches,
+                )
+            ]
+        )
+        return 2
+    if selected_state == "identity_conflict":
+        _print_diagnostics([make_diagnostic("AIWF-BACKFILL-IDENTITY-001", rel(root, selected_candidate or selected), blocker=True)])
+        return 2
+    if selected_state == "same_identity":
+        selected = selected_candidate or selected
+    elif selected_state == "no_existing" and selected_parent is not None:
+        task_id = next_task_id(selected_parent)
+        selected = selected_parent / f"{task_id}_{selected_name}"
     selected_rel = rel(root, selected)
-    summary = read_existing_summary(target) or "No existing summary file was found. Fill manually if needed."
 
+    selected_missing = _backfill_missing_artifacts(selected) if selected.exists() else list(
+        filename for group in BACKFILL_REQUIRED_ARTIFACT_GROUPS for filename in [group[0]]
+    )
+    if selected_state == "same_identity" and selected_missing:
+        if _backfill_is_finalized(selected):
+            _print_diagnostics(
+                [make_diagnostic("AIWF-BACKFILL-PRESERVE-001", rel(root, selected / selected_missing[0]), blocker=True, artifact=selected_missing[0])]
+            )
+            return 2
+        if not update_existing:
+            _print_diagnostics(
+                [make_diagnostic("AIWF-BACKFILL-INCOMPLETE-001", rel(root, selected), blocker=True, missing=", ".join(selected_missing))]
+            )
+            return 2
+
+    current_ai_day = resolve_ai_day_dir(root, selected_date)
+    backfill_name = normalize_name("backfill_" + target_rel.replace("/", "_").replace("\\", "_"))
+    try:
+        current_candidates = _backfill_current_candidates(current_ai_day, backfill_name)
+    except TaskIdAllocationError:
+        _print_diagnostics([make_diagnostic("AIWF-TASK-ID-001", rel(root, current_ai_day), blocker=True)])
+        return 2
+    current_state, current_candidate = _backfill_classify_candidates(
+        root,
+        current_candidates,
+        identity,
+        selected=current_ai_day / "000_placeholder",
+        allow_bootstrap=False,
+    )
+    if current_state == "ambiguous":
+        _print_diagnostics(
+            [
+                make_diagnostic(
+                    "AIWF-TASK-NAME-001",
+                    rel(root, current_ai_day),
+                    blocker=True,
+                    task_name=backfill_name,
+                    matches=", ".join(rel(root, path) for path in current_candidates),
+                )
+            ]
+        )
+        return 2
+    if current_state == "identity_conflict":
+        _print_diagnostics([make_diagnostic("AIWF-BACKFILL-IDENTITY-001", rel(root, current_candidate or current_ai_day), blocker=True)])
+        return 2
+    if current_state == "same_identity":
+        current = current_candidate or current_ai_day / "000_placeholder"
+    elif current_state == "no_existing":
+        try:
+            current = current_ai_day / f"{next_task_id(current_ai_day)}_{backfill_name}"
+        except TaskIdAllocationError:
+            _print_diagnostics([make_diagnostic("AIWF-TASK-ID-001", rel(root, current_ai_day), blocker=True)])
+            return 2
+    else:
+        current = current_candidate or current_ai_day / "000_placeholder"
+    current_rel = rel(root, current)
+
+    current_missing = _backfill_missing_artifacts(current) if current.exists() else list(
+        filename for group in BACKFILL_REQUIRED_ARTIFACT_GROUPS for filename in [group[0]]
+    )
+    if current_state == "same_identity" and current_missing:
+        if _backfill_is_finalized(current):
+            _print_diagnostics(
+                [make_diagnostic("AIWF-BACKFILL-PRESERVE-001", rel(root, current / current_missing[0]), blocker=True, artifact=current_missing[0])]
+            )
+            return 2
+        if not update_existing:
+            _print_diagnostics(
+                [make_diagnostic("AIWF-BACKFILL-INCOMPLETE-001", rel(root, current), blocker=True, missing=", ".join(current_missing))]
+            )
+            return 2
+
+    if selected_state == "same_identity" and not selected_missing and current_state == "same_identity" and not current_missing:
+        _print_diagnostics([make_diagnostic("AIWF-BACKFILL-NOOP", rel(root, selected))])
+        return 0
+
+    summary = read_existing_summary(target) or "No existing summary file was found. Fill manually if needed."
     historical_task = f"""# Backfill: {title}
 
 ## Background
@@ -4518,42 +5048,39 @@ This is a v1.1 workflow backfill for a historical AI work record.
 
 ## Problem
 
-The historical task record did not fully follow AI Workflow v1.1, which expects task-level `task.md`, task-level `agent.md`, execution traceability, and reusable knowledge writeback when applicable.
+The historical task record did not fully follow AI Workflow v1.1, which expects task-level files and execution traceability.
 
 ## Goal
 
-- Add missing v1.1 task-level files.
+- Add only missing v1.1 task-level files.
 - Preserve original historical files and conclusions.
-- Create a current-day execution record for this backfill.
-- Add reusable knowledge writeback if applicable.
+- Create one current execution record for this backfill.
+- Preserve deterministic source provenance for idempotent reruns.
 
 ## Constraints
 
-- Do not rewrite historical conclusions.
-- Do not delete or relocate historical files.
+- Do not rewrite historical conclusions or existing evidence.
+- Do not delete, relocate, merge, or rename records.
 - Do not modify business code.
 - Do not run real DUT or destructive tests.
-- Keep changes limited to .aiwf/records/ai_* and .aiwf/docs/knowledge.
+- `--update-existing` may create missing artifacts only for matching provenance.
 
 ## Acceptance Criteria
 
-- [ ] `task.md` exists in the selected historical/backfill task directory.
-- [ ] `agent.md` exists in the selected historical/backfill task directory.
-- [ ] Current-day execution record exists.
-- [ ] Index files are updated.
-- [ ] Knowledge writeback exists or is explicitly not applicable.
-- [ ] No business code changed.
-- [ ] No real DUT/destructive operation executed.
+- [ ] Existing historical files and evidence are preserved.
+- [ ] `backfill_source.json` records deterministic source identity.
+- [ ] Re-running the same source is an idempotent no-op.
+- [ ] Different or ambiguous source identity fails closed.
+- [ ] No duplicate normalized task is created.
 
 ## Risk
 
-Backfill errors can reduce traceability if files are placed at date-root level or if old records are rewritten. Preserve historical structure and link old/new paths clearly.
+Backfill errors can reduce traceability if historical evidence is rewritten or if a duplicate identity is selected automatically. Preserve existing files and require manual resolution for conflicts.
 
 ## Validation Plan
 
-- Static file existence check.
-- Index content check.
-- Documentation-only scope check.
+- Static file and provenance checks.
+- First-run, repeated-run, incomplete-target, finalized-target, and conflict tests.
 - No real DUT/destructive execution.
 """
     historical_agent = f"""# Agent Instructions: backfill {title}
@@ -4569,70 +5096,45 @@ You are an AI workflow backfill agent.
 
 ## Execution Rules
 
-1. Treat this as a v1.1 workflow backfill.
-2. Operate only on the specified path and the current-day execution record.
-3. Preserve all existing historical files.
-4. Do not rewrite historical conclusions.
-5. Do not modify business code.
-6. Do not run real DUT or destructive operations.
-7. Prefer static validation only.
-8. Add reusable knowledge under `.aiwf/docs/knowledge/` if applicable.
-
-## Safety Rules
-
-- Never add task-specific files directly under `.aiwf/records/ai_YYYYMMDD/`.
-- Use a task-specific directory.
-- Keep historical and current-day records linked.
-- Avoid duplicate knowledge files.
-
-## Required Outputs
-
-- Historical/backfill `task.md`
-- Historical/backfill `agent.md`
-- Current-day execution record
-- Index updates
-- Knowledge writeback when applicable
-
-## Review Checklist
-
-- Correct path selected?
-- Old records preserved?
-- v1.1 files complete?
-- Knowledge written or not-applicable reason documented?
-- No code changes?
-- No destructive operations?
+1. Preserve all existing historical files and conclusions.
+2. Use `backfill_source.json` as deterministic source identity evidence.
+3. Treat a matching complete target rerun as a no-op.
+4. Use `--update-existing` only to create missing artifacts for matching identity.
+5. Never rewrite task, agent, validation, review, finalize, index, or event evidence.
+6. Do not merge, rename, repair, or select a canonical duplicate.
+7. Do not run real DUT or destructive operations.
 """
     selected_task_id, selected_task_name = split_task_dir_name(selected)
     if selected_task_id is None or selected_task_name is None:
         selected_task_id = "000"
         selected_task_name = normalize_name(selected.name)
-    historical_metadata = default_task_metadata(
-        task_id=selected_task_id,
-        task_name=selected_task_name,
-        title=title,
-        date=selected_date,
-    )
+    historical_metadata = default_task_metadata(task_id=selected_task_id, task_name=selected_task_name, title=title, date=selected_date)
+    historical_files = {
+        "task.md": format_front_matter(historical_metadata) + historical_task,
+        "agent.md": historical_agent,
+        "task_record.md": task_record_md(f"backfill {title}", backfill_path=selected_rel),
+        "self_validation.md": self_validation_md(f"backfill {title}"),
+        "review_agent.md": review_agent_md(f"backfill {title}"),
+        "review_final.md": review_final_md(f"backfill {title}"),
+        BACKFILL_PROVENANCE_FILENAME: json.dumps(identity.as_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+    }
+    results: list[WriteResult] = _write_missing_backfill_artifacts(root, selected, historical_files)
 
-    results = [
-        write_file(root, selected / "task.md", format_front_matter(historical_metadata) + historical_task, update_existing),
-        write_file(root, selected / "agent.md", historical_agent, update_existing),
-    ]
+    if selected_state != "same_identity" and is_ai_date_dir(selected.parent):
+        index_path = selected.parent / "index.md"
+        if not _backfill_index_contains(index_path, selected):
+            results.append(append_index(index_path, f"- `{selected.name}` | scope: v1.1 backfill | status: added | note: original `{target_rel}`"))
 
-    if is_ai_date_dir(selected.parent):
-        results.append(append_index(selected.parent / "index.md", f"- `{selected.name}` | scope: v1.1 backfill | status: added | note: original `{target_rel}`"))
-
-    current_ai_day = resolve_ai_day_dir(root, selected_date)
-    cur_id = next_task_id(current_ai_day)
-    backfill_name = normalize_name("backfill_" + target_rel.replace("/", "_").replace("\\", "_"))
-    current = current_ai_day / f"{cur_id}_{backfill_name}"
-    current_rel = rel(root, current)
+    current_task_id, current_task_name = split_task_dir_name(current)
+    if current_task_id is None or current_task_name is None:
+        current_task_id = "000"
+        current_task_name = backfill_name
     current_metadata = default_task_metadata(
-        task_id=cur_id,
-        task_name=backfill_name,
+        task_id=current_task_id,
+        task_name=current_task_name,
         title=f"backfill {target_rel}",
         date=selected_date,
     )
-
     record_files = {
         "task.md": task_md(f"backfill {target_rel}", metadata=current_metadata, source_path=target_rel, backfill=True),
         "agent.md": agent_md(f"backfill {target_rel}", backfill=True),
@@ -4640,30 +5142,29 @@ You are an AI workflow backfill agent.
         "self_validation.md": self_validation_md(f"backfill {target_rel}"),
         "review_agent.md": review_agent_md(f"backfill {target_rel}"),
         "review_final.md": review_final_md(f"backfill {target_rel}"),
+        BACKFILL_PROVENANCE_FILENAME: json.dumps(identity.as_dict(), ensure_ascii=False, indent=2, sort_keys=True),
     }
-    for fn, content in record_files.items():
-        results.append(write_file(root, current / fn, content, update_existing))
-    results.append(append_index(current_ai_day / "index.md", f"- `{cur_id}` `{current.name}` | scope: backfill | status: generated | note: original `{target_rel}` -> selected `{selected_rel}`"))
+    write_current = (selected_state != "same_identity" and current_state == "no_existing") or (
+        current_state == "same_identity" and bool(current_missing)
+    )
+    if write_current:
+        results.extend(_write_missing_backfill_artifacts(root, current, record_files))
+        if current_state == "no_existing":
+            index_path = current.parent / "index.md"
+            if not _backfill_index_contains(index_path, current):
+                results.append(append_index(current.parent / "index.md", f"- `{current_task_id}` `{current.name}` | scope: backfill | status: generated | note: original `{target_rel}` -> selected `{selected_rel}`"))
 
-    if not no_decision:
-        decision_path = root / "docs" / "knowledge" / "decisions" / "v11_backfill_preserve_historical_structure.md"
+    if selected_state != "same_identity" and not no_decision:
+        decision_path = get_aiwf_docs_root(root) / "knowledge" / "decisions" / "v11_backfill_preserve_historical_structure.md"
         decision = f"""# Decision: Preserve historical structure during v1.1 backfill
 
 ## Decision
 
-When backfilling historical AI work records, preserve original historical files and add v1.1 task/agent files in a task-specific directory.
+Backfill is additive and identity-aware. Existing historical files and evidence are preserved; only missing artifacts for a matching source identity may be created.
 
 ## Rationale
 
-Historical records are audit artifacts. Rewriting or relocating them can damage traceability. Backfill should improve future retrieval without changing what happened historically.
-
-## Required Behavior
-
-- Do not place task-specific files directly under `.aiwf/records/ai_YYYYMMDD/`.
-- Use or create a task-specific subdirectory.
-- Create a current-day execution record for the backfill.
-- Link original and selected paths in records and indexes.
-- Do not rewrite historical conclusions.
+Historical records are audit artifacts. Rewriting or relocating them damages traceability. A deterministic provenance artifact makes repeated backfill runs idempotent without introducing merge or canonical-selection behavior.
 
 ## Related Backfill
 
@@ -4671,7 +5172,7 @@ Historical records are audit artifacts. Rewriting or relocating them can damage 
 - Selected: `{selected_rel}`
 - Execution: `{current_rel}`
 """
-        results.append(write_file(root, decision_path, decision, update_existing=False))
+        results.append(_write_missing_file(root, decision_path, decision))
 
     print(f"Selected historical/backfill path: {selected_rel}")
     print(f"Current execution record:        {current_rel}")
@@ -4695,7 +5196,9 @@ def check_task_dir(root: Path, task_dir: Path, *, v11_missing_is_fail: bool = Tr
 
 
 def check_path(root: Path, raw_target: str, strict: bool, *, finalize_ready: bool = False) -> int:
-    target = _resolve_target_path(root, raw_target)
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
     if is_task_specific_dir(target):
         diagnostics = _collect_task_diagnostics(
             root,
@@ -4711,13 +5214,16 @@ def check_path(root: Path, raw_target: str, strict: bool, *, finalize_ready: boo
         else:
             print(f"\nSummary: {len(diagnostics)} findings, {err} ERROR, {warn} WARN")
             exit_code = _diagnostic_exit_code(diagnostics, strict)
-        _try_append_aiwf_event(
-            root,
-            target,
-            command="check_finalize_ready" if finalize_ready else "check",
-            exit_code=exit_code,
-            diagnostics=diagnostics,
-        )
+        if finalize_ready:
+            _print_read_only_notice()
+        else:
+            _try_append_aiwf_event(
+                root,
+                target,
+                command="check",
+                exit_code=exit_code,
+                diagnostics=diagnostics,
+            )
         return exit_code
 
     if finalize_ready:
@@ -4962,9 +5468,15 @@ def _derive_experiment_context_from_events(events: Sequence[dict[str, Any]]) -> 
 
 
 def export_experiment_command(root: Path, raw_target: str) -> int:
-    target = _resolve_target_path(root, raw_target)
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
     if not is_task_specific_dir(target):
-        raise SystemExit(f"ERROR: path is not a task-specific directory: {target}")
+        print("[ERROR] AIWF-PATH-002")
+        print(f"{rel(root, target)}: {DIAGNOSTICS['AIWF-PATH-002']['message']}")
+        print("Suggested Fix:")
+        print(DIAGNOSTICS["AIWF-PATH-002"]["suggested_fix"])
+        return 2
 
     events, malformed_count = _load_events_with_stats(target)
     if malformed_count > 0:
@@ -5054,14 +5566,9 @@ def export_experiment_command(root: Path, raw_target: str) -> int:
 def export_json_command(root: Path, raw_target: Optional[str]) -> int:
     target: Optional[Path] = None
     if raw_target:
-        target = Path(raw_target)
-        target = (root / target).resolve() if not target.is_absolute() else target.resolve()
-        if not target.exists():
-            raise SystemExit(f"ERROR: path does not exist: {target}")
-        try:
-            target.relative_to(root.resolve())
-        except ValueError:
-            raise SystemExit(f"ERROR: path is outside repo root: {target}")
+        target = _resolve_command_target_path(root, raw_target)
+        if target is None:
+            return 2
 
     payload = export_tasks_json(root, target)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -5423,6 +5930,30 @@ def dataset_export_command(root: Path, output: str, output_format: str) -> int:
     target = Path(output)
     if not target.is_absolute():
         target = root / target
+    try:
+        safe_dataset_output_path(root, target)
+    except DatasetOutputBoundaryError as exc:
+        diagnostic = DIAGNOSTICS[exc.code]
+        print(
+            f"[ERROR] {exc.code}",
+            file=sys.stderr,
+        )
+        print(
+            f"{exc.requested_path}: {diagnostic['message']}",
+            file=sys.stderr,
+        )
+        print(f"Resolved path: {exc.resolved_path}", file=sys.stderr)
+        print(f"Repository root: {exc.root}", file=sys.stderr)
+        print(f"Records root: {exc.records_root}", file=sys.stderr)
+        print("Suggested Fix:", file=sys.stderr)
+        print(
+            diagnostic["suggested_fix"],
+            file=sys.stderr,
+        )
+        return 2
+    except SystemExit as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     payload = build_dataset_export_payload(root)
     result = write_dataset_output(root, target.resolve(), json.dumps(payload, ensure_ascii=False, indent=2))
     print(f"{result.action.upper()}  {rel(root, result.path)}")
@@ -6550,9 +7081,9 @@ def _package_records_summary_md(manifest: Mapping[str, Any]) -> str:
             f"- Manifest Schema: {_package_records_result_label(validation.get('manifest_schema', {}).get('result') if isinstance(validation.get('manifest_schema'), Mapping) else '')}",
             f"- Package Integrity: {_package_records_result_label(validation.get('package_integrity', {}).get('result') if isinstance(validation.get('package_integrity'), Mapping) else '')}",
             f"- Privacy/Security: {_package_records_result_label(validation.get('privacy_security', {}).get('result') if isinstance(validation.get('privacy_security'), Mapping) else '')}",
-            f"- Workflow Evidence Findings: {_package_records_result_label(workflow_evidence.get('result', validation.get('result', '')))} ({workflow_finding_count} findings packaged)",
+            f"- Workflow Evidence Findings: {_package_records_result_label(workflow_evidence.get('result', validation.get('result', '')))} ({workflow_finding_count} workflow evidence findings discovered)",
             "",
-            "Workflow evidence findings describe historical source workflow records packaged for review. They do not by themselves mean package generation failed.",
+            "Workflow evidence findings are discovered while inspecting historical source workflow records. They do not by themselves mean package generation failed.",
             "",
         ]
     )
@@ -7054,7 +7585,7 @@ def _package_records_print_status(
         file=stream,
     )
     print(
-        f"Workflow Evidence Findings: {_package_records_result_label(workflow_result)}, {workflow_count} findings packaged",
+        f"Workflow Evidence Findings: {_package_records_result_label(workflow_result)}, {workflow_count} workflow evidence findings discovered",
         file=stream,
     )
 
@@ -7231,7 +7762,70 @@ def _package_records_parse_filters(options: argparse.Namespace) -> tuple[Optiona
     except DateValidationError as exc:
         _print_date_validation_error(exc)
         return None, None, set(), 2
+    if from_date and to_date and from_date > to_date:
+        _print_diagnostics(
+            [
+                make_diagnostic(
+                    "AIWF-DATE-RANGE-001",
+                    "package records",
+                    blocker=True,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+            ]
+        )
+        return None, None, set(), 2
     return from_date, to_date, dates, None
+
+
+def _validate_selector_values(
+    *,
+    command: str,
+    selectors: Mapping[str, Optional[str | Sequence[str]]],
+) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    allowed_by_field = {
+        "status": ALLOWED_STATUS,
+        "workflow_phase": ALLOWED_WORKFLOW_PHASE,
+        "review_status": ALLOWED_REVIEW_STATUS,
+    }
+    for field, raw_values in selectors.items():
+        allowed = allowed_by_field[field]
+        if raw_values is None:
+            values: list[str] = []
+        elif isinstance(raw_values, str):
+            values = [raw_values]
+        else:
+            values = [str(value) for value in raw_values]
+        invalid = sorted({value for value in values if value not in allowed})
+        if invalid:
+            option = "--" + field.replace("_", "-")
+            diagnostics.append(
+                make_diagnostic(
+                    "AIWF-SELECTOR-001",
+                    f"{command} {option}",
+                    blocker=True,
+                    field=option,
+                    invalid=", ".join(invalid),
+                    allowed=", ".join(sorted(allowed)),
+                )
+            )
+    return diagnostics
+
+
+def _package_records_validate_selectors(options: argparse.Namespace) -> int:
+    diagnostics = _validate_selector_values(
+        command="package records",
+        selectors={
+            "status": getattr(options, "status", []),
+            "workflow_phase": getattr(options, "workflow_phase", []),
+            "review_status": getattr(options, "review_status", []),
+        },
+    )
+    if diagnostics:
+        _print_diagnostics(diagnostics)
+        return 2
+    return 0
 
 
 def _package_records_deferred_option_error(options: argparse.Namespace) -> Optional[str]:
@@ -7270,6 +7864,9 @@ def package_records_command(root: Path, options: argparse.Namespace) -> int:
     from_date, to_date, dates, date_error = _package_records_parse_filters(options)
     if date_error is not None:
         return date_error
+    selector_error = _package_records_validate_selectors(options)
+    if selector_error:
+        return selector_error
 
     records_root = get_record_root(root)
     selected_tasks, excluded_tasks, findings, selector_error = _package_records_select_tasks(
@@ -7365,6 +7962,18 @@ def list_command(
     workflow_phase: Optional[str],
     date: Optional[str],
 ) -> int:
+    selector_diagnostics = _validate_selector_values(
+        command="list",
+        selectors={
+            "status": status,
+            "workflow_phase": workflow_phase,
+            "review_status": review_status,
+        },
+    )
+    if selector_diagnostics:
+        _print_diagnostics(selector_diagnostics)
+        return 2
+
     date_filter: Optional[str] = None
     if date is not None:
         try:
@@ -7612,7 +8221,11 @@ def _render_report_markdown(payload: dict[str, Any]) -> str:
 
 
 def report_command(root: Path, raw_target: Optional[str], output_format: str) -> int:
-    payload = build_report_payload(root, raw_target)
+    try:
+        payload = build_report_payload(root, raw_target)
+    except CommandPathInputError as exc:
+        _print_command_path_error(exc)
+        return 2
     if output_format == "markdown":
         print(_render_report_markdown(payload), end="")
     else:
@@ -7935,12 +8548,18 @@ def next_id_command(root: Path, date: Optional[str]) -> int:
             _print_date_validation_error(exc)
             return 2
     ai_day_dir = resolve_ai_day_dir(root, target_date)
-    print(next_task_id(ai_day_dir))
+    try:
+        print(next_task_id(ai_day_dir))
+    except TaskIdAllocationError:
+        _print_diagnostics([make_diagnostic("AIWF-TASK-ID-001", rel(root, ai_day_dir), blocker=True)])
+        return 2
     return 0
 
 
 def sync_index_command(root: Path, raw_target: str) -> int:
-    target = _resolve_target_path(root, raw_target)
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
     if not is_task_specific_dir(target):
         print("[ERROR] AIWF-SYNC-001")
         print(f"{rel(root, target)}: {DIAGNOSTICS['AIWF-SYNC-001']['message']}")
@@ -7968,7 +8587,9 @@ def sync_index_command(root: Path, raw_target: str) -> int:
 
 
 def doctor_command(root: Path, raw_target: str) -> int:
-    target = _resolve_target_path(root, raw_target)
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
     if not is_task_specific_dir(target):
         print("[ERROR] AIWF-DOCTOR-001")
         print(f"{rel(root, target)}: {DIAGNOSTICS['AIWF-DOCTOR-001']['message']}")
@@ -7990,7 +8611,9 @@ def doctor_command(root: Path, raw_target: str) -> int:
 
 
 def finalize_command(root: Path, raw_target: str, dry_run: bool = False) -> int:
-    target = _resolve_target_path(root, raw_target)
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
     if not is_task_specific_dir(target):
         print("[ERROR] AIWF-FINALIZE-002")
         print(f"{rel(root, target)}: {DIAGNOSTICS['AIWF-FINALIZE-002']['message']}")
@@ -8008,14 +8631,17 @@ def finalize_command(root: Path, raw_target: str, dry_run: bool = False) -> int:
     blockers = [item for item in diagnostics if item.blocker and item.severity == "error"]
     if blockers:
         print(f"\nSummary: {len(diagnostics)} findings, {err} ERROR, {warn} WARN, {len(blockers)} finalize blockers")
-        _try_append_aiwf_event(
-            root,
-            target,
-            command="finalize_dry_run" if dry_run else "finalize",
-            exit_code=2,
-            diagnostics=diagnostics,
-            extra_result={"blocked": True},
-        )
+        if dry_run:
+            _print_read_only_notice()
+        else:
+            _try_append_aiwf_event(
+                root,
+                target,
+                command="finalize",
+                exit_code=2,
+                diagnostics=diagnostics,
+                extra_result={"blocked": True},
+            )
         return 2
 
     metadata_payload = load_task_metadata(target).get("metadata", {})
@@ -8033,14 +8659,7 @@ def finalize_command(root: Path, raw_target: str, dry_run: bool = False) -> int:
                 print(f"- {line}")
             print("Result:")
             print("PASS")
-        _try_append_aiwf_event(
-            root,
-            target,
-            command="finalize_dry_run",
-            exit_code=0,
-            diagnostics=diagnostics,
-            extra_result={"already_finalized": already_finalized},
-        )
+        _print_read_only_notice()
         return 0
 
     if already_finalized:
@@ -8272,9 +8891,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=lambda a, r: next_id_command(r, a.date))
 
     p = sub.add_parser("list", help="list tasks with optional filters")
-    p.add_argument("--status", default=None)
-    p.add_argument("--review-status", default=None)
-    p.add_argument("--workflow-phase", default=None)
+    p.add_argument(
+        "--status",
+        default=None,
+        help="exact task status selector; allowed: " + ", ".join(sorted(ALLOWED_STATUS)),
+    )
+    p.add_argument(
+        "--review-status",
+        default=None,
+        help="exact review status selector; allowed: " + ", ".join(sorted(ALLOWED_REVIEW_STATUS)),
+    )
+    p.add_argument(
+        "--workflow-phase",
+        default=None,
+        help="exact workflow phase selector; allowed: " + ", ".join(sorted(ALLOWED_WORKFLOW_PHASE)),
+    )
     p.add_argument("--date", default=None, help="YYYYMMDD")
     p.set_defaults(
         func=lambda a, r: list_command(
@@ -8309,7 +8940,11 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_sub = p.add_subparsers(dest="dataset_command", required=True)
 
     p_export = dataset_sub.add_parser("export", help="write dataset export output")
-    p_export.add_argument("--output", required=True, help="repo-relative or absolute output path")
+    p_export.add_argument(
+        "--output",
+        required=True,
+        help="repository-local relative or absolute output path outside the configured AIWF records root",
+    )
     p_export.add_argument("--format", choices=["json"], default="json", help="dataset export format")
     p_export.set_defaults(func=lambda a, r: dataset_export_command(r, a.output, a.format))
 
@@ -8330,9 +8965,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_records.add_argument("--to-date", default=None, help="include tasks created on or before YYYY-MM-DD")
     p_records.add_argument("--date", action="append", default=[], help="include tasks for YYYY-MM-DD; may repeat")
     p_records.add_argument("--task", action="append", default=[], help="exact task path or unambiguous task id; may repeat")
-    p_records.add_argument("--status", action="append", default=[], help="task metadata status; may repeat")
-    p_records.add_argument("--workflow-phase", action="append", default=[], help="task metadata workflow_phase; may repeat")
-    p_records.add_argument("--review-status", action="append", default=[], help="task metadata review_status; may repeat")
+    p_records.add_argument(
+        "--status",
+        action="append",
+        default=[],
+        help="exact task metadata status selector; may repeat; allowed: " + ", ".join(sorted(ALLOWED_STATUS)),
+    )
+    p_records.add_argument(
+        "--workflow-phase",
+        action="append",
+        default=[],
+        help="exact workflow phase selector; may repeat; allowed: " + ", ".join(sorted(ALLOWED_WORKFLOW_PHASE)),
+    )
+    p_records.add_argument(
+        "--review-status",
+        action="append",
+        default=[],
+        help="exact review status selector; may repeat; allowed: " + ", ".join(sorted(ALLOWED_REVIEW_STATUS)),
+    )
     p_records.add_argument("--project", action="append", default=[], help="task metadata project; may repeat")
     p_records.add_argument("--tag", action="append", default=[], help="task metadata tag; may repeat")
     p_records.add_argument("--include-related", action="store_true", help="not implemented in this release")

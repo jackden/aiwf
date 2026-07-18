@@ -29,6 +29,14 @@ When backfilling old AI work records to the current workflow format:
 
 7. For any v1.1 backfill, never add task-specific files directly under `.aiwf/records/ai_YYYYMMDD/`. Always create or use a task-specific subdirectory.
 
+## Identity and Preservation Rules
+
+8. Record deterministic provenance in `backfill_source.json` with normalized source path, source date, source task ID when available, and normalized source task name.
+9. Re-running the same source must be idempotent when the existing target is complete; do not create a second task or duplicate index entry.
+10. A same-name target with a different provenance identity, or multiple same-name candidates, must fail closed for manual resolution.
+11. `--update-existing` is not a general task editor. It may create missing backfill artifacts only after provenance matches.
+12. Never overwrite existing `task.md`, `agent.md`, `task_record.md`, validation/review/finalize evidence, provenance, index history, event history, or finalized records.
+
 ## Backfill Trigger Contract
 
 When the user requests:

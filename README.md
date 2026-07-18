@@ -71,8 +71,8 @@ Current metadata version boundary:
 
 | Field | Value |
 |-------|-------|
-| Release version | `1.7.11` |
-| AIWF Tool Version | `1.7.11` |
+| Release version | `1.7.12` |
+| AIWF Tool Version | `1.7.12` |
 | Workflow Protocol Version | `1.7.8` |
 
 ## Documentation
@@ -108,6 +108,7 @@ Current metadata version boundary:
 - v1.7.10 filesystem trust-boundary security hardening: [.aiwf/docs/releases/v1.7.10.md](.aiwf/docs/releases/v1.7.10.md)
 - v1.7.10.post2 upgrade runtime dependency and template copy-scope fix: [.aiwf/docs/releases/v1.7.10.post2.md](.aiwf/docs/releases/v1.7.10.post2.md)
 - v1.7.11 fail-closed task creation identity safety: [.aiwf/docs/releases/v1.7.11.md](.aiwf/docs/releases/v1.7.11.md)
+- v1.7.12 agents path repository-boundary hardening: [.aiwf/docs/releases/v1.7.12.md](.aiwf/docs/releases/v1.7.12.md)
 - Package Records release preparation: [.aiwf/docs/releases/package_records_release_preparation.md](.aiwf/docs/releases/package_records_release_preparation.md)
 
 ## Install AIWF in a New Repository
@@ -217,6 +218,11 @@ Records root layout:
 - With this config, new task records are created under `.aiwf/records/ai_YYYYMMDD/`.
 - Legacy `layout.records_root` is still accepted for compatibility in older repos.
 
+Dataset export boundary:
+- `./aiwf dataset export --output <path>` accepts a repository-local relative or absolute output path outside the active configured records root.
+- `.aiwf/records/` and any configured records root are reserved for workflow evidence; use project-owned paths such as `artifacts/dataset.json`, `reports/aiwf/dataset.json`, or an experiment output directory.
+- Resolved nested paths and symlinks into the records root are rejected with return code `2`; absolute paths outside the repository remain rejected.
+
 Run a full lifecycle example:
 - [.aiwf/docs/examples/basic_lifecycle.md](.aiwf/docs/examples/basic_lifecycle.md)
 
@@ -229,12 +235,12 @@ AGENTS root entrypoint helpers:
 
 Root `AGENTS.md` is a thin managed bootstrap entrypoint. The managed block source of truth is [`.aiwf/templates/AGENTS.block.md`](.aiwf/templates/AGENTS.block.md). The canonical rules live under `.aiwf/docs/agent_rules/`, starting with [`.aiwf/docs/agent_rules/00_root_entrypoint.md`](.aiwf/docs/agent_rules/00_root_entrypoint.md).
 
-### Version Metadata Policy (v1.7.11)
-For this release, release identity and tool provenance advance to `1.7.11` while workflow protocol semantics remain at `1.7.8`.
+### Version Metadata Policy (v1.7.12)
+For this release, release identity and tool provenance advance to `1.7.12` while workflow protocol semantics remain at `1.7.8`.
 
 Current metadata version boundary:
-- release version: `1.7.11`
-- tool version: `1.7.11`
+- release version: `1.7.12`
+- tool version: `1.7.12`
 - workflow protocol version: `1.7.8`
 
 The upgrade mechanism is additive and does not imply a package manager, a database migration framework, or silent overwrites of workflow evidence.
@@ -320,6 +326,25 @@ Report commands:
 ./aiwf report --path .aiwf/records --format json
 ./aiwf report --path .aiwf/records --format markdown
 ```
+
+## New in v1.7.12
+
+AIWF v1.7.12 contains the agents repository-boundary hardening, F-02
+relocate/upgrade conflict evidence correction, and F-03 task-ID/creation
+side-effect hardening.
+
+- `agents check --path` and `agents install --path` reject absolute outside paths, `..` traversal, and symlinks that resolve outside the repository.
+- Rejected paths return `2` with `AIWF-AGENTS-PATH-001` and do not write files; valid repository-local nested paths remain supported.
+- `relocate --apply --legacy-docs` and `upgrade --apply --migrate-legacy-docs` perform a complete conflict preflight before mutation.
+- Relocation conflicts return `2` with `AIWF-RELOCATE-CONFLICT-001`; no file mutation or success report/evidence is produced.
+- `--check` and `--dry-run` expose the blocker without changing files; no-conflict and already-relocated paths remain supported.
+- `next-id` is read-only: a missing date returns `001` without creating a date directory, index, event, or report; non-directory date paths fail closed with `AIWF-TASK-ID-001`.
+- `new-task` validates deterministic metadata before ID/directory allocation, so invalid tags, references, related files, priority/risk values, duplicate names, and `--update-existing` leave no orphan date directory or partial artifacts.
+- `backfill` records deterministic source provenance in `backfill_source.json`; repeated matching runs are idempotent no-ops and do not create duplicate tasks or index entries.
+- `backfill --update-existing` only creates missing artifacts for matching provenance and never overwrites historical task, validation, review, index, event, or finalized evidence. Identity conflicts and ambiguous candidates fail closed.
+- `finalize --dry-run` and `check --finalize-ready` are repository read-only operations: they print projected/readiness results without changing task artifacts, metadata, indexes, reports, or event logs. Readiness output is not closure evidence.
+- Read-only paths bypass the event writer even when internal `AIWF_EVENT_LOG=1` is enabled; the current CLI has no explicit event-logging option. Normal finalize event emission remains after successful mutation.
+- The workflow protocol remains `1.7.8`; no event schema, phase, or finalize semantic change is introduced.
 
 ## New in v1.7.11
 
@@ -424,12 +449,18 @@ it. Secret findings fail closed.
 Package records output separates package status from source workflow evidence
 quality. `Package Generation`, `Manifest Schema`, `Package Integrity`, and
 `Privacy/Security` describe whether the package was produced safely. `Workflow
-Evidence Findings` describes historical findings preserved from the packaged
-records, and may be `WARNING` or `FAIL` even when package generation succeeded.
+Evidence Findings` describes findings discovered while inspecting the selected
+source workflow records, and may be `WARNING` or `FAIL` even when package
+generation succeeded.
 
 ## AIWF Record Retention Policy
 AIWF task records under `.aiwf/records/ai_YYYYMMDD/` are intended to be committed by default.
 They are workflow evidence and part of the later reporting dataset.
+
+Deterministic user-input and repository-path validation failures return exit
+code `2`. This local contract does not redefine exit behavior for repository
+configuration errors, internal invariant failures, unexpected runtime
+failures, argparse usage errors, or process interruption.
 
 Do not commit:
 - secrets or private credentials

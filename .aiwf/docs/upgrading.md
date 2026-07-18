@@ -47,7 +47,7 @@ chmod +x ./aiwf
 ./aiwf upgrade --apply --source /path/to/new_aiwf_repo
 ```
 
-This sequence was verified against the current v1.7.10.post2 runtime.
+This sequence was verified against the current v1.7.12 runtime.
 
 ## Upgrade Modes
 
@@ -59,6 +59,11 @@ This sequence was verified against the current v1.7.10.post2 runtime.
 
 `--no-relocate` skips legacy layout relocation and leaves the old layout in place.
 Use it only when you intentionally want to preserve the legacy layout.
+
+Relocation is fail-closed when both a legacy source and its canonical destination
+exist. AIWF reports `AIWF-RELOCATE-CONFLICT-001`, returns `2`, and does not
+overwrite, merge, or delete either path automatically. The operator must review
+and resolve the conflict before `relocate --apply` or upgrade apply.
 
 ## What Upgrade Preserves
 
@@ -103,6 +108,10 @@ AIWF upgrade and relocation must not create, overwrite, move, or assume ownershi
 Legacy root `docs/` migration is disabled by default.
 When the target repository still contains older AIWF-owned `docs/ai_*` content, `upgrade --check` and `upgrade --dry-run` report relocation only if `--migrate-legacy-docs` is used after reviewing ownership.
 `upgrade --apply --migrate-legacy-docs` moves those legacy AIWF paths into the committed v2 layout unless `--no-relocate` is set.
+
+Upgrade with legacy migration uses the same conflict preflight as relocation. A
+conflict aborts before runtime, config, docs, event, or report mutation, and no
+successful upgrade report or relocated-path count is published.
 
 When explicitly enabled, legacy AIWF relocation rules cover:
 
@@ -166,7 +175,7 @@ Recommended spot checks:
 | `upgrade --check` reports `repair_required: yes` for the same tool version | The target repo is missing runtime dependencies or managed templates | Run `./aiwf upgrade --apply --source <source_repo>` to reinstall the missing AIWF-owned package paths |
 | `upgrade --check` or `--dry-run` reports `relocation_required: yes` | The target repo still has legacy `docs/ai_*` paths | Review the relocation plan, then run `--apply` or intentionally use `--no-relocate` |
 | `upgrade --check` warns that `tools/ai_workflow.py` exists | An older project-owned legacy file is still present | Keep it if callers depend on it, or remove it manually after confirming it is unused |
-| `upgrade --dry-run` shows a destination already exists | The target repo already contains a file at the relocation destination | Resolve the duplicate path before `--apply` |
+| `upgrade --check` or `--dry-run` reports `AIWF-RELOCATE-CONFLICT-001` | A legacy source and canonical destination both exist | Review both paths, resolve the duplicate explicitly, then rerun the command before `--apply` |
 | `AIWF-AGENTS-OUTDATED` after upgrade | The managed block no longer matches `.aiwf/templates/AGENTS.block.md` | Re-run `./aiwf agents install --path AGENTS.md --yes` |
 | `./aiwf agents check --path AGENTS.md` fails because the template is missing | The target was upgraded by an older package copy scope | Run `./aiwf upgrade --check --source <source_repo>` and apply the reported repair |
 | `git status` shows copied datasets or backup files | Generated state was copied from another repository | Remove those files from the commit set and keep only the AIWF package files |

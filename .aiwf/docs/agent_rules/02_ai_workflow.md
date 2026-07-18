@@ -29,6 +29,11 @@ Use the managed AGENTS thin block commands when needed:
 - `./aiwf agents check --path AGENTS.md`
 - `./aiwf agents install --path AGENTS.md --yes`
 
+AGENTS paths must resolve within the repository root. Absolute outside paths,
+parent traversal, and repository-local symlinks that resolve outside the
+repository are rejected. The `--yes` option only skips interactive
+confirmation and does not bypass repository-boundary validation.
+
 ## Tool-Owned Front Matter
 
 Do not manually create or rewrite task front matter.
@@ -81,11 +86,17 @@ runtime code
 - Use `new-task` / `next-id` for task ID allocation.
 - `new-task` is create-only; `new-task --update-existing` fails closed before any file write.
 - Within one `ai_YYYYMMDD` directory, normalized task names must be unique. New-task rejects duplicates before ID allocation, and task diagnostics report existing duplicates as blockers.
+- Backfill is identity-aware and additive. A deterministic `backfill_source.json` must identify the normalized source path/date/task identity; repeated matching backfill is an idempotent no-op and must not create a duplicate task.
+- `backfill --update-existing` may create missing artifacts only for a matching source identity. It must not rewrite historical task/agent content, task records, validation/review evidence, indexes, events, or finalized records.
+- Same-name different-identity and multiple-candidate backfill states fail closed; AIWF must not merge, rename, repair, discard, or select a canonical historical task automatically.
 - Use `check` and `doctor` for diagnostics.
 - `task.md` metadata is source of truth; `.aiwf/records/ai_YYYYMMDD/index.md` is a derived projection.
 - Use `sync-index --path <task_dir>` to repair stale index status from metadata.
 - Only `finalize` can set workflow completion state (`status: done`, `workflow_phase: finalized`).
 - Before finalize, run `check --path <task_dir> --finalize-ready` as the recommended deterministic gate.
+- `finalize --dry-run` is a read-only preview: it evaluates blockers and projected metadata without changing task artifacts, metadata, indexes, reports, event logs, or repository tree.
+- `check --finalize-ready` is a read-only observation: its readiness diagnostics are not closure evidence and must not append events, create reports, or mutate task/index files.
+- Read-only preflight paths must not call the repository event writer, even when internal `AIWF_EVENT_LOG=1` is enabled. The current CLI has no explicit `--log`, `--record-event`, or `--write-event` option.
 - `finalize --path <task_dir>` is fail-closed when parent `index.md` status is stale.
 - Successful finalize explicitly synchronizes parent index status projection; this mutation must be visible in command output.
 - Missing required files/sections/placeholders/review state must block finalize.

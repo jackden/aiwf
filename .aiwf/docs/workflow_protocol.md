@@ -2,15 +2,15 @@
 
 This document is the canonical protocol semantics reference for repository-native AI workflow governance.
 
-## Version Identity Policy (v1.7.11)
+## Version Identity Policy (v1.7.12)
 
 For the current lightweight, repository-native AIWF project, release identity and tool provenance normally move together.
-The `v1.7.11` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
+The `v1.7.12` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
 This does not introduce a package manager, database migration framework, or silent overwrite of workflow evidence.
 
 Current version state:
-- release version: `1.7.11`
-- tool version: `1.7.11`
+- release version: `1.7.12`
+- tool version: `1.7.12`
 - workflow protocol version: `1.7.8`
 
 This release identity is a fail-closed task creation safety correction. It does not imply workflow protocol semantic changes, event schema changes, finalize gate changes, or phase state machine changes.
@@ -93,6 +93,12 @@ Rules:
 - When a legacy project-level `tools/ai_workflow.py` exists, AIWF preserves it unchanged, does not treat it as a supported public entrypoint, and does not use it as a relocation source.
 - Legacy root `docs/` migration is explicit opt-in and must be used only after reviewing project ownership.
 
+Legacy relocation conflict handling:
+- A relocation plan classifies each selected entry as `source_missing`, `relocatable`, `already_relocated`, or `conflict`.
+- When both a legacy source and canonical destination exist, `relocate --apply` and `upgrade --apply --migrate-legacy-docs` fail closed before mutation with `AIWF-RELOCATE-CONFLICT-001` and return code `2`.
+- Conflict handling does not overwrite, merge, delete, or publish a successful migration/upgrade report. `--check` and `--dry-run` expose the same blocker without changing files.
+- This is runtime integrity behavior; it does not change event schema, workflow phases, or finalize semantics.
+
 ## 2.3 AI Agent Metadata Attribution
 
 AIWF tracks operator-facing AI attribution metadata through:
@@ -123,6 +129,43 @@ Task front matter uses workflow role fields:
 - Actual tool, provider, model, and reasoning profile belong in AIWF metadata/env profiles or `.aiwf/events/events.jsonl` provenance.
 - Historical records may still contain older values such as `owner: "codex"`; these remain compatible and are not migrated retroactively.
 
+## 2.4 Task ID lookup and new-task preflight
+
+Task ID lookup is read-only. `next-id` and the internal `next_task_id()` helper only inspect an existing AI date directory; a missing directory returns `001` without creating a directory, index entry, event, report, or task artifact. An existing date path that is not a directory fails closed with `AIWF-TASK-ID-001`.
+
+`new-task` validates all deterministic inputs before allocating an AI date directory or task directory. This includes date policy, normalized name, priority/risk, project normalization, task references, tags, and related files. Duplicate normalized names and the create-only `--update-existing` gate are also rejected before allocation. Invalid input returns `2` without leaving a date directory, task artifacts, index entry, event, report, or partial file. Valid task creation retains the existing max-plus-one ID allocation and artifact/index behavior.
+
+This boundary is intentionally limited to single-process ordering; it does not introduce locks, reservations, transaction directories, or a new rollback subsystem.
+
+## 2.5 Dataset output boundary
+
+`dataset export --output <path>` writes analytical output only to a repository-local
+relative or absolute path outside the active configured records root. The records
+root is reserved for workflow records and evidence; dataset output belongs in a
+project-owned location such as `artifacts/`, `reports/`, or an experiment output
+directory.
+
+The runtime resolves both the repository root and output target before writing,
+then rejects any target resolved anywhere under the configured records root,
+including nested paths, final symlinks, and symlinked parent directories. Absolute
+paths outside the repository remain rejected, and sibling names such as
+`.aiwf/records-export/` are not treated as the records root. Rejection returns
+code `2` before dataset collection, parent-directory creation, serialization, or
+output mutation, with diagnostic `AIWF-DATASET-OUTPUT-001` for the records-root
+boundary.
+
+This is an output placement boundary only. It does not change dataset schema,
+selection semantics, event semantics, workflow phases, or finalize behavior, and
+does not introduce an output override or generic output-management framework.
+
+## 2.6 Identity-aware additive backfill
+
+Backfill is additive, identity-aware, and fail-closed. Each backfill source is represented by a deterministic `backfill_source.json` containing the normalized source path, source date, source task ID when available, and normalized source task name. The artifact is provenance evidence and does not change the workflow protocol schema.
+
+Re-running backfill for the same source identity is an idempotent no-op when the selected and execution targets are complete. It returns `0`, does not create another task, and does not rewrite artifacts, indexes, or events. A same-name different-identity target returns `2` with `AIWF-BACKFILL-IDENTITY-001`; multiple same-name candidates return `2` without automatic canonical selection.
+
+`backfill --update-existing` may create missing backfill artifacts only when provenance matches. Existing `task.md`, `agent.md`, `task_record.md`, validation/review evidence, provenance, index entries, and finalized records are never overwritten. Incomplete matching targets fail closed without the flag; incomplete finalized targets remain protected even with it. Backfill does not merge, rename, repair, discard, or select historical records.
+
 ## 3. Finalize Semantics
 
 `./aiwf finalize --path <task_dir>` is the workflow completion authority.
@@ -144,15 +187,18 @@ Idempotency:
 
 Dry-run:
 
-- `finalize --dry-run` validates and previews mutations without writing files.
+- `finalize --dry-run` is a repository read-only operation. It validates and previews mutations without writing task artifacts, metadata, indexes, reports, or either repository/task-local event log.
+- A dry-run evaluates the same blockers as the mutating command, prints the projected result, and may print a read-only notice; the observation is not workflow evidence and does not produce a closure event.
 - For already finalized tasks, dry-run reports no-op preview.
 
 Closure hardening:
 
 - finalized tasks reject new evidence records from `record`.
 - if `finalize_success` exists, post-finalize evidence-changing events are treated as a closure violation.
-- `check --finalize-ready` runs finalize-level diagnostics in read-only mode for CI/agent gates.
+- `check --finalize-ready` runs finalize-level diagnostics in read-only mode for CI/agent gates. It does not modify task artifacts, metadata, indexes, reports, or either event log, and its readiness result is not closure evidence.
 - `check --finalize-ready` validates closure evidence hygiene, including pending validation/review residue, default template residue in required artifacts, and acceptance-criteria closure-decision states.
+- Read-only preflight paths must bypass the event writer entirely, including when internal `AIWF_EVENT_LOG=1` is enabled. The current parser exposes no explicit event-logging option to combine with these modes.
+- A successful normal finalize may append phase/finalize evidence only after the metadata and index mutation succeeds. Failed finalize paths must not emit `finalize_success`.
 - v1.6.1 remains evidence-driven; strict phase-gated finalize is deferred and not enforced as `workflow_phase == review`.
 - finalized required artifacts (`task.md`, `task_record.md`, `self_validation.md`, `review_agent.md`, `review_final.md`) are governance-controlled evidence after finalize.
 - `review_agent.md` is the canonical AI/agent review artifact for new tasks.
