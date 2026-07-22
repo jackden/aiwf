@@ -118,6 +118,17 @@ runtime code
 - Treat `AIWF-PATH-019` as event-chain contamination that requires follow-up handling.
 - Closure evidence hygiene checks validate workflow readiness only; they do not validate business completion truth.
 - Treat version metadata alignment as governance metadata behavior, not automatic runtime semantic change.
+- Post-finalization correction is additive: use `./aiwf correct-finalized` only
+  for a finalized task and only with explicit `human_*` authority. The command
+  must not rewrite finalized metadata, required artifacts, index, events, or
+  finalize manifest.
+- Use `./aiwf inspect --path <task_dir>` to distinguish historical closure from
+  current effective state; do not infer current state from finalized prose
+  alone when a correction artifact is present.
+- The internal source-only stamp for this correction capability is
+  `v1.7.12.post1`; keep public/tool version `1.7.13` and protocol version
+  `1.7.8` unchanged unless a separate release task explicitly changes the
+  release boundary.
 
 ## v1.6.1 Scope Note
 

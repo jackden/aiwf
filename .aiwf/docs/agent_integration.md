@@ -84,3 +84,51 @@ Workflow events are stored under:
 - `AGENTS.md` is supported whether it already exists or not.
 - Outdated managed blocks are expected to be repaired by reinstalling the block, not by hand-editing inside the managed region.
 - This integration is intentionally minimal and does not introduce any other adapter generation or repo relocation behavior.
+
+## Closure Summary
+
+New `review_final.md` artifacts include a short, human-authored conclusion
+section:
+
+```md
+## Closure Summary
+- Workflow Decision: finalize
+- Engineering Outcome: functional_pass
+- Remaining Limitations: none
+- Follow-up: none
+```
+
+Workflow Decision describes whether the current workflow has a clear closure.
+Engineering Outcome describes what the engineering work demonstrated. A task
+may use `Workflow Decision: finalize` with
+`Engineering Outcome: bounded_incomplete` when a limitation is explicit.
+
+The summary is documentation guidance, not a metadata enum or finalize
+blocker. It must not be left as `TBD`, `Pending`, or blank in a completed
+review artifact. `Remaining Limitations` should say `none` when there are no
+known limitations. Real-DUT validation, external environment state, or later
+verification may be recorded as limitations and follow-up work.
+
+### Fully validated
+
+```md
+## Closure Summary
+- Workflow Decision: finalize
+- Engineering Outcome: functional_pass
+- Remaining Limitations: none
+- Follow-up: none
+```
+
+### Bounded completion
+
+```md
+## Closure Summary
+- Workflow Decision: finalize
+- Engineering Outcome: bounded_incomplete
+- Remaining Limitations: Real-DUT validation was not executed in this task.
+- Follow-up: Real-DUT validation is tracked in task 052.
+```
+
+Finalize represents workflow closure with evidence; it does not guarantee that
+the product or domain result is correct. Task content complexity cannot replace
+workflow evidence.

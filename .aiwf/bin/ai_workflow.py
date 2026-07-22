@@ -6,6 +6,7 @@ Repo-local tool for deterministic AI workflow governance.
 
 Commands:
   new-task <name>
+  install --target <path> [--yes]
   relocate [--dry-run|--apply] [--legacy-docs]
   upgrade --check|--dry-run|--apply --source <repo> [--migrate-legacy-docs]
   dataset export --output <path> [--format json]
@@ -16,6 +17,8 @@ Commands:
   sync-index --path <task_dir>
   doctor --path <path>
   finalize --path <path>
+  correct-finalized --path <path> --type <type> --authority <human_authority> --current-state <state> --reason <reason>
+  inspect --path <path>
   transition --path <task_dir> --to <phase>
   record --path <task_dir> --kind <kind> [kind-specific args]
   next-id [--date <YYYYMMDD>]
@@ -67,6 +70,7 @@ from safe_paths import (  # noqa: E402
     lexical_relative,
     safe_copy_file_no_symlink,
     safe_copy_tree_no_symlink,
+    safe_walk_files,
 )
 
 from lib.package_core import (  # noqa: E402
@@ -98,7 +102,7 @@ SCHEMA_V16 = "ai-workflow-v1.6"
 CURRENT_SCHEMA_VERSION = SCHEMA_V16
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16}
 WORKFLOW_PROTOCOL_VERSION = "1.7.8"
-AIWF_TOOL_VERSION = "1.7.12"
+AIWF_TOOL_VERSION = "1.7.13"
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.1"
 AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.2"
 AIWF_EXPERIMENT_SCHEMA_VERSION = "aiwf-experiment-v0.1"
@@ -111,6 +115,25 @@ AIWF_PACKAGE_RECORDS_MANIFEST_ERROR = "AIWF-PKG-MANIFEST-001"
 AIWF_PACKAGE_RECORDS_DATASET_PATH = "dataset/aiwf_dataset.json"
 AIWF_PACKAGE_RECORDS_ROOT_DIR = "aiwf-records-package"
 AIWF_PACKAGE_RECORDS_REDACTION_PROFILES = {"safe", "internal", "none"}
+CORRECTION_SCHEMA_VERSION = "aiwf-correction-v1"
+CORRECTION_DIRNAME = "corrections"
+CORRECTION_FILENAME_RE = re.compile(r"^(\d{3})_([a-z0-9][a-z0-9_]*)\.md$")
+CORRECTION_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+CORRECTION_AUTHORITY_RE = re.compile(r"^human_[a-z0-9_]+$")
+ALLOWED_CORRECTION_TYPES = {
+    "implementation_reverted",
+    "scope_reclassified",
+    "conclusion_corrected",
+    "evidence_superseded",
+    "current_state_clarification",
+}
+ALLOWED_CORRECTION_AFFECTS = {
+    "implementation_state",
+    "current_repository_state",
+    "conclusion",
+    "evidence",
+    "scope",
+}
 BACKFILL_PROVENANCE_FILENAME = "backfill_source.json"
 BACKFILL_PROVENANCE_SCHEMA_VERSION = "1"
 BACKFILL_REQUIRED_ARTIFACT_GROUPS: tuple[tuple[str, ...], ...] = (
@@ -769,6 +792,15 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-META-RUNTIME-001": {"severity": "error", "message": "Invalid runtime metadata option {option}: {value}.", "suggested_fix": "Use `AIWF_EVENT_LOG=1` to enable event logging or `AIWF_EVENT_LOG=0` to disable it."},
     "AIWF-FINALIZED-001": {"severity": "warn", "message": "Finalized task modified after finalized_at.", "suggested_fix": "Review post-finalize edits and rerun check/doctor before additional changes."},
     "AIWF-FINALIZED-002": {"severity": "error", "message": "Finalized task cannot accept new evidence records.", "suggested_fix": "Do not run record on finalized tasks; create a new follow-up task for additional evidence."},
+    "AIWF-CORRECTION-001": {"severity": "error", "message": "Post-finalization correction requires a finalized task.", "suggested_fix": "Run correction only after the target task has been finalized successfully."},
+    "AIWF-CORRECTION-002": {"severity": "error", "message": "Correction type is invalid: {correction_type}.", "suggested_fix": "Use one of: implementation_reverted, scope_reclassified, conclusion_corrected, evidence_superseded, current_state_clarification."},
+    "AIWF-CORRECTION-003": {"severity": "error", "message": "Correction authority must be an explicit human authority: {authority}.", "suggested_fix": "Use a non-empty human_* authority such as human_scope_decision."},
+    "AIWF-CORRECTION-004": {"severity": "error", "message": "Correction field {field} must be non-empty single-line text.", "suggested_fix": "Provide a non-empty value without newline characters."},
+    "AIWF-CORRECTION-005": {"severity": "error", "message": "Correction target has an invalid or colliding artifact: {artifact_path}.", "suggested_fix": "Keep corrections under corrections/ with unique names like 001_implementation_reverted.md."},
+    "AIWF-CORRECTION-006": {"severity": "error", "message": "Correction artifact is malformed: {artifact_path}.", "suggested_fix": "Use a tool-created aiwf-correction-v1 artifact; do not hand-edit correction metadata."},
+    "AIWF-CORRECTION-007": {"severity": "error", "message": "Correction path is not a safe directory under the task.", "suggested_fix": "Remove the conflicting symlink or filesystem object and retry after review."},
+    "AIWF-CORRECTION-008": {"severity": "error", "message": "Correction ID already exists: {correction_id}.", "suggested_fix": "Retry after resolving the correction directory collision."},
+    "AIWF-INSPECT-001": {"severity": "error", "message": "inspect only supports task-specific directory paths.", "suggested_fix": "Use a path like .aiwf/records/ai_YYYYMMDD/NNN_task_name."},
     "AIWF-DOCTOR-001": {"severity": "error", "message": "doctor only supports task-specific directory paths.", "suggested_fix": "Use a path like .aiwf/records/ai_YYYYMMDD/NNN_task_name."},
     "AIWF-FINALIZE-001": {"severity": "info", "message": "Task already finalized. No changes applied.", "suggested_fix": ""},
     "AIWF-FINALIZE-002": {"severity": "error", "message": "finalize only supports task-specific directory paths.", "suggested_fix": "Use a path like .aiwf/records/ai_YYYYMMDD/NNN_task_name."},
@@ -2077,6 +2109,33 @@ UPGRADE_COPY_SPECS: Mapping[str, tuple[str, str]] = {
     ".aiwf/templates/**": (".aiwf/templates", ".aiwf/templates"),
 }
 
+# Fresh install uses the same package-owned paths as upgrade, plus the layout
+# config.  Generated/private source state is intentionally excluded from the
+# directory copies; records and events are created empty in the target.
+INSTALL_REQUIRED_SOURCE_PATHS: tuple[tuple[str, str], ...] = (
+    *UPGRADE_REQUIRED_SOURCE_PATHS,
+    (".aiwf/config.yaml", "file"),
+)
+INSTALL_COPY_SPECS: Mapping[str, tuple[str, str]] = {
+    **UPGRADE_COPY_SPECS,
+    ".aiwf/config.yaml": (".aiwf/config.yaml", ".aiwf/config.yaml"),
+}
+INSTALL_CREATED_DIRS: tuple[str, ...] = (
+    ".aiwf/records",
+    ".aiwf/events",
+    ".aiwf/migrations",
+)
+INSTALL_EXCLUDED_PATHS: frozenset[str] = frozenset(
+    {
+        ".aiwf/docs/internal",
+        ".aiwf/docs/knowledge",
+        ".aiwf/bin/export_public_tree.py",
+        ".aiwf/bin/package_review_bundle.py",
+        ".aiwf/bin/package_review_bundle.sh",
+    }
+)
+INSTALL_EXCLUDED_NAMES: frozenset[str] = frozenset({"__pycache__", ".pytest_cache", ".DS_Store"})
+
 
 def _upgrade_source_requirements(source_root: Path) -> list[tuple[str, Path, str]]:
     return [
@@ -2252,6 +2311,333 @@ def _copy_upgrade_artifacts(source_root: Path, target_root: Path, update_plan: S
             raise SystemExit(f"ERROR: {exc}") from exc
         copied.append(installed_label)
     return copied
+
+
+def _install_source_rel(source_root: Path, path: Path) -> str:
+    return lexical_relative(path, source_root)
+
+
+def _install_validate_source(source_root: Path) -> list[str]:
+    blockers: list[str] = []
+    if not source_root.exists():
+        return [f"source package does not exist: {source_root}"]
+    if not source_root.is_dir():
+        return [f"source package is not a directory: {source_root}"]
+    for rel_path, expected_type in INSTALL_REQUIRED_SOURCE_PATHS:
+        path = source_root / rel_path
+        symlink_path = find_symlink_component(path, source_root)
+        if symlink_path is not None:
+            blockers.append(f"source package member must not be a symlink: {_install_source_rel(source_root, symlink_path)}")
+            continue
+        if not path.exists():
+            blockers.append(f"missing required source package path: {_install_source_rel(source_root, path)}")
+            continue
+        if expected_type == "dir" and not path.is_dir():
+            blockers.append(f"required source package path is not a directory: {_install_source_rel(source_root, path)}")
+        elif expected_type == "file" and not path.is_file():
+            blockers.append(f"required source package path is not a file: {_install_source_rel(source_root, path)}")
+    for rel_path in UPGRADE_SOURCE_TREE_PATHS:
+        path = source_root / rel_path
+        if path.exists() and path.is_dir():
+            symlink_path = find_tree_symlink(path)
+            if symlink_path is not None:
+                blockers.append(f"source package tree must not contain symlinks: {_install_source_rel(source_root, symlink_path)}")
+    aiwf_entrypoint = source_root / "aiwf"
+    if aiwf_entrypoint.exists() and not os.access(aiwf_entrypoint, os.X_OK):
+        blockers.append(f"aiwf is not executable: {_install_source_rel(source_root, aiwf_entrypoint)}")
+    return blockers
+
+
+def _install_path_is_writable(path: Path) -> bool:
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return False
+    return bool(mode & 0o222) and os.access(path, os.W_OK)
+
+
+def _install_path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _install_first_symlink_component(path: Path) -> Optional[Path]:
+    current = Path(path.anchor) if path.is_absolute() else Path.cwd()
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def _install_agents_text(original: Optional[str], managed: str) -> str:
+    managed = managed.rstrip("\n")
+    if original is None:
+        return managed + "\n"
+    begin, end = _find_agents_block_bounds(original)
+    if begin is None and end is None:
+        base = original.rstrip("\n")
+        return f"{base}\n\n{managed}\n" if base else f"{managed}\n"
+    if begin is None or end is None:
+        raise ValueError("existing AGENTS.md contains an incomplete AIWF managed block")
+    updated = f"{original[:begin].rstrip()}\n\n{managed}\n{original[end:].lstrip()}"
+    return updated if updated.endswith("\n") else updated + "\n"
+
+
+def _install_target_required_paths() -> tuple[tuple[str, str], ...]:
+    return (
+        ("aiwf", "file"),
+        (".aiwf/bin/ai_workflow.py", "file"),
+        (".aiwf/bin/safe_paths.py", "file"),
+        (".aiwf/bin/lib", "dir"),
+        (".aiwf/bin/lib/package_core.py", "file"),
+        (".aiwf/docs", "dir"),
+        (".aiwf/templates/AGENTS.block.md", "file"),
+        (".aiwf/config.yaml", "file"),
+        *( (path, "dir") for path in INSTALL_CREATED_DIRS ),
+    )
+
+
+def _install_target_gaps(root: Path) -> list[str]:
+    gaps: list[str] = []
+    for rel_path, expected_type in _install_target_required_paths():
+        path = root / rel_path
+        if expected_type == "dir" and not path.is_dir():
+            gaps.append(rel_path)
+        elif expected_type == "file" and not path.is_file():
+            gaps.append(rel_path)
+    return gaps
+
+
+def _install_preflight(root: Path, source_root: Path) -> tuple[list[str], str, list[tuple[Path, Path]]]:
+    blockers = _install_validate_source(source_root)
+    target = root.resolve()
+    source = source_root.resolve()
+    if not target.exists():
+        blockers.append(f"target path does not exist: {target}")
+        return blockers, "", []
+    if target.is_symlink() or not target.is_dir():
+        blockers.append(f"target path is not a directory: {target}")
+        return blockers, "", []
+    if not _install_path_is_writable(target):
+        blockers.append(f"target path is not writable: {target}")
+    if target == source:
+        blockers.append("target path must not equal the source package")
+    elif _install_path_within(target, source):
+        blockers.append("target path must not be inside the source package")
+    elif _install_path_within(source, target):
+        blockers.append("source package must not be inside the target path")
+
+    markers = [path for path in (root / "aiwf", root / ".aiwf") if path.exists()]
+    agents_path = root / "AGENTS.md"
+    agents_original: Optional[str] = None
+    managed_present = False
+    if agents_path.exists():
+        if agents_path.is_symlink() or not agents_path.is_file():
+            blockers.append(f"AGENTS.md is not a regular file: {agents_path}")
+        else:
+            if not _install_path_is_writable(agents_path):
+                blockers.append(f"AGENTS.md is not writable: {agents_path}")
+            agents_original = agents_path.read_text(encoding="utf-8", errors="replace")
+            begin, end = _find_agents_block_bounds(agents_original)
+            managed_present = begin is not None or end is not None
+            if managed_present and (begin is None or end is None):
+                blockers.append("target contains an incomplete AGENTS.md managed block")
+
+    complete = bool(markers) and not _install_target_gaps(root) and not blockers
+    if complete and managed_present:
+        blockers.append("AIWF is already installed in the target repository. Use ./aiwf upgrade instead.")
+    elif markers or managed_present:
+        paths = [rel(root, path) for path in markers]
+        if managed_present:
+            paths.append("AGENTS.md managed block")
+        blockers.append("partial AIWF installation detected at: " + ", ".join(paths))
+
+    if blockers:
+        return blockers, "", []
+
+    managed_path = source_root / ".aiwf" / "templates" / "AGENTS.block.md"
+    managed = managed_path.read_text(encoding="utf-8", errors="replace")
+    try:
+        agents_text = _install_agents_text(agents_original, managed)
+    except ValueError as exc:
+        return [str(exc)], "", []
+
+    copy_plan: list[tuple[Path, Path]] = []
+    for plan_item, (source_rel, _installed_label) in INSTALL_COPY_SPECS.items():
+        source_path = source_root / source_rel
+        if source_path.is_dir():
+            for source_file in safe_walk_files(source_path, allowed_root=source_root):
+                rel_path = source_file.relative_to(source_root).as_posix()
+                if rel_path in INSTALL_EXCLUDED_PATHS or any(
+                    rel_path.startswith(f"{excluded}/") for excluded in INSTALL_EXCLUDED_PATHS
+                ):
+                    continue
+                if any(part in INSTALL_EXCLUDED_NAMES for part in source_file.relative_to(source_root).parts):
+                    continue
+                if source_file.suffix in {".pyc", ".pyo"}:
+                    continue
+                copy_plan.append((source_file, root / rel_path))
+        else:
+            copy_plan.append((source_path, root / source_rel))
+    return [], agents_text, copy_plan
+
+
+@dataclass
+class _InstallRollback:
+    created_files: list[Path]
+    created_dirs: list[Path]
+    backups: dict[Path, tuple[bytes, int]]
+
+    @classmethod
+    def create(cls) -> "_InstallRollback":
+        return cls([], [], {})
+
+    def ensure_dir(self, path: Path) -> None:
+        missing: list[Path] = []
+        current = path
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        if current.is_symlink() or not current.is_dir():
+            raise ValueError(f"installation parent is not a directory: {current}")
+        for directory in reversed(missing):
+            directory.mkdir()
+            self.created_dirs.append(directory)
+
+    def remember_destination(self, path: Path) -> None:
+        if not path.exists():
+            self.created_files.append(path)
+            return
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"installation destination is not a regular file: {path}")
+        if path not in self.backups:
+            self.backups[path] = (path.read_bytes(), path.stat().st_mode)
+
+    def rollback(self) -> list[Path]:
+        failures: list[Path] = []
+        for path in reversed(self.created_files):
+            try:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+            except OSError:
+                failures.append(path)
+        for path, (content, mode) in self.backups.items():
+            try:
+                path.write_bytes(content)
+                path.chmod(mode)
+            except OSError:
+                failures.append(path)
+        for path in reversed(self.created_dirs):
+            try:
+                path.rmdir()
+            except OSError:
+                if path.exists():
+                    failures.append(path)
+        return failures
+
+
+def _install_post_validation(root: Path, source_root: Path) -> list[str]:
+    failures: list[str] = []
+    wrapper = root / "aiwf"
+    runtime = root / ".aiwf" / "bin" / "ai_workflow.py"
+    if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
+        failures.append("root wrapper executable check failed")
+    if not runtime.is_file():
+        failures.append("runtime path check failed: .aiwf/bin/ai_workflow.py")
+    else:
+        result = subprocess.run(
+            [str(wrapper), "--help"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            check=False,
+            timeout=30,
+        )
+        if result.returncode != 0 or "install" not in result.stdout:
+            failures.append("runtime help check failed")
+    gaps = _install_target_gaps(root)
+    if gaps:
+        failures.append("package layout check failed: " + ", ".join(gaps))
+    source_tool = _read_version_constant(source_root / ".aiwf/bin/ai_workflow.py", "AIWF_TOOL_VERSION")
+    target_tool = _read_version_constant(runtime, "AIWF_TOOL_VERSION")
+    source_protocol = _read_version_constant(source_root / ".aiwf/bin/ai_workflow.py", "WORKFLOW_PROTOCOL_VERSION")
+    target_protocol = _read_version_constant(runtime, "WORKFLOW_PROTOCOL_VERSION")
+    if source_tool != target_tool or source_protocol != target_protocol:
+        failures.append("package version identity check failed")
+    agents_path = root / "AGENTS.md"
+    try:
+        agents_text = agents_path.read_text(encoding="utf-8", errors="replace")
+        begin, end = _find_agents_block_bounds(agents_text)
+        template = (root / ".aiwf/templates/AGENTS.block.md").read_text(encoding="utf-8", errors="replace").rstrip("\n")
+        if begin is None or end is None or agents_text[begin:end].rstrip("\n") != template:
+            failures.append("agent instructions check failed")
+    except OSError:
+        failures.append("agent instructions check failed")
+    return failures
+
+
+def install_command(root: Path, target: str, yes: bool) -> int:
+    target_root = Path(target).expanduser()
+    if not target_root.is_absolute():
+        target_root = Path.cwd() / target_root
+    symlink_component = _install_first_symlink_component(target_root)
+    if symlink_component is not None:
+        print("[ERROR] AIWF install preflight failed.")
+        print(f"- target path contains a symlink component: {symlink_component}")
+        return 2
+    target_root = target_root.resolve()
+    source_root = (AIWF_BIN_DIR.parent.parent).resolve()
+    blockers, agents_text, copy_plan = _install_preflight(target_root, source_root)
+    if blockers:
+        print("[ERROR] AIWF install preflight failed.")
+        for blocker in blockers:
+            print(f"- {blocker}")
+        return 2
+    print("Fresh install preflight passed.")
+    if not yes:
+        print("No files were changed.")
+        print("Re-run with --yes to install AIWF.")
+        return 0
+
+    transaction = _InstallRollback.create()
+    try:
+        for source_path, destination in copy_plan:
+            transaction.ensure_dir(destination.parent)
+            transaction.remember_destination(destination)
+            safe_copy_file_no_symlink(source_path, destination, source_root)
+        for relative_dir in INSTALL_CREATED_DIRS:
+            transaction.ensure_dir(target_root / relative_dir)
+        agents_path = target_root / "AGENTS.md"
+        transaction.ensure_dir(agents_path.parent)
+        transaction.remember_destination(agents_path)
+        agents_path.write_text(agents_text, encoding="utf-8")
+        post_failures = _install_post_validation(target_root, source_root)
+        if post_failures:
+            raise ValueError("; ".join(post_failures))
+    except BaseException as exc:
+        rollback_failures = transaction.rollback()
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        print("[ERROR] AIWF installation failed; installation was rolled back.")
+        print(f"- {exc}")
+        if rollback_failures:
+            print("- rollback could not restore:")
+            for path in rollback_failures:
+                print(f"  - {path}")
+        return 2
+
+    print("AIWF installed successfully.")
+    print(f"Target:\n  {target_root}")
+    print("Installed:\n  aiwf\n  .aiwf/bin\n  .aiwf/docs\n  .aiwf/templates\n  .aiwf/config.yaml\n  AGENTS.md managed block")
+    print("Validation:\n  runtime: PASS\n  package layout: PASS\n  agent instructions: PASS")
+    print("Next:\n  ./aiwf new-task <task-name>")
+    return 0
 
 
 def _upgrade_report_text(
@@ -3434,6 +3820,12 @@ Pending human review.
 
 PENDING
 
+## Closure Summary
+- Workflow Decision:
+- Engineering Outcome:
+- Remaining Limitations:
+- Follow-up:
+
 ## DUT Validation Conclusion
 
 Not run. This task does not execute real DUT/destructive validation unless explicitly approved.
@@ -3620,6 +4012,241 @@ def _is_already_finalized(metadata: dict[str, Any]) -> bool:
         and str(metadata.get("workflow_phase", "")) == "finalized"
         and _has_non_empty_text(metadata.get("finalized_at"))
     )
+
+
+CORRECTION_AFFECTS_BY_TYPE: dict[str, list[str]] = {
+    "implementation_reverted": ["implementation_state", "current_repository_state"],
+    "scope_reclassified": ["scope", "conclusion"],
+    "conclusion_corrected": ["conclusion", "evidence"],
+    "evidence_superseded": ["evidence", "conclusion"],
+    "current_state_clarification": ["current_repository_state"],
+}
+
+
+def _correction_dir(task_dir: Path) -> Path:
+    return task_dir / CORRECTION_DIRNAME
+
+
+def _correction_text_is_valid(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and "\n" not in value and "\r" not in value
+
+
+def _correction_diagnostic(root: Path, task_dir: Path, code: str, *, blocker: bool = True, **fmt: Any) -> Diagnostic:
+    return make_diagnostic(code, rel(root, task_dir), blocker=blocker, **fmt)
+
+
+def _correction_artifact_records(root: Path, task_dir: Path) -> tuple[list[dict[str, Any]], list[Diagnostic]]:
+    directory = _correction_dir(task_dir)
+    if not directory.exists():
+        return [], []
+    if directory.is_symlink() or not directory.is_dir():
+        return [], [_correction_diagnostic(root, task_dir, "AIWF-CORRECTION-007")]
+
+    records: list[dict[str, Any]] = []
+    diagnostics: list[Diagnostic] = []
+    seen_ids: set[str] = set()
+    for path in sorted(directory.iterdir(), key=lambda candidate: candidate.name):
+        match = CORRECTION_FILENAME_RE.fullmatch(path.name)
+        if path.is_symlink() or not path.is_file() or match is None:
+            diagnostics.append(
+                _correction_diagnostic(
+                    root,
+                    task_dir,
+                    "AIWF-CORRECTION-005",
+                    artifact_path=rel(root, path),
+                )
+            )
+            continue
+
+        correction_id, filename_type = match.groups()
+        if correction_id in seen_ids:
+            diagnostics.append(
+                _correction_diagnostic(root, task_dir, "AIWF-CORRECTION-008", correction_id=correction_id)
+            )
+            continue
+        seen_ids.add(correction_id)
+
+        metadata, body = parse_front_matter(path.read_text(encoding="utf-8", errors="replace"))
+        correction_type = str(metadata.get("correction_type", "")).strip()
+        authority = str(metadata.get("authority", "")).strip()
+        affects = metadata.get("affects", [])
+        historical_valid = str(metadata.get("historical_closure_remains_valid", "")).strip().lower() == "true"
+        valid = (
+            metadata.get("schema_version") == CORRECTION_SCHEMA_VERSION
+            and str(metadata.get("correction_id", "")).strip() == correction_id
+            and correction_type == filename_type
+            and correction_type in ALLOWED_CORRECTION_TYPES
+            and str(metadata.get("created_by", "")).strip() == "human"
+            and bool(CORRECTION_AUTHORITY_RE.fullmatch(authority))
+            and _correction_text_is_valid(metadata.get("current_effective_state"))
+            and _correction_text_is_valid(metadata.get("reason"))
+            and _correction_text_is_valid(metadata.get("created_at"))
+            and historical_valid
+            and isinstance(affects, list)
+            and bool(affects)
+            and all(str(item) in ALLOWED_CORRECTION_AFFECTS for item in affects)
+            and bool(body.strip())
+        )
+        if not valid:
+            diagnostics.append(
+                _correction_diagnostic(root, task_dir, "AIWF-CORRECTION-006", artifact_path=rel(root, path))
+            )
+            continue
+
+        record = dict(metadata)
+        record["path"] = path
+        record["correction_id"] = correction_id
+        record["correction_type"] = correction_type
+        record["authority"] = authority
+        record["affects"] = [str(item) for item in affects]
+        record["historical_closure_remains_valid"] = historical_valid
+        records.append(record)
+
+    records.sort(key=lambda item: str(item["correction_id"]))
+    return records, diagnostics
+
+
+def _next_correction_id(records: Sequence[dict[str, Any]]) -> str:
+    highest = max((int(str(item["correction_id"])) for item in records), default=0)
+    return f"{highest + 1:03d}"
+
+
+def _print_task_path_diagnostic(root: Path, target: Path, code: str) -> None:
+    diagnostic = make_diagnostic(code, rel(root, target), blocker=True)
+    _print_diagnostics([diagnostic])
+
+
+def correct_finalized_command(
+    root: Path,
+    raw_target: str,
+    *,
+    correction_type: Optional[str],
+    authority: Optional[str],
+    current_state: Optional[str],
+    reason: Optional[str],
+) -> int:
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
+    if not is_task_specific_dir(target):
+        _print_task_path_diagnostic(root, target, "AIWF-PATH-002")
+        return 2
+
+    metadata = load_task_metadata(target).get("metadata", {})
+    if not isinstance(metadata, dict) or not _is_already_finalized(metadata):
+        _print_diagnostics([_correction_diagnostic(root, target, "AIWF-CORRECTION-001")])
+        return 2
+
+    existing, existing_diagnostics = _correction_artifact_records(root, target)
+    if existing_diagnostics:
+        _print_diagnostics(existing_diagnostics)
+        return 2
+
+    normalized_type = str(correction_type or "").strip()
+    if normalized_type not in ALLOWED_CORRECTION_TYPES:
+        _print_diagnostics(
+            [_correction_diagnostic(root, target, "AIWF-CORRECTION-002", correction_type=normalized_type or "(empty)")]
+        )
+        return 2
+
+    normalized_authority = str(authority or "").strip()
+    if not CORRECTION_AUTHORITY_RE.fullmatch(normalized_authority):
+        _print_diagnostics(
+            [_correction_diagnostic(root, target, "AIWF-CORRECTION-003", authority=normalized_authority or "(empty)")]
+        )
+        return 2
+
+    invalid_fields = [
+        field
+        for field, value in (("current_state", current_state), ("reason", reason))
+        if not _correction_text_is_valid(value)
+    ]
+    if invalid_fields:
+        _print_diagnostics(
+            [_correction_diagnostic(root, target, "AIWF-CORRECTION-004", field=invalid_fields[0])]
+        )
+        return 2
+
+    correction_id = _next_correction_id(existing)
+    correction_path = _correction_dir(target) / f"{correction_id}_{normalized_type}.md"
+    if correction_path.exists():
+        _print_diagnostics(
+            [_correction_diagnostic(root, target, "AIWF-CORRECTION-008", correction_id=correction_id)]
+        )
+        return 2
+
+    safe_write_path(root, correction_path)
+    ensure_dir(correction_path.parent)
+    correction_metadata: dict[str, Any] = {
+        "schema_version": CORRECTION_SCHEMA_VERSION,
+        "correction_id": correction_id,
+        "correction_type": normalized_type,
+        "created_at": _now_iso_timestamp(),
+        "created_by": "human",
+        "authority": normalized_authority,
+        "supersedes_correction": None,
+        "affects": CORRECTION_AFFECTS_BY_TYPE[normalized_type],
+        "historical_closure_remains_valid": True,
+        "current_effective_state": str(current_state).strip(),
+        "reason": str(reason).strip(),
+    }
+    content = (
+        format_front_matter(correction_metadata)
+        + f"# Post-Finalization Correction {correction_id}\n\n"
+        + "## Reason\n\n"
+        + f"{str(reason).strip()}\n\n"
+        + "## Current Effective State\n\n"
+        + f"{str(current_state).strip()}\n"
+    )
+    try:
+        with correction_path.open("x", encoding="utf-8") as handle:
+            handle.write(content)
+    except FileExistsError:
+        _print_diagnostics(
+            [_correction_diagnostic(root, target, "AIWF-CORRECTION-008", correction_id=correction_id)]
+        )
+        return 2
+
+    print("[INFO] AIWF-CORRECTION-OK")
+    print(f"{rel(root, correction_path)}: additive post-finalization correction created")
+    print("Historical closure evidence: preserved")
+    return 0
+
+
+def inspect_command(root: Path, raw_target: str) -> int:
+    target = _resolve_command_target_path(root, raw_target)
+    if target is None:
+        return 2
+    if not is_task_specific_dir(target):
+        _print_task_path_diagnostic(root, target, "AIWF-INSPECT-001")
+        return 2
+
+    payload = load_task_metadata(target)
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict) or not metadata:
+        _print_diagnostics([make_diagnostic("AIWF-META-001", rel(root, target / "task.md"), blocker=True)])
+        return 2
+
+    corrections, diagnostics = _correction_artifact_records(root, target)
+    if diagnostics:
+        _print_diagnostics(diagnostics)
+        return 2
+
+    print(f"Task: {rel(root, target)}")
+    print(f"AIWF tool version: {AIWF_TOOL_VERSION}")
+    print(f"Workflow protocol version: {WORKFLOW_PROTOCOL_VERSION}")
+    print(f"Historical workflow state: {metadata.get('workflow_phase', 'unknown')}")
+    print(f"Historical closure evidence: {'preserved' if _is_already_finalized(metadata) else 'not finalized'}")
+    print(f"Post-finalization correction: {'present' if corrections else 'none'}")
+    print(f"Correction count: {len(corrections)}")
+    if corrections:
+        latest = corrections[-1]
+        print(f"Latest correction: {latest['correction_id']}")
+        print(f"Latest correction type: {latest['correction_type']}")
+        print(f"Latest correction authority: {latest['authority']}")
+        print(f"Current implementation state: {latest['current_effective_state']}")
+        print(f"Latest correction path: {rel(root, latest['path'])}")
+    return 0
 
 
 def _resolve_target_path(root: Path, raw_target: str) -> Path:
@@ -8796,6 +9423,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-knowledge-decision", action="store_true")
     p.set_defaults(func=lambda a, r: backfill(r, a.path, a.date, a.update_existing, a.no_knowledge_decision))
 
+    p = sub.add_parser(
+        "install",
+        help="source-driven fresh install; existing or partial installations are rejected",
+        description=(
+            "Install AIWF from the package containing this command into a fresh target repository. "
+            "This command does not upgrade or repair an existing installation. "
+            "Existing and partial installations are rejected."
+        ),
+    )
+    p.add_argument("--target", required=True, help="target repository directory")
+    p.add_argument("--yes", action="store_true", help="apply the preflight plan; without it, no files are changed")
+    p.set_defaults(func=lambda a, r: install_command(r, a.target, a.yes))
+
     p = sub.add_parser("check", help="check workflow compliance")
     p.add_argument("--path", default=None, help="limit check scope to a specific path")
     p.add_argument("--strict", action="store_true", help="return non-zero on warnings")
@@ -8849,6 +9489,27 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="show deterministic diagnostics for a task path")
     p.add_argument("--path", required=True, help="task-specific path")
     p.set_defaults(func=lambda a, r: doctor_command(r, a.path))
+
+    p = sub.add_parser("correct-finalized", help="create an additive human-authorized correction for a finalized task")
+    p.add_argument("--path", required=True, help="finalized task-specific path")
+    p.add_argument("--type", dest="correction_type", required=True, help="correction type")
+    p.add_argument("--authority", required=True, help="explicit human_* authority")
+    p.add_argument("--current-state", required=True, help="current effective state, as single-line text")
+    p.add_argument("--reason", required=True, help="human-authorized correction reason, as single-line text")
+    p.set_defaults(
+        func=lambda a, r: correct_finalized_command(
+            r,
+            a.path,
+            correction_type=a.correction_type,
+            authority=a.authority,
+            current_state=a.current_state,
+            reason=a.reason,
+        )
+    )
+
+    p = sub.add_parser("inspect", help="show historical closure and current-state projection for a task")
+    p.add_argument("--path", required=True, help="task-specific path")
+    p.set_defaults(func=lambda a, r: inspect_command(r, a.path))
 
     p = sub.add_parser("finalize", help="finalize a task after deterministic checks pass")
     p.add_argument("--path", required=True, help="task-specific path")
@@ -9065,7 +9726,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    root = Path(args.repo_root).resolve() if args.repo_root else find_repo_root(Path.cwd())
+    if args.command == "install" and not args.repo_root:
+        target_root = Path(args.target).expanduser()
+        root = (target_root if target_root.is_absolute() else Path.cwd() / target_root).resolve()
+    else:
+        root = Path(args.repo_root).resolve() if args.repo_root else find_repo_root(Path.cwd())
     if not root.exists():
         raise SystemExit(f"ERROR: repo root does not exist: {root}")
     try:

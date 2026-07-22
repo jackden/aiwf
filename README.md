@@ -1,520 +1,164 @@
 # AIWF
 
-**Repository-native workflow governance for AI-assisted engineering**
+Repository-native, lightweight deterministic workflow governance for AI-assisted engineering.
 
-AIWF is a lightweight, repository-native workflow governance layer for AI-assisted engineering work.
-It helps engineering teams determine when AI-assisted work is actually ready to be considered complete.
+## Why AIWF
 
-AIWF records task metadata, validation, review, evidence, and finalize decisions inside the repository.
-It makes completion claims reviewable, traceable, and reproducible without acting as a workflow engine or replacing human review.
+AI-generated work can be useful before it is complete. A claim may be narrowed
+by review, corrected, re-validated, or left bounded by an external dependency.
+AIWF keeps those workflow decisions and their evidence visible in the
+repository.
 
-<p align="center">
-  <img src=".aiwf/docs/images/aiwf_overview.svg" width="760" alt="AIWF overview">
-</p>
+Git records how code changed. AIWF records the workflow evidence used to
+validate, review, correct, and close the work.
 
-## Why AIWF?
+## Install
 
-AI can generate code, documentation, tests, and fixes.
-Engineering teams still need evidence before they can confidently say that work is complete.
-AIWF records workflow evidence inside the repository, making completion claims reviewable, traceable, and reproducible.
+Use a trusted local AIWF source package: a directory containing the executable
+`aiwf` entrypoint and the committed `.aiwf/` package paths. Run the command from
+the repository that should receive AIWF:
 
-## What AIWF Is
+```bash
+/path/to/aiwf-package/aiwf install --target . --yes
+```
 
-| AIWF provides | AIWF is NOT |
-|---------------|-------------|
-| Workflow evidence governance | Workflow engine |
-| Repository-native workflow records | Project management tool |
-| Completion readiness checks | CI system |
-| Deterministic workflow metadata | Coding agent |
-| Evidence-driven finalize gate | Test runner |
+`--target` is the destination repository. Without `--yes`, AIWF performs the
+same preflight and prints the plan without changing files. A complete or
+partial installation is rejected; use the [Upgrade Guide](.aiwf/docs/upgrading.md)
+for an existing AIWF repository.
 
-AIWF does not guarantee correctness, decide whether product requirements are complete, or replace human review.
-
-## Quick Start
-
-Create a workflow task:
+After installation, the first command is:
 
 ```bash
 ./aiwf new-task demo_task
 ```
 
-Run readiness checks:
+## Five-minute Quick Start
+
+Create a task, implement the requested change, then record validation and
+review evidence in the generated artifacts:
 
 ```bash
-./aiwf check --path <task_dir>
-./aiwf check --path <task_dir> --finalize-ready
-./aiwf doctor --path <task_dir>
+./aiwf new-task demo_task
+./aiwf check --path <task-path>
+./aiwf check --path <task-path> --finalize-ready
+./aiwf finalize --path <task-path>
 ```
 
-Finalize when evidence is ready:
+Replace `<task-path>` with the path printed by `new-task`. The finalize-ready
+check is read-only. Finalize closes the current workflow only after the
+required evidence and review decisions are complete.
 
-```bash
-./aiwf finalize --path <task_dir>
+## How AIWF Works
+
+<p align="center">
+  <img src=".aiwf/docs/images/aiwf_overview.svg" width="760" alt="AIWF workflow overview">
+</p>
+
+AIWF provides task creation, deterministic checks, validation and review
+evidence, correction tracking, and a completion gate. It does not execute the
+engineering work or infer conclusions with an LLM.
+
+## What AIWF Makes Visible
+
+An ordinary engineering change can be represented as:
+
+```text
+Initial claim
+    → Review finding
+    → Correction
+    → Re-validation
+    → Evidence-backed Closure
 ```
 
-Use the task directory printed by `./aiwf new-task`.
-If actual CLI syntax differs in your installed version, follow runtime help from `./aiwf --help`.
+The final Closure Summary is a short, human-authored conclusion aid:
 
-## Versioning
+```markdown
+## Closure Summary
+- Workflow Decision: finalize
+- Engineering Outcome: bounded_incomplete
+- Remaining Limitations: Real-DUT validation was not executed in this task.
+- Follow-up: Real-DUT validation is tracked in task 052.
+```
 
-AIWF uses two independent version identifiers.
+Workflow Decision and Engineering Outcome are different. `finalize` means the
+current workflow has an explicit closure; it does not guarantee product
+correctness. Closure Summary is not currently a finalize blocker.
 
-| Identifier | Represents |
-|------------|------------|
-| **AIWF Tool Version** | Runtime implementation, CLI behavior, packaging, bug fixes, security hardening, and internal architecture improvements |
-| **Workflow Protocol Version** | Workflow semantics, workflow evidence model, state transitions, event semantics, completion boundary, and protocol compatibility |
+## What AIWF Is
 
-Security fixes and implementation improvements normally update only the **AIWF Tool Version**.
-The **Workflow Protocol Version** changes only when workflow semantics evolve.
+- A repository-native deterministic workflow governance layer.
+- A place for local task, validation, review, and finalize evidence.
+- A lightweight companion to AI-assisted engineering workflows.
+- A tool that keeps workflow history inspectable without becoming the execution engine.
 
-Current metadata version boundary:
+## What AIWF Is Not
+
+- Not a prompt template or autonomous coding framework.
+- Not a CI system or a replacement for Git.
+- Not a DUT runner or domain validation system.
+- Not a workflow orchestration engine.
+- Not a tamper-proof audit ledger.
+- Not a guarantee of correctness or reliability.
+- Not a replacement for Human Review or accountable engineering judgment.
+
+## Design Principles
+
+### Evidence over claims
+
+Completion claims should be supported by explicit workflow evidence.
+
+### History is preserved
+
+Workflow history should be extended rather than silently rewritten.
+
+### Human authority remains explicit
+
+AI assists engineering work but does not replace accountable human judgment.
+
+### Deterministic before intelligent
+
+Prefer deterministic governance rules before introducing model-dependent
+reasoning.
+
+## Project Status and Current Release
+
+AIWF is under active development and is being evaluated through real engineering
+workflow records. Use tagged public releases for adoption. Tool and protocol
+versions evolve independently.
 
 | Field | Value |
-|-------|-------|
-| Release version | `1.7.12` |
-| AIWF Tool Version | `1.7.12` |
+| --- | --- |
+| Current Release | `1.7.13` |
+| Tool Version | `1.7.13` |
 | Workflow Protocol Version | `1.7.8` |
+| Latest Release Notes | [v1.7.13](.aiwf/docs/releases/v1.7.13.md) |
+| GitHub Releases | [jackden/aiwf releases](https://github.com/jackden/aiwf/releases) |
 
 ## Documentation
 
-### Core Boundaries
+- [Installation Guide](.aiwf/docs/adoption_guide.md)
+- [Upgrade Guide](.aiwf/docs/upgrading.md)
+- [CLI Reference](.aiwf/docs/cli_reference.md)
+- [Workflow Protocol](.aiwf/docs/workflow_protocol.md)
+- [Agent Rules](.aiwf/docs/agent_rules/00_index.md)
+- [Reporting Guide](.aiwf/docs/reporting.md)
+- [Security / Repository Boundary](.aiwf/docs/repo_boundary.md)
+- [Release Notes](.aiwf/docs/releases/)
 
-- AIWF core scope and domain boundary: [.aiwf/docs/repo_boundary.md](.aiwf/docs/repo_boundary.md)
-- Canonical protocol semantics: [.aiwf/docs/workflow_protocol.md](.aiwf/docs/workflow_protocol.md)
-- AI agent governance entrypoint: [.aiwf/docs/agent_rules/00_index.md](.aiwf/docs/agent_rules/00_index.md)
+Post-finalization changes have two distinct paths: accidental artifact changes
+use a dedicated repair workflow; a new fact or human-authorized correction is
+recorded additively with `correct-finalized` and does not rewrite history. See
+the [Workflow Protocol](.aiwf/docs/workflow_protocol.md) for the boundary.
 
-### Governance Docs
+## Contributing
 
-- Agent managed block integration: [.aiwf/docs/agent_integration.md](.aiwf/docs/agent_integration.md)
-- Metadata attribution and profile rules: [.aiwf/docs/metadata.md](.aiwf/docs/metadata.md)
-- Repository source packaging guideline: [.aiwf/docs/packaging.md](.aiwf/docs/packaging.md)
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-### Release Notes
+## Security
 
-- v1.7.0 release baseline: [.aiwf/docs/releases/v1.7.0.md](.aiwf/docs/releases/v1.7.0.md)
-- v1.7.1 patch hardening: [.aiwf/docs/releases/v1.7.1.md](.aiwf/docs/releases/v1.7.1.md)
-- v1.7.2 patch hardening: [.aiwf/docs/releases/v1.7.2.md](.aiwf/docs/releases/v1.7.2.md)
-- v1.7.3 adoption foundation consolidation: [.aiwf/docs/releases/v1.7.3.md](.aiwf/docs/releases/v1.7.3.md)
-- v1.7.4 release consistency and metadata artifact hygiene: [.aiwf/docs/releases/v1.7.4.md](.aiwf/docs/releases/v1.7.4.md)
-- v1.7.5 deterministic task metadata hardening: [.aiwf/docs/releases/v1.7.5.md](.aiwf/docs/releases/v1.7.5.md)
-- v1.7.5.post2 metadata attribution hardening: [.aiwf/docs/releases/v1.7.5.post2.md](.aiwf/docs/releases/v1.7.5.post2.md)
-- v1.7.5.post3 metadata visibility and profile runtime option hardening: [.aiwf/docs/releases/v1.7.5.post3.md](.aiwf/docs/releases/v1.7.5.post3.md)
-- v1.7.5.post4 metadata init inline allowed-values help: [.aiwf/docs/releases/v1.7.5.post4.md](.aiwf/docs/releases/v1.7.5.post4.md)
-- v1.7.5.post5 metadata show compact source rendering: [.aiwf/docs/releases/v1.7.5.post5.md](.aiwf/docs/releases/v1.7.5.post5.md)
-- v1.7.7 AIWF Upgrade Mechanism v1: [.aiwf/docs/releases/v1.7.7.md](.aiwf/docs/releases/v1.7.7.md)
-- v1.7.8 shared date validation hardening: [.aiwf/docs/releases/v1.7.8.md](.aiwf/docs/releases/v1.7.8.md)
-- v1.7.8.post1 public release baseline: [.aiwf/docs/releases/v1.7.8.post1.md](.aiwf/docs/releases/v1.7.8.post1.md)
-- v1.7.9 Package Records evidence portability: [.aiwf/docs/releases/v1.7.9.md](.aiwf/docs/releases/v1.7.9.md)
-- v1.7.10 filesystem trust-boundary security hardening: [.aiwf/docs/releases/v1.7.10.md](.aiwf/docs/releases/v1.7.10.md)
-- v1.7.10.post2 upgrade runtime dependency and template copy-scope fix: [.aiwf/docs/releases/v1.7.10.post2.md](.aiwf/docs/releases/v1.7.10.post2.md)
-- v1.7.11 fail-closed task creation identity safety: [.aiwf/docs/releases/v1.7.11.md](.aiwf/docs/releases/v1.7.11.md)
-- v1.7.12 agents path repository-boundary hardening: [.aiwf/docs/releases/v1.7.12.md](.aiwf/docs/releases/v1.7.12.md)
-- Package Records release preparation: [.aiwf/docs/releases/package_records_release_preparation.md](.aiwf/docs/releases/package_records_release_preparation.md)
-
-## Install AIWF in a New Repository
-
-Audience: a clean repository that does not yet have the AIWF runtime, docs, templates, or managed AGENTS block.
-
-Minimal flow:
-```bash
-mkdir -p .aiwf/bin .aiwf/docs .aiwf/templates
-cp /path/to/new_aiwf_repo/aiwf ./aiwf
-chmod +x ./aiwf
-cp -R /path/to/new_aiwf_repo/.aiwf/bin ./.aiwf/
-cp -R /path/to/new_aiwf_repo/.aiwf/docs ./.aiwf/
-cp -R /path/to/new_aiwf_repo/.aiwf/templates ./.aiwf/
-cp /path/to/new_aiwf_repo/.aiwf/config.yaml ./.aiwf/config.yaml
-./aiwf agents install --path AGENTS.md --yes
-```
-
-Expected result:
-- `./aiwf` resolves the canonical `.aiwf/bin/ai_workflow.py` runtime.
-- `.aiwf/docs/` and `.aiwf/templates/` come from the same source package.
-- root `AGENTS.md` has a managed block.
-- task records are created under `.aiwf/records/ai_YYYYMMDD/`.
-- project-level `docs/`, `tools/`, and `scripts/` remain project-owned and are not required by AIWF.
-- AIWF install does not create, overwrite, or assume ownership of files under root `scripts/` unless explicitly requested for a project-specific integration.
-
-Validation:
-```bash
-./aiwf --help
-./aiwf upgrade --check --source /path/to/new_aiwf_repo
-./aiwf agents check --path AGENTS.md
-./aiwf new-task aiwf_install_smoke
-./aiwf doctor --path <generated_task_path>
-```
-
-For a first install, `upgrade --check` is only a non-mutating package/layout consistency check.
-Run `doctor` only after creating the first task and substituting its actual generated path.
-
-Detailed guide: [.aiwf/docs/adoption_guide.md](.aiwf/docs/adoption_guide.md)
-
-## Upgrade AIWF in an Existing Repository
-
-Audience: a repository that already has AIWF files and needs a newer source package.
-
-Minimal flow:
-```bash
-cp /path/to/new_aiwf_repo/aiwf ./aiwf
-chmod +x ./aiwf
-./aiwf upgrade --check --source /path/to/new_aiwf_repo
-./aiwf upgrade --dry-run --source /path/to/new_aiwf_repo
-./aiwf upgrade --apply --source /path/to/new_aiwf_repo
-```
-
-Expected result:
-- `./aiwf`, `.aiwf/bin/**`, `.aiwf/docs/**`, and `.aiwf/templates/**` come from the new source package.
-- `.aiwf/records/`, `.aiwf/events/`, `.aiwf/migrations/`, and `.aiwf/config.yaml` are preserved.
-- project-level `docs/`, `tools/`, and `scripts/` remain project-owned.
-- existing project-owned files under root `scripts/` remain unchanged.
-- legacy AIWF root `docs/` migration is disabled by default and runs only with explicit opt-in after reviewing ownership.
-
-Validation:
-```bash
-./aiwf --help
-./aiwf upgrade --check --source /path/to/new_aiwf_repo
-./aiwf upgrade --dry-run --source /path/to/new_aiwf_repo
-./aiwf agents check --path AGENTS.md
-./aiwf check --path .aiwf/records/ai_YYYYMMDD/NNN_task_name --finalize-ready
-```
-
-Detailed guide: [.aiwf/docs/upgrading.md](.aiwf/docs/upgrading.md)
-
-## Install vs Upgrade
-
-| Repository state | Recommended path |
-|---|---|
-| No `aiwf` wrapper and no `.aiwf/` tree | First install |
-| Root `aiwf` exists and `.aiwf/` exists | Upgrade |
-| Legacy `docs/ai_*` layout exists | Upgrade / migration path |
-| Partial or inconsistent layout | Run `./aiwf upgrade --check --source <source_repo>` and review blockers before `--apply` |
-
-Command identity:
-- `./aiwf` is the recommended user-facing and agent-facing repository-local command entrypoint.
-- `.aiwf/bin/ai_workflow.py` is the canonical runtime implementation.
-- AIWF owns only the root `./aiwf` entrypoint and the `.aiwf/` namespace.
-- project-level `tools/ai_workflow.py`, when present in older repositories, is a project-owned legacy file. AIWF preserves it unchanged and does not use it as the supported public entrypoint.
-- After confirming no external caller depends on a legacy `tools/ai_workflow.py`, users may remove it manually.
-- `./aiwf` interpreter resolution order is:
-  1. `AIWF_PYTHON`
-  2. repo-local `.venv/bin/python`
-  3. repo-local `.venv/Scripts/python`
-  4. repo-local `.venv/Scripts/python.exe`
-  5. `python` from `PATH`
-  6. `python3` from `PATH` (validated as Python >= 3.10)
-- Windows Store alias paths under `Microsoft/WindowsApps` are treated as non-runnable candidates and are skipped during fallback selection.
-
-Records root layout:
-- Canonical records root is `.aiwf/records`.
-- Canonical AIWF docs root is `.aiwf/docs`.
-- `.aiwf/config.yaml` declares the committed layout version:
-  ```yaml
-  aiwf_layout_version: 2
-  docs_root: ".aiwf/docs"
-  record_root: ".aiwf/records"
-  event_log: ".aiwf/events/events.jsonl"
-  legacy_enabled: true
-  ```
-- With this config, new task records are created under `.aiwf/records/ai_YYYYMMDD/`.
-- Legacy `layout.records_root` is still accepted for compatibility in older repos.
-
-Dataset export boundary:
-- `./aiwf dataset export --output <path>` accepts a repository-local relative or absolute output path outside the active configured records root.
-- `.aiwf/records/` and any configured records root are reserved for workflow evidence; use project-owned paths such as `artifacts/dataset.json`, `reports/aiwf/dataset.json`, or an experiment output directory.
-- Resolved nested paths and symlinks into the records root are rejected with return code `2`; absolute paths outside the repository remain rejected.
-
-Run a full lifecycle example:
-- [.aiwf/docs/examples/basic_lifecycle.md](.aiwf/docs/examples/basic_lifecycle.md)
-
-AGENTS root entrypoint helpers:
-```bash
-./aiwf agents print-block
-./aiwf agents check --path AGENTS.md
-./aiwf agents install --path AGENTS.md --yes
-```
-
-Root `AGENTS.md` is a thin managed bootstrap entrypoint. The managed block source of truth is [`.aiwf/templates/AGENTS.block.md`](.aiwf/templates/AGENTS.block.md). The canonical rules live under `.aiwf/docs/agent_rules/`, starting with [`.aiwf/docs/agent_rules/00_root_entrypoint.md`](.aiwf/docs/agent_rules/00_root_entrypoint.md).
-
-### Version Metadata Policy (v1.7.12)
-For this release, release identity and tool provenance advance to `1.7.12` while workflow protocol semantics remain at `1.7.8`.
-
-Current metadata version boundary:
-- release version: `1.7.12`
-- tool version: `1.7.12`
-- workflow protocol version: `1.7.8`
-
-The upgrade mechanism is additive and does not imply a package manager, a database migration framework, or silent overwrites of workflow evidence.
+See [SECURITY.md](SECURITY.md).
 
 ## License
 
-AIWF is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
-
-## AIWF Metadata
-`./aiwf metadata show` displays effective AI agent attribution metadata.
-Effective metadata is resolved in this order:
-
-```text
-default -> active profile -> .aiwf/metadata.local.env -> shell env
-```
-
-`./aiwf metadata profile use <name>` changes `.aiwf/metadata.current`, but `.aiwf/metadata.local.env` or shell `AIWF_*` metadata variables may still override the active profile.
-
-Use:
-
-```bash
-./aiwf metadata profile show
-./aiwf metadata show
-./aiwf metadata status
-```
-
-to inspect stored profile values, effective values, and metadata resolution behavior.
-
-When all effective metadata fields resolve from the same source, `./aiwf metadata show` prints one shared `Source:` line. Mixed-source metadata continues to show per-field `from:` lines.
-
-During `./aiwf metadata init`, enter `?` to show allowed values for the current field, or `:all` to print the full metadata allowed-values reference without leaving the prompt flow.
-
-## AIWF v1.7.0 Release Semantics
-- `finalize` is the closure point.
-- Once finalized, new evidence records are rejected (for example `AIWF-FINALIZED-002`).
-- If work is needed after finalize, create a follow-up task.
-- `check --finalize-ready` is the recommended pre-finalize gate.
-- v1.7.0 adds task-level pre-edit governance via `guard --pre-edit --path <task_dir>`.
-- v1.7.0 remains evidence-driven for finalize semantics. Strict phase-gated finalize is still deferred.
-
-### Agent Review Artifact Naming
-New AIWF task records use `review_agent.md` as the canonical AI/agent review
-artifact. Existing records that contain only `review_codex.md` remain supported
-through a legacy alias and should not be bulk-renamed.
-
-### Finalized Artifact Drift Governance (v1.7.x Clarification)
-- AIWF does not guarantee physical immutability of finalized artifacts.
-- AIWF governance guarantee is deterministic drift handling:
-  - detect drift
-  - diagnose scope/cause
-  - repair via follow-up workflow task
-  - preserve repair evidence
-- Silent rewrite of finalized evidence is not allowed.
-- If finalized artifact drift is found, use a dedicated repair task that records:
-  - affected original task path/files
-  - drift diagnosis
-  - repair actions
-  - post-repair consistency checks
-
-### Guard Is Not Finalize
-`guard --pre-edit` is a pre-edit governance guard. It does not replace:
-- `check --finalize-ready`
-- validation evidence
-- review
-- `finalize`
-
-`finalize` remains the closure authority.
-
-### Task Naming Reviewability Note
-For future task naming, avoid duplicated numeric prefixes where possible.
-
-- Prefer: `005_aiwf_v1_7_0_post_merge_baseline_review`
-- Avoid: `001_005_aiwf_v1_7_0_post_merge_baseline_review`
-
-Existing finalized task paths should not be renamed only for cosmetic cleanup.
-
-## Diagnostics and Reporting
-- Diagnostic code catalog: [.aiwf/docs/diagnostics.md](.aiwf/docs/diagnostics.md)
-- Report usage and caveats: [.aiwf/docs/reporting.md](.aiwf/docs/reporting.md)
-
-Report commands:
-```bash
-./aiwf report --path .aiwf/records --format json
-./aiwf report --path .aiwf/records --format markdown
-```
-
-## New in v1.7.12
-
-AIWF v1.7.12 contains the agents repository-boundary hardening, F-02
-relocate/upgrade conflict evidence correction, and F-03 task-ID/creation
-side-effect hardening.
-
-- `agents check --path` and `agents install --path` reject absolute outside paths, `..` traversal, and symlinks that resolve outside the repository.
-- Rejected paths return `2` with `AIWF-AGENTS-PATH-001` and do not write files; valid repository-local nested paths remain supported.
-- `relocate --apply --legacy-docs` and `upgrade --apply --migrate-legacy-docs` perform a complete conflict preflight before mutation.
-- Relocation conflicts return `2` with `AIWF-RELOCATE-CONFLICT-001`; no file mutation or success report/evidence is produced.
-- `--check` and `--dry-run` expose the blocker without changing files; no-conflict and already-relocated paths remain supported.
-- `next-id` is read-only: a missing date returns `001` without creating a date directory, index, event, or report; non-directory date paths fail closed with `AIWF-TASK-ID-001`.
-- `new-task` validates deterministic metadata before ID/directory allocation, so invalid tags, references, related files, priority/risk values, duplicate names, and `--update-existing` leave no orphan date directory or partial artifacts.
-- `backfill` records deterministic source provenance in `backfill_source.json`; repeated matching runs are idempotent no-ops and do not create duplicate tasks or index entries.
-- `backfill --update-existing` only creates missing artifacts for matching provenance and never overwrites historical task, validation, review, index, event, or finalized evidence. Identity conflicts and ambiguous candidates fail closed.
-- `finalize --dry-run` and `check --finalize-ready` are repository read-only operations: they print projected/readiness results without changing task artifacts, metadata, indexes, reports, or event logs. Readiness output is not closure evidence.
-- Read-only paths bypass the event writer even when internal `AIWF_EVENT_LOG=1` is enabled; the current CLI has no explicit event-logging option. Normal finalize event emission remains after successful mutation.
-- The workflow protocol remains `1.7.8`; no event schema, phase, or finalize semantic change is introduced.
-
-## New in v1.7.11
-
-AIWF v1.7.11 makes task creation fail closed around task identity.
-
-- `new-task --update-existing` is rejected without writing files.
-- Same-date duplicate normalized task names are rejected before ID allocation.
-- `check`, `doctor`, and `finalize` report existing duplicates as blockers.
-
-The workflow protocol remains `1.7.8`; no event schema, finalize semantic,
-phase state machine, or historical-record migration is introduced.
-
-## New in v1.7.10.post2
-
-AIWF v1.7.10.post2 fixes public package upgrade reliability for multi-file
-runtime installs.
-
-This patch ensures `upgrade --apply` installs:
-
-- `aiwf`
-- `.aiwf/bin/**`
-- `.aiwf/docs/**`
-- `.aiwf/templates/**`
-
-`upgrade --check` now validates source package completeness and detects
-same-version target repositories that are missing runtime dependencies or the
-managed AGENTS template. No workflow protocol semantic change, event schema
-change, finalize gate change, phase state machine change, or records migration
-is introduced.
-
-## New in v1.7.10
-
-AIWF v1.7.10 is a runtime security hardening release for filesystem
-trust-boundary handling.
-
-This release hardens:
-
-- public export symlink traversal under allowlisted roots
-- review bundle symlinked task content
-- upgrade source-package symlinked members
-- review bundle output destinations under protected workflow evidence paths
-- review bundle overwrite behavior, which now requires explicit `--force`
-
-Normal public export, review bundle, and upgrade command syntax remains
-unchanged. No workflow protocol semantic change, event schema change, or phase
-state machine change is introduced.
-
-## New in v1.7.9
-
-AIWF v1.7.9 adds Package Records as an optional workflow evidence portability
-capability:
-
-```bash
-./aiwf package records --output records.zip
-```
-
-The package includes a manifest, inventories, copied workflow records, event
-evidence, optional dataset output, redaction metadata, and integrity metadata.
-It is intended for workflow evidence analysis and engineering handoff, not as a
-repository backup or source archive.
-
-This release also introduces `review_agent.md` as the canonical agent review
-artifact for new tasks while retaining `review_codex.md` as a legacy alias for
-existing records.
-
-No workflow protocol, event schema, or finalize behavior change is introduced.
-
-## Package Records
-
-Package Records creates a deterministic workflow evidence package for analysis,
-review, and engineering handoff:
-
-```bash
-./aiwf package records --output records.zip
-```
-
-Additional examples:
-```bash
-./aiwf package records --output aiwf_records_package.zip
-./aiwf package records --output aiwf-records-package --format directory
-./aiwf package records --dry-run --output package_manifest.json
-```
-
-Package Records is:
-
-- a workflow evidence package
-- an analysis package
-- an engineering handoff package
-
-Package Records is not:
-
-- a repository backup
-- a source archive
-- a tamper-proof audit ledger
-
-The package contains `package_manifest.json`, summary and inventory files,
-copied task records, canonical events, optional dataset output, and integrity
-metadata. The default redaction profile is `safe`; use `--redaction-profile
-internal` or `--redaction-profile none` only when the sharing boundary allows
-it. Secret findings fail closed.
-
-Package records output separates package status from source workflow evidence
-quality. `Package Generation`, `Manifest Schema`, `Package Integrity`, and
-`Privacy/Security` describe whether the package was produced safely. `Workflow
-Evidence Findings` describes findings discovered while inspecting the selected
-source workflow records, and may be `WARNING` or `FAIL` even when package
-generation succeeded.
-
-## AIWF Record Retention Policy
-AIWF task records under `.aiwf/records/ai_YYYYMMDD/` are intended to be committed by default.
-They are workflow evidence and part of the later reporting dataset.
-
-Deterministic user-input and repository-path validation failures return exit
-code `2`. This local contract does not redefine exit behavior for repository
-configuration errors, internal invariant failures, unexpected runtime
-failures, argparse usage errors, or process interruption.
-
-Do not commit:
-- secrets or private credentials
-- private customer data
-- large binary artifacts
-
-Use sanitized summaries and external evidence references when required.
-
-## Record and Knowledge Boundary
-AIWF separates workflow execution evidence from derived knowledge and narrative material:
-
-- `.aiwf/records/ai_YYYYMMDD/*`: workflow execution records, task lifecycle artifacts, validation/review/finalize evidence, and task-local `.aiwf/events.jsonl`.
-- `.aiwf/docs/knowledge/*`: reusable operational engineering knowledge derived from tasks, such as patterns, repeatable bugs, and decisions. These files are not workflow execution records.
-- `knowledge/analysis/*`: cross-task analysis, trend analysis, workflow interpretation, and comparative studies. Analysis is interpretation, not raw workflow evidence.
-- `knowledge/articles/*`: public narrative material, article strategy, README strategy, and external communication drafts. Public narrative material must not be treated as protocol or runtime source of truth.
-
-Source precedence:
-
-```text
-runtime code
-  > protocol/design docs
-  > release notes
-  > workflow execution records
-  > reusable engineering knowledge
-  > derived analysis
-  > public narrative material
-```
-
-Only `.aiwf/records/ai_YYYYMMDD/*` task records and task-local event logs should be used as raw workflow evidence.
-Derived analysis, reusable knowledge, and public narrative material may summarize or interpret workflow evidence, but they must not override runtime behavior, protocol semantics, or recorded workflow evidence.
-
-## Setup and Validation
-Requirements:
-- Python 3.10+ (or the repository-supported version)
-- `pytest` for unit tests
-- no runtime third-party dependency required for basic AIWF CLI behavior
-
-This repository currently uses `requirement.txt` (not `requirements.txt`).
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirement.txt
-python -m pytest -q
-```
-
-## Environment Policy
-Use `.env.example` as the template for local overrides:
-
-```bash
-cp .env.example .env
-```
-
-## Adoption
-For using AIWF in another repository:
-- [.aiwf/docs/adoption_guide.md](.aiwf/docs/adoption_guide.md)
-- [.aiwf/docs/examples/ci/gitlab-aiwf-minimal.yml](.aiwf/docs/examples/ci/gitlab-aiwf-minimal.yml)
+Apache License 2.0. See [LICENSE](LICENSE).

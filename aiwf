@@ -153,6 +153,15 @@ if [ -f "$runtime_path" ]; then
   exec "$python_bin" "$runtime_path" "$@"
 fi
 
+if [ "${1:-}" = "install" ]; then
+  source_root="$(cd "$(dirname "$0")" && pwd)"
+  if [ ! -f "$source_root/.aiwf/bin/ai_workflow.py" ]; then
+    echo "ERROR: source-driven install package is missing .aiwf/bin/ai_workflow.py" >&2
+    exit 2
+  fi
+  exec "$python_bin" "$source_root/.aiwf/bin/ai_workflow.py" "$@"
+fi
+
 if bootstrap_help_requested "${1:-}"; then
   bootstrap_help
   exit 0

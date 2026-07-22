@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import importlib.util
 import json
@@ -134,6 +135,284 @@ def _copy_supported_install_set(source_root: Path, target_root: Path) -> None:
             dirs_exist_ok=True,
         )
     shutil.copy2(source_root / ".aiwf" / "config.yaml", target_root / ".aiwf" / "config.yaml")
+
+
+def _set_install_source(monkeypatch, source_root: Path) -> None:
+    monkeypatch.setattr(ai_workflow, "AIWF_BIN_DIR", source_root / ".aiwf" / "bin")
+
+
+def test_new_task_review_final_contains_closure_summary_without_new_gate(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    review_text = (task_dir / "review_final.md").read_text(encoding="utf-8")
+
+    assert "## Closure Summary" in review_text
+    assert review_text.index("Workflow Decision") < review_text.index("Engineering Outcome")
+    assert review_text.index("Engineering Outcome") < review_text.index("Remaining Limitations")
+    assert review_text.index("Remaining Limitations") < review_text.index("Follow-up")
+    assert ai_workflow.check_path(root, str(task_dir), strict=False) == 0
+
+
+def test_install_dry_run_has_zero_side_effects(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    before = _snapshot_tree(target)
+
+    rc = ai_workflow.main(["install", "--target", str(target)])
+    output = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Fresh install preflight passed." in output
+    assert "No files were changed." in output
+    assert "AIWF installed successfully." not in output
+    assert _snapshot_tree(target) == before
+
+
+def test_install_writes_package_and_agents_block(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+
+    rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
+    output = capsys.readouterr().out
+
+    assert rc == 0
+    assert "AIWF installed successfully." in output
+    assert (target / "aiwf").is_file()
+    assert (target / ".aiwf" / "bin" / "ai_workflow.py").is_file()
+    assert (target / ".aiwf" / "config.yaml").is_file()
+    assert (target / ".aiwf" / "records").is_dir()
+    assert (target / ".aiwf" / "events").is_dir()
+    assert (target / ".aiwf" / "migrations").is_dir()
+    assert ai_workflow.agents_check_command(target, "AGENTS.md") == 0
+    help_result = subprocess.run([str(target / "aiwf"), "--help"], cwd=target, text=True, capture_output=True, check=False)
+    assert help_result.returncode == 0
+    assert "install" in help_result.stdout
+
+
+def test_source_wrapper_installs_from_external_working_directory(tmp_path: Path):
+    target = tmp_path / "target"
+    target.mkdir()
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+
+    result = subprocess.run(
+        [str(REPO_ROOT / "aiwf"), "install", "--target", str(target), "--yes"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "AIWF installed successfully." in result.stdout
+    smoke = subprocess.run(
+        [str(target / "aiwf"), "new-task", "install_smoke"],
+        cwd=target,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert smoke.returncode == 0, smoke.stderr
+    task_path = target / ".aiwf" / "records" / f"ai_{dt.date.today():%Y%m%d}"
+    assert any(path.name.endswith("_install_smoke") for path in task_path.iterdir())
+
+
+def test_install_rejects_complete_installation_and_recommends_upgrade(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    assert ai_workflow.main(["install", "--target", str(target), "--yes"]) == 0
+    capsys.readouterr()
+
+    rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
+    output = capsys.readouterr().out
+
+    assert rc == 2
+    assert "AIWF is already installed" in output
+    assert "./aiwf upgrade instead" in output
+
+
+@pytest.mark.parametrize("marker", ["aiwf", ".aiwf"])
+def test_install_rejects_partial_installation(tmp_path: Path, capsys, marker: str):
+    target = tmp_path / "target"
+    target.mkdir()
+    path = target / marker
+    if marker == "aiwf":
+        path.write_text("partial\n", encoding="utf-8")
+    else:
+        path.mkdir()
+        (path / "config.yaml").write_text("partial\n", encoding="utf-8")
+    before = _snapshot_tree(target)
+
+    rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
+    output = capsys.readouterr().out
+
+    assert rc == 2
+    assert "partial AIWF installation" in output
+    assert _snapshot_tree(target) == before
+
+
+def test_install_preserves_existing_agents_content(tmp_path: Path):
+    target = tmp_path / "target"
+    target.mkdir()
+    agents = target / "AGENTS.md"
+    agents.write_text("# Project instructions\n\nKeep this text.\n", encoding="utf-8")
+
+    assert ai_workflow.main(["install", "--target", str(target), "--yes"]) == 0
+    installed = agents.read_text(encoding="utf-8")
+    assert "# Project instructions" in installed
+    assert "Keep this text." in installed
+    assert "<!-- AIWF:BEGIN -->" in installed
+
+
+def test_install_rejects_orphan_agents_block_without_writing(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    agents = target / "AGENTS.md"
+    agents.write_text("# Project\n\n<!-- AIWF:BEGIN -->\n", encoding="utf-8")
+    before = _snapshot_tree(target)
+
+    rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
+    output = capsys.readouterr().out
+
+    assert rc == 2
+    assert "incomplete AGENTS.md managed block" in output
+    assert _snapshot_tree(target) == before
+
+
+def test_install_source_validation_rejects_missing_required_file(tmp_path: Path, monkeypatch, capsys):
+    source = tmp_path / "source"
+    _seed_minimal_upgrade_source(source)
+    target = tmp_path / "target"
+    target.mkdir()
+    _set_install_source(monkeypatch, source)
+
+    rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
+    output = capsys.readouterr().out
+
+    assert rc == 2
+    assert "missing required source package path: .aiwf/config.yaml" in output
+    assert not (target / "aiwf").exists()
+
+
+def test_install_rejects_unwritable_target(tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    target.chmod(0o555)
+    try:
+        rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
+        output = capsys.readouterr().out
+    finally:
+        target.chmod(0o755)
+
+    assert rc == 2
+    assert "target path is not writable" in output
+
+
+def test_install_rejects_symlink_target_component(tmp_path: Path, capsys):
+    target_real = tmp_path / "real-target"
+    target_real.mkdir()
+    target_link = tmp_path / "target-link"
+    _symlink_or_skip(target_link, target_real, target_is_directory=True)
+
+    rc = ai_workflow.main(["install", "--target", str(target_link), "--yes"])
+    output = capsys.readouterr().out
+
+    assert rc == 2
+    assert "symlink component" in output
+    assert _snapshot_tree(target_real) == {}
+
+
+def test_install_rejects_source_target_boundary_conflicts(tmp_path: Path, monkeypatch, capsys):
+    source = tmp_path / "source"
+    _copy_supported_install_set(REPO_ROOT, source)
+    _set_install_source(monkeypatch, source)
+
+    nested_target = source / "nested-target"
+    nested_target.mkdir()
+    rc_nested = ai_workflow.main(["install", "--target", str(nested_target), "--yes"])
+    nested_output = capsys.readouterr().out
+    assert rc_nested == 2
+    assert "inside the source package" in nested_output
+    assert not (nested_target / "aiwf").exists()
+
+    parent_target = tmp_path / "parent-target"
+    parent_target.mkdir()
+    source_inside = parent_target / "source"
+    shutil.copytree(source, source_inside)
+    _set_install_source(monkeypatch, source_inside)
+    rc_parent = ai_workflow.main(["install", "--target", str(parent_target), "--yes"])
+    parent_output = capsys.readouterr().out
+    assert rc_parent == 2
+    assert "source package must not be inside the target path" in parent_output
+    assert set(path.name for path in parent_target.iterdir()) == {"source"}
+
+
+def test_install_copy_failure_rolls_back(monkeypatch, tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    original_copy = ai_workflow.safe_copy_file_no_symlink
+    calls = 0
+
+    def fail_after_first(source: Path, destination: Path, allowed_root: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("forced copy failure")
+        original_copy(source, destination, allowed_root)
+
+    monkeypatch.setattr(ai_workflow, "safe_copy_file_no_symlink", fail_after_first)
+    rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
+    output = capsys.readouterr().out
+
+    assert rc == 2
+    assert "rolled back" in output
+    assert _snapshot_tree(target) == {}
+
+
+def test_install_agents_failure_rolls_back(monkeypatch, tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    original_write_text = Path.write_text
+
+    def fail_agents_write(path: Path, data: str, *args, **kwargs):
+        if path == target / "AGENTS.md":
+            raise OSError("forced AGENTS failure")
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_agents_write)
+    rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
+    output = capsys.readouterr().out
+
+    assert rc == 2
+    assert "rolled back" in output
+    assert _snapshot_tree(target) == {}
+
+
+def test_install_post_validation_failure_rolls_back(monkeypatch, tmp_path: Path, capsys):
+    target = tmp_path / "target"
+    target.mkdir()
+    monkeypatch.setattr(ai_workflow, "_install_post_validation", lambda *_args: ["forced validation failure"])
+
+    rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
+    output = capsys.readouterr().out
+
+    assert rc == 2
+    assert "forced validation failure" in output
+    assert _snapshot_tree(target) == {}
+
+
+def test_install_does_not_copy_records_events_or_private_source_files(tmp_path: Path):
+    target = tmp_path / "target"
+    target.mkdir()
+
+    assert ai_workflow.main(["install", "--target", str(target), "--yes"]) == 0
+    assert not any((target / ".aiwf" / "records").iterdir())
+    assert not any((target / ".aiwf" / "events").iterdir())
+    assert not (target / ".aiwf" / "docs" / "internal").exists()
+    assert not (target / ".aiwf" / "docs" / "knowledge").exists()
+    assert not (target / ".aiwf" / "bin" / "__pycache__").exists()
+    assert not (target / "knowledge").exists()
 
 
 def test_supported_first_install_preserves_project_scripts_and_does_not_create_removed_helper(tmp_path: Path):
@@ -4682,6 +4961,181 @@ def test_list_cli_dispatch_accepts_empty_valid_status_selector_result(tmp_path: 
     assert rc == 0
     assert "task_id |" in out
     assert "Total: 0" in out
+
+
+def test_correct_finalized_is_additive_and_inspect_projects_current_state(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="post_finalize_projection", date="20260509")
+    _prepare_finalize_ready_task(root, task_dir)
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
+    capsys.readouterr()
+
+    preserved_paths = [
+        task_dir / "task.md",
+        task_dir / "task_record.md",
+        task_dir / "self_validation.md",
+        task_dir / "review_agent.md",
+        task_dir / "review_final.md",
+        task_dir.parent / "index.md",
+        task_dir / ".aiwf" / "events.jsonl",
+    ]
+    preserved = _snapshot_text_files(preserved_paths)
+    manifest_before = ai_workflow._artifact_manifest(task_dir)
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "correct-finalized",
+            "--path",
+            str(task_dir),
+            "--type",
+            "implementation_reverted",
+            "--authority",
+            "human_scope_decision",
+            "--current-state",
+            "implementation_not_present",
+            "--reason",
+            "Implementation exceeded the authorized analysis scope and was reverted.",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "AIWF-CORRECTION-OK" in out
+    correction_path = task_dir / "corrections" / "001_implementation_reverted.md"
+    assert correction_path.exists()
+    correction, body = ai_workflow.parse_front_matter(correction_path.read_text(encoding="utf-8"))
+    assert correction["schema_version"] == "aiwf-correction-v1"
+    assert correction["correction_id"] == "001"
+    assert correction["correction_type"] == "implementation_reverted"
+    assert correction["created_by"] == "human"
+    assert correction["authority"] == "human_scope_decision"
+    assert correction["historical_closure_remains_valid"] == "True"
+    assert correction["current_effective_state"] == "implementation_not_present"
+    assert "Current Effective State" in body
+    for path, content in preserved.items():
+        assert path.read_text(encoding="utf-8") == content
+    assert ai_workflow._artifact_manifest(task_dir) == manifest_before
+
+    rc = ai_workflow.main(["--repo-root", str(root), "inspect", "--path", str(task_dir)])
+    inspect_out = capsys.readouterr().out
+    assert rc == 0
+    assert "Historical workflow state: finalized" in inspect_out
+    assert "Historical closure evidence: preserved" in inspect_out
+    assert "Post-finalization correction: present" in inspect_out
+    assert "Latest correction: 001" in inspect_out
+    assert "Current implementation state: implementation_not_present" in inspect_out
+    assert f"AIWF tool version: {ai_workflow.AIWF_TOOL_VERSION}" in inspect_out
+
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
+    capsys.readouterr()
+    assert ai_workflow._artifact_manifest(task_dir) == manifest_before
+    assert ai_workflow.parse_front_matter((task_dir / "task.md").read_text(encoding="utf-8"))[0]["status"] == "done"
+
+
+def test_correct_finalized_validation_is_fail_closed_and_zero_side_effect(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="open_correction_target", date="20260509")
+
+    before = _snapshot_tree(root)
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "correct-finalized",
+            "--path",
+            str(task_dir),
+            "--type",
+            "implementation_reverted",
+            "--authority",
+            "human_scope_decision",
+            "--current-state",
+            "implementation_not_present",
+            "--reason",
+            "not finalized",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-CORRECTION-001" in out
+    assert _snapshot_tree(root) == before
+
+    _prepare_finalize_ready_task(root, task_dir)
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
+    capsys.readouterr()
+    before = _snapshot_tree(root)
+    for field_args, code in [
+        (["--type", "unsupported"], "AIWF-CORRECTION-002"),
+        (["--authority", "agent_proposal"], "AIWF-CORRECTION-003"),
+        (["--reason", ""], "AIWF-CORRECTION-004"),
+    ]:
+        args = [
+            "--repo-root",
+            str(root),
+            "correct-finalized",
+            "--path",
+            str(task_dir),
+            "--type",
+            "implementation_reverted",
+            "--authority",
+            "human_scope_decision",
+            "--current-state",
+            "implementation_not_present",
+            "--reason",
+            "valid reason",
+        ]
+        for index in range(0, len(field_args), 2):
+            flag, value = field_args[index : index + 2]
+            position = args.index(flag)
+            args[position + 1] = value
+        if field_args[0] == "--type":
+            args[args.index("--type") + 1] = field_args[1]
+        if field_args[0] == "--authority":
+            args[args.index("--authority") + 1] = field_args[1]
+        if field_args[0] == "--reason":
+            args[args.index("--reason") + 1] = field_args[1]
+        rc = ai_workflow.main(args)
+        out = capsys.readouterr().out
+        assert rc == 2
+        assert code in out
+        assert _snapshot_tree(root) == before
+
+
+def test_correct_finalized_rejects_malformed_existing_correction_without_rewrite(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="malformed_correction_target", date="20260509")
+    _prepare_finalize_ready_task(root, task_dir)
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
+    capsys.readouterr()
+
+    correction_dir = task_dir / "corrections"
+    correction_dir.mkdir()
+    malformed = correction_dir / "001_bad.md"
+    malformed.write_text("not a correction\n", encoding="utf-8")
+    before = _snapshot_tree(root)
+
+    rc = ai_workflow.main(
+        [
+            "--repo-root",
+            str(root),
+            "correct-finalized",
+            "--path",
+            str(task_dir),
+            "--type",
+            "implementation_reverted",
+            "--authority",
+            "human_scope_decision",
+            "--current-state",
+            "implementation_not_present",
+            "--reason",
+            "valid reason",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-CORRECTION-006" in out
+    assert _snapshot_tree(root) == before
 
 
 def test_schema_version_v12_compatibility(tmp_path: Path):

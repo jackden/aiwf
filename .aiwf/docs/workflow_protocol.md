@@ -2,16 +2,22 @@
 
 This document is the canonical protocol semantics reference for repository-native AI workflow governance.
 
-## Version Identity Policy (v1.7.12)
+## Version Identity Policy (v1.7.13)
 
 For the current lightweight, repository-native AIWF project, release identity and tool provenance normally move together.
-The `v1.7.12` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
+The `v1.7.13` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
 This does not introduce a package manager, database migration framework, or silent overwrite of workflow evidence.
 
 Current version state:
-- release version: `1.7.12`
-- tool version: `1.7.12`
+- release version: `1.7.13`
+- tool version: `1.7.13`
 - workflow protocol version: `1.7.8`
+
+Internal source-only post-release stamp:
+- source stamp: `1.7.12.post1`
+- public/tool release is: `1.7.13`
+- this stamp adds additive post-finalization correction artifacts and a
+  deterministic inspection path without rewriting existing closure evidence.
 
 This release identity is a fail-closed task creation safety correction. It does not imply workflow protocol semantic changes, event schema changes, finalize gate changes, or phase state machine changes.
 
@@ -206,6 +212,29 @@ Closure hardening:
 - AIWF does not provide tamper-proof storage or physical immutability guarantees for finalized artifacts.
 - AIWF guarantees deterministic post-finalize drift handling: detect, diagnose, repair, preserve evidence.
 - follow-up tasks must not silently rewrite finalized evidence.
+
+Post-finalization correction projection (`v1.7.12.post1` internal source
+stamp):
+
+- `correct-finalized --path <task_dir>` creates an additive correction artifact
+  only when the target task is finalized.
+- Correction artifacts live under `<task_dir>/corrections/` and are generated
+  with `schema_version: aiwf-correction-v1`; their numeric IDs are allocated
+  deterministically from existing correction artifacts.
+- The first implementation accepts only explicit `human_*` authority values
+  and records `created_by: human`; agent-proposed or automated corrections are
+  fail-closed rather than treated as authoritative.
+- Supported correction types are `implementation_reverted`,
+  `scope_reclassified`, `conclusion_corrected`, `evidence_superseded`, and
+  `current_state_clarification`.
+- A correction preserves the original task metadata, required artifacts,
+  index, finalize event, and finalize manifest. It is not appended as a
+  post-finalize validation/review/fix event.
+- `inspect --path <task_dir>` is the deterministic current-state projection:
+  it reports historical workflow state, whether closure evidence remains
+  preserved, the latest correction, and the latest current effective state.
+- `finalize` remains idempotent after a correction; corrections do not reopen
+  the task or change its historical closure state.
 
 Post-finalize correction policy (errata workflow):
 

@@ -40,25 +40,22 @@ Do not copy repo-local or generated state from another repository:
 
 ## Canonical First-Install Flow
 
-1. Create the destination directories if they do not already exist.
-2. Copy the AIWF package files into the repository.
-3. Make `./aiwf` executable.
-4. Install or verify the root `AGENTS.md` managed block.
-5. Verify runtime and layout.
-6. Create a first sample task or run a non-mutating validation command.
-
-Example:
+Use the source package's wrapper as the single fresh-install command:
 
 ```bash
-mkdir -p .aiwf/bin .aiwf/docs .aiwf/templates
-cp /path/to/new_aiwf_repo/aiwf ./aiwf
-cp -R /path/to/new_aiwf_repo/.aiwf/bin ./.aiwf/
-cp -R /path/to/new_aiwf_repo/.aiwf/docs ./.aiwf/
-cp -R /path/to/new_aiwf_repo/.aiwf/templates ./.aiwf/
-cp /path/to/new_aiwf_repo/.aiwf/config.yaml ./.aiwf/config.yaml
-chmod +x ./aiwf
-./aiwf agents install --path AGENTS.md --yes
+/path/to/aiwf-package/aiwf install --target .
+/path/to/aiwf-package/aiwf install --target . --yes
 ```
+
+The first command performs all preflight checks and writes nothing. The second
+applies the validated plan, installs the package-owned files, creates empty
+records/events/migrations directories, and installs the managed `AGENTS.md`
+block while preserving user-owned content outside that block.
+
+Install is fail-closed for complete or partial layouts, source/target path
+conflicts, missing source package files, and failed post-install validation. A
+write-time failure is rolled back. Install does not download, migrate, repair,
+or silently become upgrade.
 
 If `AGENTS.md` already exists, `agents install` preserves everything outside the managed block.
 If `AGENTS.md` does not exist, `agents install` creates the file with the managed block in place.
@@ -76,10 +73,10 @@ If the template file is missing, the `agents` commands cannot render or validate
 ## Validation Checklist
 
 - `./aiwf --help` opens the repo-local CLI.
-- `./aiwf upgrade --check --source /path/to/new_aiwf_repo` is a non-mutating package and layout consistency check.
 - `./aiwf agents check --path AGENTS.md` confirms the root managed block.
 - `./aiwf new-task aiwf_install_smoke` creates the first task.
 - `./aiwf doctor --path <generated_task_path>` is a useful task-level sanity check once you have a real task path.
+- `./aiwf install --target .` is a read-only preflight when invoked from a source package.
 - `git status --short` should not show copied generated state that you did not intend to commit.
 
 ## What To Commit
@@ -102,7 +99,7 @@ Existing project-owned files under root `scripts/` should remain unchanged durin
 
 | Symptom | Cause | Recommended correction |
 |---|---|---|
-| `./aiwf` says bootstrap mode only supports upgrade commands | The canonical runtime is missing, so only upgrade is available | Copy the package files listed above, or run `upgrade` from a source repo that already has the runtime |
+| `./aiwf` says bootstrap mode only supports upgrade commands | The canonical runtime is missing and the command is not being run from a source package | Use `/path/to/aiwf-package/aiwf install --target . --yes`, or use `upgrade` for an existing installation |
 | `AIWF-AGENTS-001` or `AGENTS.md file not found` | Root `AGENTS.md` has not been created yet | Run `./aiwf agents install --path AGENTS.md --yes` from the repo root |
 | `AIWF-AGENTS-OUTDATED` | The managed block drifted from `.aiwf/templates/AGENTS.block.md` | Re-run `./aiwf agents install --path AGENTS.md --yes` |
 | `./aiwf upgrade --check` reports missing `aiwf` or `.aiwf/bin/ai_workflow.py` | Only part of the package was copied | Copy the missing package paths from the source tree |
