@@ -27,6 +27,15 @@ same preflight and prints the plan without changing files. A complete or
 partial installation is rejected; use the [Upgrade Guide](.aiwf/docs/upgrading.md)
 for an existing AIWF repository.
 
+### Install Payload Boundary
+
+Public repository contents are not the install payload. Installation is limited
+to the AIWF launcher and runtime-owned `.aiwf/` paths; repository-level
+development assets such as `tests/`, `.github/`, root `docs/`, `knowledge/`,
+release files, and review artifacts are intentionally excluded. Existing
+project-owned `tests/`, `.github/`, and `docs/` directories are preserved
+byte-for-byte.
+
 After installation, the first command is:
 
 ```bash
@@ -129,10 +138,10 @@ versions evolve independently.
 
 | Field | Value |
 | --- | --- |
-| Current Release | `1.7.13` |
-| Tool Version | `1.7.13` |
+| Current Release | `1.7.13.post1` |
+| Tool Version | `1.7.13.post1` |
 | Workflow Protocol Version | `1.7.8` |
-| Latest Release Notes | [v1.7.13](.aiwf/docs/releases/v1.7.13.md) |
+| Latest Release Notes | [v1.7.13.post1](.aiwf/docs/releases/v1.7.13.post1.md) |
 | GitHub Releases | [jackden/aiwf releases](https://github.com/jackden/aiwf/releases) |
 
 ## Documentation

@@ -126,7 +126,7 @@ runtime code
   current effective state; do not infer current state from finalized prose
   alone when a correction artifact is present.
 - The internal source-only stamp for this correction capability is
-  `v1.7.12.post1`; keep public/tool version `1.7.13` and protocol version
+  `v1.7.12.post1`; keep public/tool version `1.7.13.post1` and protocol version
   `1.7.8` unchanged unless a separate release task explicitly changes the
   release boundary.
 

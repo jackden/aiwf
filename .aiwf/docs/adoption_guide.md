@@ -27,6 +27,20 @@ Those paths provide the wrapper, canonical runtime, docs, managed AGENTS templat
 AIWF owns only the root `./aiwf` entrypoint and the `.aiwf/` namespace. Project-level `docs/`, `tools/`, and `scripts/` directories remain project-owned and are not required for a first install.
 The first-install flow must not create, overwrite, or assume ownership of files under root `scripts/` unless the user explicitly requests a project-specific integration.
 
+## Install Boundary
+
+Public repository contents are not the install payload. The fresh installer has
+an explicit allowlist for the launcher, `.aiwf/bin/`, `.aiwf/docs/`,
+`.aiwf/templates/`, and `.aiwf/config.yaml`. Repository-level development
+assets are source-only and are intentionally excluded, including `tests/`,
+`.github/`, root `docs/`, `knowledge/`, release files, CI assets, and review
+artifacts.
+
+If the target already contains `tests/`, `.github/`, or root `docs/`, install
+does not merge, copy, overwrite, rename, or otherwise modify those directories.
+The installer creates only the AIWF-owned namespace and its empty workflow
+state directories.
+
 Do not copy repo-local or generated state from another repository:
 
 - `.aiwf/records/`

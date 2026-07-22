@@ -102,7 +102,7 @@ SCHEMA_V16 = "ai-workflow-v1.6"
 CURRENT_SCHEMA_VERSION = SCHEMA_V16
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16}
 WORKFLOW_PROTOCOL_VERSION = "1.7.8"
-AIWF_TOOL_VERSION = "1.7.13"
+AIWF_TOOL_VERSION = "1.7.13.post1"
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.1"
 AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.2"
 AIWF_EXPERIMENT_SCHEMA_VERSION = "aiwf-experiment-v0.1"
@@ -2109,16 +2109,29 @@ UPGRADE_COPY_SPECS: Mapping[str, tuple[str, str]] = {
     ".aiwf/templates/**": (".aiwf/templates", ".aiwf/templates"),
 }
 
-# Fresh install uses the same package-owned paths as upgrade, plus the layout
-# config.  Generated/private source state is intentionally excluded from the
-# directory copies; records and events are created empty in the target.
+# Fresh install has its own payload boundary.  A public repository is a source
+# tree, not an install payload: repository-level development assets such as
+# tests, .github, root docs, knowledge, release files, and review artifacts are
+# intentionally outside this manifest even when they exist in the source.
+INSTALL_PAYLOAD_MANIFEST: tuple[tuple[str, str], ...] = (
+    ("aiwf", "launcher"),
+    (".aiwf/bin", "runtime"),
+    (".aiwf/docs", "documentation"),
+    (".aiwf/templates", "templates"),
+    (".aiwf/config.yaml", "config"),
+)
+INSTALL_PAYLOAD_ALLOWED_ROOTS: tuple[str, ...] = tuple(
+    source_rel for source_rel, _label in INSTALL_PAYLOAD_MANIFEST
+)
+INSTALL_PROJECT_OWNED_ROOTS: frozenset[str] = frozenset(
+    {"tests", ".github", "docs", "knowledge", "release", "records"}
+)
 INSTALL_REQUIRED_SOURCE_PATHS: tuple[tuple[str, str], ...] = (
     *UPGRADE_REQUIRED_SOURCE_PATHS,
     (".aiwf/config.yaml", "file"),
 )
 INSTALL_COPY_SPECS: Mapping[str, tuple[str, str]] = {
-    **UPGRADE_COPY_SPECS,
-    ".aiwf/config.yaml": (".aiwf/config.yaml", ".aiwf/config.yaml"),
+    source_rel: (source_rel, label) for source_rel, label in INSTALL_PAYLOAD_MANIFEST
 }
 INSTALL_CREATED_DIRS: tuple[str, ...] = (
     ".aiwf/records",
@@ -2135,6 +2148,13 @@ INSTALL_EXCLUDED_PATHS: frozenset[str] = frozenset(
     }
 )
 INSTALL_EXCLUDED_NAMES: frozenset[str] = frozenset({"__pycache__", ".pytest_cache", ".DS_Store"})
+
+
+def _install_payload_path_allowed(rel_path: str) -> bool:
+    return any(
+        rel_path == allowed_root or rel_path.startswith(f"{allowed_root}/")
+        for allowed_root in INSTALL_PAYLOAD_ALLOWED_ROOTS
+    )
 
 
 def _upgrade_source_requirements(source_root: Path) -> list[tuple[str, Path, str]]:
@@ -2484,6 +2504,16 @@ def _install_preflight(root: Path, source_root: Path) -> tuple[list[str], str, l
                 copy_plan.append((source_file, root / rel_path))
         else:
             copy_plan.append((source_path, root / source_rel))
+    for source_path, destination in copy_plan:
+        source_rel = source_path.relative_to(source_root).as_posix()
+        destination_rel = destination.relative_to(root).as_posix()
+        if not _install_payload_path_allowed(source_rel) or not _install_payload_path_allowed(destination_rel):
+            top_level = source_rel.split("/", 1)[0]
+            ownership = "project-owned" if top_level in INSTALL_PROJECT_OWNED_ROOTS else "non-runtime"
+            return [
+                "install payload boundary violation: "
+                f"{source_rel} -> {destination_rel} ({ownership} path is not allowlisted)"
+            ], "", []
     return [], agents_text, copy_plan
 
 
@@ -2635,7 +2665,7 @@ def install_command(root: Path, target: str, yes: bool) -> int:
     print("AIWF installed successfully.")
     print(f"Target:\n  {target_root}")
     print("Installed:\n  aiwf\n  .aiwf/bin\n  .aiwf/docs\n  .aiwf/templates\n  .aiwf/config.yaml\n  AGENTS.md managed block")
-    print("Validation:\n  runtime: PASS\n  package layout: PASS\n  agent instructions: PASS")
+    print("Validation:\n  install payload boundary: PASS\n  runtime: PASS\n  package layout: PASS\n  agent instructions: PASS")
     print("Next:\n  ./aiwf new-task <task-name>")
     return 0
 

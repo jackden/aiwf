@@ -183,6 +183,11 @@ def test_install_writes_package_and_agents_block(tmp_path: Path, capsys):
     assert (target / ".aiwf" / "records").is_dir()
     assert (target / ".aiwf" / "events").is_dir()
     assert (target / ".aiwf" / "migrations").is_dir()
+    assert not (target / "tests").exists()
+    assert not (target / ".github").exists()
+    assert not (target / "docs").exists()
+    assert not (target / "knowledge").exists()
+    assert not (target / "release").exists()
     assert ai_workflow.agents_check_command(target, "AGENTS.md") == 0
     help_result = subprocess.run([str(target / "aiwf"), "--help"], cwd=target, text=True, capture_output=True, check=False)
     assert help_result.returncode == 0
@@ -413,6 +418,83 @@ def test_install_does_not_copy_records_events_or_private_source_files(tmp_path: 
     assert not (target / ".aiwf" / "docs" / "knowledge").exists()
     assert not (target / ".aiwf" / "bin" / "__pycache__").exists()
     assert not (target / "knowledge").exists()
+
+
+def test_install_payload_ignores_repository_level_assets_in_source_package(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    _copy_supported_install_set(REPO_ROOT, source)
+    for relative in (
+        "tests/test_source_only.py",
+        ".github/workflows/test.yml",
+        "docs/project_notes.md",
+        "knowledge/private_notes.md",
+        "release/v1.7.13.md",
+        "records/private_record.md",
+    ):
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("source-only repository asset\n", encoding="utf-8")
+
+    target = tmp_path / "target"
+    target.mkdir()
+    _set_install_source(monkeypatch, source)
+
+    assert ai_workflow.main(["install", "--target", str(target), "--yes"]) == 0
+
+    for relative in ("tests", ".github", "docs", "knowledge", "release", "records"):
+        assert not (target / relative).exists(), relative
+
+
+def test_install_preserves_existing_tests_github_and_docs_byte_for_byte(tmp_path: Path):
+    target = tmp_path / "target"
+    (target / "tests" / "unit").mkdir(parents=True)
+    (target / "tests" / "integration").mkdir(parents=True)
+    (target / ".github" / "workflows").mkdir(parents=True)
+    (target / "docs").mkdir(parents=True)
+    (target / "tests" / "unit" / "test_user_unit.py").write_text(
+        "def test_user_unit():\n    assert True\n", encoding="utf-8"
+    )
+    (target / "tests" / "integration" / "test_user_integration.py").write_text(
+        "def test_user_integration():\n    assert True\n", encoding="utf-8"
+    )
+    (target / ".github" / "workflows" / "ci.yml").write_text("name: user-ci\n", encoding="utf-8")
+    (target / "docs" / "project.md").write_text("user docs\n", encoding="utf-8")
+    protected = {
+        relative: _snapshot_tree(target / relative)
+        for relative in ("tests", ".github", "docs")
+    }
+
+    assert ai_workflow.main(["install", "--target", str(target), "--yes"]) == 0
+
+    for relative, snapshot in protected.items():
+        assert _snapshot_tree(target / relative) == snapshot, relative
+
+
+def test_install_pytest_collects_only_user_tests(tmp_path: Path):
+    target = tmp_path / "target"
+    (target / "tests" / "unit").mkdir(parents=True)
+    (target / "tests" / "integration").mkdir(parents=True)
+    (target / "tests" / "unit" / "test_user_unit.py").write_text(
+        "def test_user_unit():\n    assert True\n", encoding="utf-8"
+    )
+    (target / "tests" / "integration" / "test_user_integration.py").write_text(
+        "def test_user_integration():\n    assert True\n", encoding="utf-8"
+    )
+
+    assert ai_workflow.main(["install", "--target", str(target), "--yes"]) == 0
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+        cwd=target,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "test_user_unit" in result.stdout
+    assert "test_user_integration" in result.stdout
+    assert "test_ai_workflow" not in result.stdout
 
 
 def test_supported_first_install_preserves_project_scripts_and_does_not_create_removed_helper(tmp_path: Path):
