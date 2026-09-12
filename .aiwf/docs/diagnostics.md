@@ -53,6 +53,23 @@
 | `AIWF-PATH-022` | error | Default template residue remains in a required section. | A generated section such as Background, Problem, Goal, or review summary was never rewritten for the current task. | Replace default template text with task-specific closure evidence before finalize. |
 | `AIWF-PATH-023` | error | Acceptance Criteria exist but no item has a closure decision. | The AC section is present, but every checkbox item is still unresolved. | Give each AC item a closure state such as passed, deferred, or not applicable before finalize. |
 | `AIWF-PATH-024` | error | Acceptance Criteria still contain unresolved or blocking states. | One or more AC items remain unchecked, failed, or blocked even though the task is being prepared for closure. | Resolve the item, or mark it deferred/not applicable with rationale before finalize. |
+| `AIWF-PATH-025` | error | Latest review decision authority does not satisfy the task's required authority. | A human-required task has only an `ai-agent` final decision, or the inverse. | Record a fresh final review with the required `--decision-authority`; `recorded_by` may be the agent that writes the evidence. |
+| `AIWF-PATH-026` | error | Latest final review lacks structured authority evidence. | A new or active legacy task has no decision authority or recording actor in the final review event. | Record a fresh review with structured authority fields. This is workflow evidence, not identity proof. |
+| `AIWF-PATH-027` | error | Review event authority snapshot disagrees with task metadata. | The event's required authority differs from the current task policy. | Align the policy and record a fresh review; historical events are not rewritten. |
+| `AIWF-REVIEW-AUTHORITY-001` | error | A v1.7 review record omitted explicit decision authority. | `record --kind review` supplied a result without `--decision-authority`. | Supply `human`, `ai-agent`, or `not_required` as appropriate. |
+| `AIWF-REVIEW-AUTHORITY-002` | error | Review evidence has no non-empty recording actor. | `--recorded-by` and `AIWF_ACTOR` are both empty. | Supply a non-empty `--recorded-by` or configure `AIWF_ACTOR`. |
+| `AIWF-REVIEW-AUTHORITY-003` | error | Review decision authority is invalid for the result. | An unsupported authority or `not_required` was paired with `pass`/`fail`. | Use `human`/`ai-agent` for final decisions, or `not_required` only with that result. |
+| `AIWF-DERIVED-REVIEW-001` | warn | Derived evidence found failed reviews without a later fix. | A review correction loop is incomplete. | Inspect the review/fix sequence; this warning does not create a finalize gate. |
+| `AIWF-DERIVED-REVIEW-002` | warn | Derived evidence found fixes without a later validation pass. | A fix has no fresh validation event. | Record validation after the fix; this warning does not create a new policy gate. |
+| `AIWF-DERIVED-REVIEW-003` | warn | Derived evidence found failed reviews without a later fresh final review. | A correction loop has no fresh closure decision. | Inspect the review sequence; the warning is observational. |
+| `AIWF-DERIVED-REVIEW-004` | warn | Latest final review status disagrees with metadata `review_status`. | Event evidence and task metadata do not describe the same current review state. | Align task metadata with the latest review evidence; this warning does not create a finalize gate. |
+| `AIWF-DERIVED-VALIDATION-001` | warn | Derived evidence found validation failures without later passes. | Validation failure evidence remains unresolved in the event sequence. | Review the existing workflow policy; AIWF does not infer failure disposition or block finalize here. |
+| `AIWF-DERIVED-AUTHORITY-001` | warn | Derived authority evidence is missing or inconsistent. | Structured event authority does not match the task policy. | Inspect authority evidence; this warning is not a second finalize gate. |
+| `AIWF-DERIVED-PROJECTION-001` | warn | Task-local events are missing from the global projection. | The two append-only event views differ. | Inspect both logs; AIWF does not rewrite historical events automatically. |
+| `AIWF-DERIVED-PROJECTION-002` | warn | The global projection contains orphan events for the task. | A global event has no task-local match. | Inspect the projection and preserve historical evidence while resolving discrepancies. |
+| `AIWF-DERIVED-PROJECTION-003` | warn | Exact duplicate event occurrences were detected. | The same canonical event appears more than once in a projection. | Review duplicate rows; no automatic historical rewrite is performed. |
+| `AIWF-DERIVED-PROJECTION-004` | warn | Local and global event ordering differs. | The projections contain the same events in different order. | Inspect timestamps/source order; this warning does not block finalize. |
+| `AIWF-DERIVED-SCHEMA-001` | warn | Derived event evidence contains an unsupported schema. | A task/global event uses an unknown event schema version. | Review compatibility; known legacy v0.1/v0.2 events remain readable. |
 | `AIWF-AGENTS-PATH-001` | error | The resolved AGENTS path is outside the repository boundary. | An absolute outside path, `..` traversal, or repository-local symlink resolves outside the repository. | Use a repository-relative path that resolves within the current repository. The `--yes` option cannot bypass this check. |
 | `AIWF-RELOCATE-CONFLICT-001` | error | A legacy source and its canonical destination both exist. | Relocation or upgrade legacy-docs migration found an ambiguous duplicate path. | Review both paths and resolve the conflict explicitly. AIWF will not overwrite, merge, or delete either path automatically. |
 
@@ -142,3 +159,9 @@ task table or `Total: 0` line is printed.
 - `AIWF-PATH-015` is a finalize blocker for v1.6 task integrity drift against the recorded finalize artifact manifest.
 - `AIWF-FINALIZE-001` confirms `finalize` idempotency/no-op on closed tasks; do not treat "re-run finalize" as a repair path for finalized artifact drift.
 - `AIWF-PATH-020` through `AIWF-PATH-024` are workflow-readiness checks only; they do not prove or disprove the underlying business result.
+- `AIWF-DERIVED-*` diagnostics are warnings exposed by `doctor`/`report`; they
+  are derived from evidence, do not alter source-of-truth metadata, and do not
+  block `check --finalize-ready` or `finalize`.
+- `AIWF-PATH-025` through `AIWF-PATH-027` are finalize-readiness errors for
+  structured review authority consistency. They do not authenticate human
+  identity or provide a cryptographic approval ledger.

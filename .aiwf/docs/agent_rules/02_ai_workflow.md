@@ -19,7 +19,7 @@ Deterministic correctness enforcement is implemented in `.aiwf/bin/ai_workflow.p
 - Prevent premature completion claims.
 - Preserve legacy records without forced mass migration.
 - Keep AGENTS.md governance instructions aligned with AIWF completion authority.
-- Keep release/tool/protocol version metadata aligned in current v1.7.x governance scope unless explicit compatibility requirements require separation.
+- Keep release/tool/protocol version metadata aligned in current v1.7.14 governance scope unless explicit compatibility requirements require separation.
 
 ## Agent Instruction Surface
 
@@ -102,8 +102,20 @@ runtime code
 - Missing required files/sections/placeholders/review state must block finalize.
 - Closure evidence hygiene must also block finalize when required artifacts still show pending validation/review residue, default template residue, or unresolved acceptance-criteria closure states.
 - Validation output should be actionable (error code + suggested fix).
-- AIWF v1.6 uses task-local `.aiwf/events.jsonl` as path evidence for finalize gate checks.
-- For v1.6 tasks, validation/review/fix evidence records are part of finalize gate.
+- AIWF v1.6+ uses task-local `.aiwf/events.jsonl` as path evidence for finalize gate checks.
+- For v1.6+ tasks, validation/review/fix evidence records are part of finalize gate.
+- New v1.7 tasks require `required_review_authority` in task metadata and
+  explicit `decision_authority` plus non-empty `recorded_by` on review events.
+  Finalize checks the decision authority against the required authority;
+  `recorded_by` may be a different actor. `reviewer` and agent capability are
+  not authority fields.
+- This check validates structured workflow assertions, not human identity or
+  cryptographic approval. Historical finalized records remain readable, while
+  active older tasks that explicitly require human review cannot bypass the
+  authority invariant.
+- `doctor`/`report` may show derived correction-loop, validation, authority,
+  projection, schema, and activity diagnostics. Derived warnings never add a
+  finalize blocker, phase, disposition gate, or reliability score.
 - `record --kind validation --command "<...>"` records command evidence only; it does not execute commands.
 - A finalized task is closed. Do not append `validation`, `review`, `fix`, or `safety_ack` evidence after finalize.
 - If additional work is required post-finalize, create a follow-up task.
@@ -125,16 +137,16 @@ runtime code
 - Use `./aiwf inspect --path <task_dir>` to distinguish historical closure from
   current effective state; do not infer current state from finalized prose
   alone when a correction artifact is present.
-- The internal source-only stamp for this correction capability is
-  `v1.7.12.post1`; keep public/tool version `1.7.13.post1` and protocol version
-  `1.7.8` unchanged unless a separate release task explicitly changes the
-  release boundary.
+- The current semantic runtime boundary is `v1.7.14`; post-finalization
+  correction remains additive and separate from review authority evidence.
 
-## v1.6.1 Scope Note
+## v1.7.14 Scope Note
 
-- AIWF v1.6.1 remains evidence-driven.
+- AIWF remains evidence-driven; v1.7.14 carries the reviewed structured review
+  authority consistency semantics in the existing finalize-readiness checks.
 - Do not assume strict phase-gated finalize in governance text.
-- Do not state `finalize requires workflow_phase == review`; strict phase gating is deferred.
+- Do not state `finalize requires workflow_phase == review`; no new phase gate
+  was introduced.
 
 ## Required Work Record Files
 

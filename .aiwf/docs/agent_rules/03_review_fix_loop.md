@@ -39,13 +39,14 @@ Deterministic completion gating is enforced by `./aiwf finalize`.
 - `AIWF-FINALIZED-002` is expected closure enforcement in this flow.
 - `AIWF-PATH-019` indicates post-finalize event-chain contamination and should be handled via follow-up workflow.
 
-## Standard Command Flow (v1.6)
+## Standard Command Flow (v1.7.14)
 
 ```bash
 ./aiwf transition --path <task> --to validation
 ./aiwf record --path <task> --kind validation --result pass --command "pytest"
 ./aiwf transition --path <task> --to review
-./aiwf record --path <task> --kind review --result pass --reviewer human --summary "review passed"
+./aiwf record --path <task> --kind review --result pass --reviewer human \
+  --decision-authority human --recorded-by codex --summary "review passed"
 ./aiwf check --path <task> --finalize-ready
 ./aiwf finalize --path <task>
 ```
@@ -53,17 +54,22 @@ Deterministic completion gating is enforced by `./aiwf finalize`.
 Review fail / fix / re-validation flow:
 
 ```bash
-./aiwf record --path <task> --kind review --result fail --reviewer codex --summary "..."
+./aiwf record --path <task> --kind review --result fail --reviewer codex \
+  --decision-authority ai-agent --recorded-by codex --summary "..."
 ./aiwf transition --path <task> --to implementation
 ./aiwf record --path <task> --kind fix --summary "..."
 ./aiwf transition --path <task> --to validation
 ./aiwf record --path <task> --kind validation --result pass --command "pytest"
 ./aiwf transition --path <task> --to review
-./aiwf record --path <task> --kind review --result pass --reviewer human --summary "..."
+./aiwf record --path <task> --kind review --result pass --reviewer human \
+  --decision-authority human --recorded-by codex --summary "..."
 ./aiwf check --path <task> --finalize-ready
 ./aiwf finalize --path <task>
 ```
 
 Note:
 - Validation/review transitions are recommended for clarity.
-- AIWF v1.6.1 does not enforce strict phase-gated finalize (`workflow_phase == review` is not a finalize prerequisite in v1.6.1).
+- v1.7.14 requires structured review decision authority on new review events;
+  `recorded_by` is the recording actor and may differ from the decision authority.
+- AIWF does not enforce strict phase-gated finalize (`workflow_phase == review`
+  is not a finalize prerequisite); no new phase was introduced.

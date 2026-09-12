@@ -29,7 +29,23 @@ and integrity metadata. It does not export the source repository.
 - `malformed_event_count`: event rows that cannot be normalized
 - `blocked_event_count`: count of events whose normalized `result.status == blocked`
 - `post_finalize_event_count`: events detected after closure boundary
+- `derived_status_counts`: counts of deterministic evidence-derived task states
+- `derived_diagnostic_count`: non-blocking derived warning count
+- `derived_diagnostic_task_count`: tasks with at least one derived warning
 - `diagnostic_code_ranking`: frequency ranking of diagnostics found in report scope
+
+Each task entry also contains `derived_status`, `derived_evidence`, and
+`derived_diagnostic_codes`. The evidence view includes validation pass/fail
+counts, review correction-loop counts, review freshness, final-review authority
+consistency, metadata/latest-review status consistency, local/global event
+projection consistency, known/unknown event schema compatibility, and last
+activity timestamp/age.
+
+Authority consistency uses the same structured-evidence validator as closure
+checks, including the event's required-authority snapshot. Projection equality
+compares complete parsed JSON events, preserving schema, provenance, result
+details and extension fields; only object key order and JSON whitespace are
+ignored.
 
 ## Caveats
 - `blocked_event_count` is MVP-defined as events with normalized `result.status == blocked`.
@@ -39,6 +55,12 @@ and integrity metadata. It does not export the source repository.
 - Compare records by workflow version, event schema version, and whether tasks are event-backed.
 - Event logs are evidence records, not tamper-proof audit logs.
 - Report output is for analysis and triage, not workflow source of truth.
+- Derived warnings are observational only. They do not block
+  `check --finalize-ready` or `finalize`, add a workflow phase, classify a
+  validation failure disposition, or form a reliability score.
+- Task-local events are the task evidence stream; `.aiwf/events/events.jsonl`
+  is the global projection. Projection discrepancies are reported without
+  historical rewrite.
 
 Workflow source of truth remains:
 - `task.md` metadata
@@ -52,10 +74,11 @@ When analyzing output, split data by:
 - event-backed task
 - `aiwf-event-v0.1`
 - `aiwf-event-v0.2`
+- `aiwf-event-v0.3`
 - domain automation work
 - workflow tooling work
 
 ## Related References
 - Diagnostic catalog: [diagnostics.md](diagnostics.md)
-- Release baseline: [releases/v1.6.1.md](releases/v1.6.1.md)
+- Release baseline: [releases/v1.7.14.md](releases/v1.7.14.md)
 - Package Records release preparation: [releases/package_records_release_preparation.md](releases/package_records_release_preparation.md)

@@ -851,25 +851,47 @@ def _sync_index(root: Path, task_dir: Path) -> None:
     assert rc == 0
 
 
-def _record_v16_finalize_evidence(root: Path, task_dir: Path) -> None:
+def _record_finalize_evidence(root: Path, task_dir: Path) -> None:
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="review passed") == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="pass",
+        command=None,
+        reviewer="human",
+        summary="review passed",
+        decision_authority="human",
+        recorded_by="codex",
+    ) == 0
+
+
+# Keep the historical helper name at call sites while using structured v1.7 evidence.
+_record_v16_finalize_evidence = _record_finalize_evidence
 
 
 def _prepare_finalize_ready_task(root: Path, task_dir: Path) -> None:
     _write_finalize_ready_docs(task_dir)
     _rewrite_task_metadata(task_dir / "task.md", review_status="pass", status="review", workflow_phase="validation")
     _sync_index(root, task_dir)
-    _record_v16_finalize_evidence(root, task_dir)
+    _record_finalize_evidence(root, task_dir)
 
 
-def test_new_task_defaults_to_v16(tmp_path: Path):
+def _prepare_open_derived_task(root: Path, *, name: str) -> Path:
+    task_dir = _create_task(root, name=name, date="20260513")
+    _write_finalize_ready_docs(task_dir)
+    _rewrite_task_metadata(task_dir / "task.md", review_status="pending", status="review", workflow_phase="validation")
+    _sync_index(root, task_dir)
+    return task_dir
+
+
+def test_new_task_defaults_to_v17_with_human_review_authority(tmp_path: Path):
     root = _init_repo(tmp_path)
     task_dir = _create_task(root)
 
     task_md_path = task_dir / "task.md"
     metadata, _body = ai_workflow.parse_front_matter(task_md_path.read_text(encoding="utf-8"))
-    assert metadata["schema_version"] == "ai-workflow-v1.6"
+    assert metadata["schema_version"] == ai_workflow.SCHEMA_V17
     assert metadata["task_id"] == "001"
     assert metadata["task_name"] == "fix_ddf_cleanup"
     assert metadata["status"] == "draft"
@@ -878,6 +900,7 @@ def test_new_task_defaults_to_v16(tmp_path: Path):
     assert metadata["owner"] == "ai-agent"
     assert metadata["reviewer"] == "human"
     assert metadata["review_status"] == "pending"
+    assert metadata["required_review_authority"] == "human"
     assert metadata["blocked_reason"] is None
     assert metadata["workflow_phase"] == "implementation"
     assert metadata["phase_entered_at"]
@@ -1910,12 +1933,12 @@ def test_valid_snake_case_task_name_passes(tmp_path: Path):
     assert rc == 0
 
 
-def test_export_json_returns_valid_v16_task(tmp_path: Path):
+def test_export_json_returns_valid_current_task(tmp_path: Path):
     root = _init_repo(tmp_path)
     task_dir = _create_task(root)
 
     payload = ai_workflow.export_tasks_json(root, task_dir)
-    assert payload["schema_version"] == "ai-workflow-v1.6"
+    assert payload["schema_version"] == ai_workflow.CURRENT_SCHEMA_VERSION
     assert payload["workflow_version"] == ai_workflow.WORKFLOW_PROTOCOL_VERSION
     assert payload["capabilities"]["deterministic_finalize"] is True
     assert payload["capabilities"]["finalize_idempotent"] is True
@@ -1923,7 +1946,7 @@ def test_export_json_returns_valid_v16_task(tmp_path: Path):
     task = payload["tasks"][0]
     assert task["task_id"] == "001"
     assert task["task_name"] == "fix_ddf_cleanup"
-    assert task["schema_version"] == "ai-workflow-v1.6"
+    assert task["schema_version"] == ai_workflow.CURRENT_SCHEMA_VERSION
     assert task["metadata_valid"] is True
     assert task["review_status"] == "pending"
     assert task["blocked_reason"] is None
@@ -1942,7 +1965,7 @@ def test_export_json_handles_legacy_task_without_failing(tmp_path: Path):
         (task_dir / name).write_text("ok\n", encoding="utf-8")
 
     payload = ai_workflow.export_tasks_json(root, day_dir)
-    assert payload["schema_version"] == "ai-workflow-v1.6"
+    assert payload["schema_version"] == ai_workflow.CURRENT_SCHEMA_VERSION
     assert len(payload["tasks"]) == 1
     task = payload["tasks"][0]
     assert task["schema_version"] == "legacy"
@@ -5337,7 +5360,9 @@ def test_finalized_task_modified_after_timestamp_warns(tmp_path: Path, capsys):
     _write_finalize_ready_docs(task_dir)
     _rewrite_task_metadata(task_dir / "task.md", schema_version="ai-workflow-v1.5", review_status="pass", status="review", workflow_phase="validation")
     _sync_index(root, task_dir)
-    ai_workflow.finalize_command(root, str(task_dir))
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None,
+        reviewer="human", summary="human decision", decision_authority="human", recorded_by="codex") == 0
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
     _sync_index(root, task_dir)
 
     target = task_dir / "task_record.md"
@@ -5370,6 +5395,30 @@ def test_diagnostics_registry_consistency():
         assert code in ai_workflow.DIAGNOSTICS
         spec = ai_workflow.DIAGNOSTICS[code]
         assert "severity" in spec and "message" in spec and "suggested_fix" in spec
+
+
+def test_current_release_version_projection_is_converged():
+    assert ai_workflow.AIWF_TOOL_VERSION == "1.7.14"
+    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.9"
+    assert ai_workflow.CURRENT_SCHEMA_VERSION == ai_workflow.SCHEMA_V17
+    assert ai_workflow.AIWF_EVIDENCE_EVENT_SCHEMA_VERSION == "aiwf-event-v0.3"
+
+    runtime_text = (REPO_ROOT / ".aiwf" / "bin" / "ai_workflow.py").read_text(encoding="utf-8")
+    assert 'AIWF_TOOL_VERSION = "1.7.14"' in runtime_text
+    assert 'WORKFLOW_PROTOCOL_VERSION = "1.7.9"' in runtime_text
+    readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "| Current Release | `1.7.14` |" in readme_text
+    assert "| Workflow Protocol Version | `1.7.9` |" in readme_text
+    assert "v1.7.14.md" in readme_text
+    protocol_text = (REPO_ROOT / ".aiwf" / "docs" / "workflow_protocol.md").read_text(encoding="utf-8")
+    assert "# AI Workflow Protocol v1.7.9" in protocol_text
+    assert "review decision MUST carry a valid decision authority" in protocol_text
+    release_text = (REPO_ROOT / ".aiwf" / "docs" / "releases" / "v1.7.14.md").read_text(encoding="utf-8")
+    assert "Why This Is Not a `.post` Release" in release_text
+    assert "cross-task dependency enforcement" in release_text
+    historical_text = (REPO_ROOT / ".aiwf" / "docs" / "releases" / "v1.7.13.post1.md").read_text(encoding="utf-8")
+    assert "1.7.13.post1" in historical_text
+    assert "1.7.8" in historical_text
 
 
 def test_load_aiwf_env_precedence(tmp_path: Path):
@@ -5436,7 +5485,7 @@ def test_event_logging_enabled_and_export_experiment(tmp_path: Path):
     first = json.loads(lines[0])
     assert first["schema_version"] == "aiwf-event-v0.1"
     assert first["tool_version"] == ai_workflow.AIWF_TOOL_VERSION
-    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.8"
+    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.9"
     assert first["command"] == "doctor"
     assert first["workflow_mode"] == "aiwf_deterministic"
     assert first["model"]["name"] == "test-model"
@@ -5719,7 +5768,7 @@ def test_transition_after_finalized_fails(tmp_path: Path, capsys):
     task_dir = _create_task(root, date="20260512")
     _write_finalize_ready_docs(task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest -q", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="ok") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="ok", decision_authority="human", recorded_by="codex") == 0
     _sync_index(root, task_dir)
     assert ai_workflow.finalize_command(root, str(task_dir)) == 0
 
@@ -5753,7 +5802,7 @@ def test_record_review_fail_event(tmp_path: Path):
     root = _init_repo(tmp_path)
     task_dir = _create_task(root, date="20260512")
 
-    rc = ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="blocker")
+    rc = ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="blocker", decision_authority="ai-agent", recorded_by="codex")
     assert rc == 0
     events = _events_lines(task_dir)
     assert any(e.get("event") == "review_recorded" and _event_result_status(e) == "fail" for e in events)
@@ -5818,7 +5867,7 @@ def test_v16_finalize_with_validation_and_review_pass_succeeds(tmp_path: Path):
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="review passed") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="review passed", decision_authority="human", recorded_by="codex") == 0
 
     rc = ai_workflow.finalize_command(root, str(task_dir))
     assert rc == 0
@@ -5838,7 +5887,7 @@ def test_review_fail_without_fix_fails(tmp_path: Path, capsys):
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail", decision_authority="ai-agent", recorded_by="codex") == 0
 
     rc = ai_workflow.finalize_command(root, str(task_dir))
     out = capsys.readouterr().out
@@ -5852,9 +5901,9 @@ def test_fix_without_revalidation_fails(tmp_path: Path, capsys):
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail", decision_authority="ai-agent", recorded_by="codex") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="fixed") == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass", decision_authority="human", recorded_by="codex") == 0
 
     rc = ai_workflow.finalize_command(root, str(task_dir))
     out = capsys.readouterr().out
@@ -5868,10 +5917,10 @@ def test_review_fail_fix_revalidation_review_pass_finalize_succeeds(tmp_path: Pa
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail", decision_authority="ai-agent", recorded_by="codex") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="fixed") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest -q", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass", decision_authority="human", recorded_by="codex") == 0
 
     rc = ai_workflow.finalize_command(root, str(task_dir))
     assert rc == 0
@@ -5883,7 +5932,7 @@ def test_v16_stale_review_pass_after_fix_blocks_finalize(tmp_path: Path, capsys)
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass before fix") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass before fix", decision_authority="human", recorded_by="codex") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="follow-up change") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest -q", reviewer=None, summary=None) == 0
 
@@ -5899,10 +5948,10 @@ def test_v16_review_pass_after_fix_can_finalize(tmp_path: Path):
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass before fix") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass before fix", decision_authority="human", recorded_by="codex") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="follow-up change") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest -q", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass after fix") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass after fix", decision_authority="human", recorded_by="codex") == 0
 
     rc = ai_workflow.finalize_command(root, str(task_dir))
     assert rc == 0
@@ -5914,8 +5963,8 @@ def test_v16_review_fail_fix_revalidation_without_new_review_pass_fails(tmp_path
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass") == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass", decision_authority="human", recorded_by="codex") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail", decision_authority="ai-agent", recorded_by="codex") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="fixed") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest -q", reviewer=None, summary=None) == 0
 
@@ -5943,8 +5992,8 @@ def test_v16_latest_review_fail_blocks_finalize_even_with_old_review_pass(tmp_pa
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass") == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass", decision_authority="human", recorded_by="codex") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="fail", command=None, reviewer="codex", summary="fail", decision_authority="ai-agent", recorded_by="codex") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="fixed") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest -q", reviewer=None, summary=None) == 0
 
@@ -5984,7 +6033,7 @@ def test_v16_review_status_fail_blocks_finalize(tmp_path: Path, capsys):
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass", decision_authority="human", recorded_by="codex") == 0
     _rewrite_task_metadata(task_dir / "task.md", review_status="fail")
 
     rc = ai_workflow.finalize_command(root, str(task_dir))
@@ -6002,7 +6051,7 @@ def test_v16_review_status_not_required_mismatch_with_latest_pass_blocks_finaliz
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="pass", decision_authority="human", recorded_by="codex") == 0
     _rewrite_task_metadata(task_dir / "task.md", review_status="not_required", review_not_required_reason="manual override")
 
     rc = ai_workflow.finalize_command(root, str(task_dir))
@@ -6017,7 +6066,7 @@ def test_v16_review_status_pass_mismatch_with_latest_not_required_blocks_finaliz
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="not_required", command=None, reviewer="human", summary="doc-only") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="not_required", command=None, reviewer="human", summary="doc-only", decision_authority="not_required", recorded_by="codex") == 0
     _rewrite_task_metadata(task_dir / "task.md", review_status="pass")
 
     rc = ai_workflow.finalize_command(root, str(task_dir))
@@ -6040,6 +6089,8 @@ def test_v16_review_not_required_before_fix_does_not_allow_finalize(tmp_path: Pa
         command=None,
         reviewer="human",
         summary="doc-only change",
+        decision_authority="not_required",
+        recorded_by="codex",
     ) == 0
     assert ai_workflow.record_command(
         root,
@@ -6077,10 +6128,10 @@ def test_v16_review_not_required_after_fix_can_finalize(tmp_path: Path):
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="not_required", command=None, reviewer="human", summary="doc-only change") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="not_required", command=None, reviewer="human", summary="doc-only change", decision_authority="not_required", recorded_by="codex") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="post-review doc update") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest -q", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="not_required", command=None, reviewer="human", summary="still doc-only after fix") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="not_required", command=None, reviewer="human", summary="still doc-only after fix", decision_authority="not_required", recorded_by="codex") == 0
 
     rc = ai_workflow.finalize_command(root, str(task_dir))
     assert rc == 0
@@ -6114,7 +6165,7 @@ def test_v16_manifest_hash_mismatch_fails(tmp_path: Path, capsys):
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="ok") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="ok", decision_authority="human", recorded_by="codex") == 0
     assert ai_workflow.finalize_command(root, str(task_dir)) == 0
     (task_dir / "review_final.md").write_text("changed after finalize\n", encoding="utf-8")
 
@@ -6130,6 +6181,10 @@ def test_v15_missing_path_events_warn_only(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
     task_dir = _create_task(root, date="20260512")
     _rewrite_task_metadata(task_dir / "task.md", schema_version="ai-workflow-v1.5", review_status="pass", status="review", workflow_phase="validation")
+    metadata = _read_task_metadata(task_dir)
+    metadata.pop("required_review_authority", None)
+    metadata["reviewer"] = "codex"
+    ai_workflow._rewrite_task_metadata_file(task_dir, metadata)
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
 
@@ -6161,7 +6216,7 @@ def test_v16_finalize_with_malformed_event_log_fails(tmp_path: Path, capsys):
     _write_finalize_ready_docs(task_dir)
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="ok") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="ok", decision_authority="human", recorded_by="codex") == 0
     event_path = task_dir / ".aiwf" / "events.jsonl"
     with event_path.open("a", encoding="utf-8") as f:
         f.write("{bad json line}\n")
@@ -6304,7 +6359,7 @@ def test_check_finalize_ready_catches_stale_review(tmp_path: Path, capsys):
     _rewrite_task_metadata(task_dir / "task.md", review_status="pass", status="review", workflow_phase="validation")
     _sync_index(root, task_dir)
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="initial pass") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="initial pass", decision_authority="human", recorded_by="codex") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="follow-up change") == 0
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest -q", reviewer=None, summary=None) == 0
 
@@ -6320,12 +6375,360 @@ def test_check_finalize_ready_catches_missing_validation(tmp_path: Path, capsys)
     _write_finalize_ready_docs(task_dir)
     _rewrite_task_metadata(task_dir / "task.md", review_status="pass", status="review", workflow_phase="validation")
     _sync_index(root, task_dir)
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="review pass") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="review pass", decision_authority="human", recorded_by="codex") == 0
 
     rc = ai_workflow.check_path(root, str(task_dir), strict=False, finalize_ready=True)
     out = capsys.readouterr().out
     assert rc == 2
     assert "AIWF-PATH-010" in out
+
+
+def test_finalize_blocks_ai_decision_for_human_required_task(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="human_authority_rejects_ai")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="pass",
+        command=None,
+        reviewer="human",
+        summary="agent cannot substitute for human decision",
+        decision_authority="ai-agent",
+        recorded_by="ai-agent",
+    ) == 0
+    before = (task_dir / "task.md").read_text(encoding="utf-8")
+
+    capsys.readouterr()
+    rc = ai_workflow.check_path(root, str(task_dir), strict=False, finalize_ready=True)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-PATH-025" in out
+    assert "ai-agent" in out
+    assert "human" in out
+
+    rc = ai_workflow.finalize_command(root, str(task_dir))
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-PATH-025" in out
+    assert (task_dir / "task.md").read_text(encoding="utf-8") == before
+    assert _read_task_metadata(task_dir)["status"] == "review"
+
+
+def test_human_decision_recorded_by_agent_satisfies_human_authority(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="human_decision_recorded_by_agent")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="pass",
+        command=None,
+        reviewer="human",
+        summary="human decision supplied to agent",
+        decision_authority="human",
+        recorded_by="codex",
+    ) == 0
+    event = _events_lines(task_dir)[-1]
+    assert event["required_review_authority"] == "human"
+    assert event["decision_authority"] == "human"
+    assert event["recorded_by"] == "codex"
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
+
+
+def test_ai_agent_required_authority_does_not_create_false_human_blocker(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="ai_authority_allowed")
+    _rewrite_task_metadata(task_dir / "task.md", required_review_authority="ai-agent")
+    _sync_index(root, task_dir)
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="pass",
+        command=None,
+        reviewer="codex",
+        summary="agent review allowed by policy",
+        decision_authority="ai-agent",
+        recorded_by="codex",
+    ) == 0
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
+
+
+def test_v17_review_requires_explicit_decision_authority(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="explicit_review_authority", date="20260513")
+
+    rc = ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="pass",
+        command=None,
+        reviewer="human",
+        summary="missing structured authority",
+    )
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-REVIEW-AUTHORITY-001" in out
+    assert not any(_event_type(event) == "review_recorded" for event in _events_lines(task_dir))
+    assert _read_task_metadata(task_dir)["review_status"] == "pending"
+
+
+def test_active_v16_human_review_cannot_use_legacy_authority_gap(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="active_v16_human_authority", date="20260513")
+    _write_finalize_ready_docs(task_dir)
+    metadata = _read_task_metadata(task_dir)
+    metadata.pop("required_review_authority", None)
+    metadata.update(schema_version=ai_workflow.SCHEMA_V16, status="review", workflow_phase="validation", review_status="pass")
+    _rewrite_task_metadata(task_dir / "task.md", **metadata)
+    _sync_index(root, task_dir)
+    _write_task_event_log(
+        task_dir,
+        {"schema_version": "aiwf-event-v0.1", "event": "validation_recorded", "result": "pass"},
+        {"schema_version": "aiwf-event-v0.1", "event": "review_recorded", "result": "pass", "reviewer": "human"},
+    )
+
+    rc = ai_workflow.finalize_command(root, str(task_dir))
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-PATH-026" in out
+    assert "AIWF-PATH-025" not in out
+
+
+def test_active_v16_human_policy_is_preserved_when_agent_records_review(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="active_v16_policy_snapshot", date="20260513")
+    _write_finalize_ready_docs(task_dir)
+    metadata = _read_task_metadata(task_dir)
+    metadata.pop("required_review_authority", None)
+    metadata.update(schema_version=ai_workflow.SCHEMA_V16, status="review", workflow_phase="validation", review_status="pending")
+    _rewrite_task_metadata(task_dir / "task.md", **metadata)
+    _sync_index(root, task_dir)
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="pass",
+        command=None,
+        reviewer="codex",
+        summary="agent attempts to close Human-required legacy task",
+        decision_authority="ai-agent",
+        recorded_by="codex",
+    ) == 0
+    assert _read_task_metadata(task_dir)["required_review_authority"] == "human"
+
+    rc = ai_workflow.finalize_command(root, str(task_dir))
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-PATH-025" in out
+
+
+def test_legacy_finalized_record_is_not_retroactively_authority_invalidated(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="legacy_finalized_authority", date="20260513")
+    _write_finalize_ready_docs(task_dir)
+    metadata = _read_task_metadata(task_dir)
+    metadata.pop("required_review_authority", None)
+    metadata.update(
+        schema_version=ai_workflow.SCHEMA_V16,
+        status="done",
+        workflow_phase="finalized",
+        review_status="pass",
+        finalized_at="2026-05-13T12:00:00Z",
+        finalized_by="tool",
+    )
+    _rewrite_task_metadata(task_dir / "task.md", **metadata)
+    _sync_index(root, task_dir)
+    _write_task_event_log(
+        task_dir,
+        {"schema_version": "aiwf-event-v0.1", "event": "validation_recorded", "result": "pass"},
+        {"schema_version": "aiwf-event-v0.1", "event": "review_recorded", "result": "pass", "reviewer": "human"},
+        {
+            "schema_version": "aiwf-event-v0.1",
+            "event": "finalize_success",
+            "result": "ok",
+            "artifact_manifest": ai_workflow._artifact_manifest(task_dir),
+        },
+    )
+
+    diagnostics = ai_workflow._collect_task_diagnostics(
+        root,
+        task_dir,
+        v11_missing_is_fail=True,
+        include_finalize_checks=True,
+    )
+    codes = {item.code for item in diagnostics}
+    assert "AIWF-PATH-025" not in codes
+    assert "AIWF-PATH-026" not in codes
+    assert "AIWF-PATH-027" not in codes
+
+
+def test_review_event_required_authority_mismatch_is_deterministic(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="authority_snapshot_mismatch")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    _rewrite_task_metadata(task_dir / "task.md", review_status="pass")
+    _sync_index(root, task_dir)
+    ai_workflow._append_raw_event(
+        root,
+        task_dir,
+        {
+            "schema_version": ai_workflow.AIWF_EVIDENCE_EVENT_SCHEMA_VERSION,
+            "event_type": "review_recorded",
+            "event": "review_recorded",
+            "result": {"status": "pass"},
+            "required_review_authority": "ai-agent",
+            "decision_authority": "human",
+            "recorded_by": "codex",
+        },
+    )
+
+    rc = ai_workflow.check_path(root, str(task_dir), strict=False, finalize_ready=True)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-PATH-027" in out
+    assert "AIWF-PATH-025" not in out
+
+
+def test_malformed_decision_authority_is_diagnostic_not_crash(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="malformed_authority_type")
+    _record_finalize_evidence(root, task_dir)
+    events = _events_lines(task_dir)
+    events[-1]["decision_authority"] = ["human"]
+    _write_task_event_log(task_dir, *events)
+
+    rc = ai_workflow.check_path(root, str(task_dir), strict=False, finalize_ready=True)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "AIWF-PATH-026" in out
+    assert "TypeError" not in out
+
+
+def test_legacy_not_required_authority_fields_remain_optional(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="legacy_not_required_authority", date="20260513")
+    metadata = _read_task_metadata(task_dir)
+    metadata.update(
+        schema_version=ai_workflow.SCHEMA_V16,
+        reviewer="codex",
+        review_status="not_required",
+        review_not_required_reason="No human review required for this historical task.",
+    )
+    metadata.pop("required_review_authority", None)
+    _rewrite_task_metadata(task_dir / "task.md", **metadata)
+    _sync_index(root, task_dir)
+    review_event = {"schema_version": "aiwf-event-v0.2", "event": "review_recorded", "result": "not_required"}
+
+    assert ai_workflow._collect_review_authority_diagnostics(
+        root, task_dir, _read_task_metadata(task_dir), review_event, "not_required"
+    ) == []
+
+
+@pytest.mark.parametrize("schema", ["ai-workflow-v1.2", "ai-workflow-v1.3", "ai-workflow-v1.4", "ai-workflow-v1.5"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_pre_v16_active_human_authority_cannot_be_bypassed(tmp_path: Path, schema: str, explicit: bool, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="legacy_authority_regression")
+    metadata = _read_task_metadata(task_dir)
+    metadata["schema_version"] = schema
+    if not explicit:
+        metadata.pop("required_review_authority", None)
+    ai_workflow._rewrite_task_metadata_file(task_dir, metadata)
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None,
+        reviewer="codex", summary="agent review", decision_authority="ai-agent", recorded_by="codex") == 0
+    assert ai_workflow.check_path(root, str(task_dir), strict=False, finalize_ready=True) == 2
+    assert "AIWF-PATH-025" in capsys.readouterr().out
+    assert ai_workflow.finalize_command(root, str(task_dir), dry_run=True) == 2
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None,
+        reviewer="human", summary="human decision", decision_authority="human", recorded_by="codex") == 0
+    # No v1.6 validation gate is imported into older schemas.
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
+
+
+@pytest.mark.parametrize("snapshot", [None, "ai-agent"])
+def test_derived_authority_uses_gate_snapshot_validation(tmp_path: Path, snapshot):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_snapshot_regression")
+    _record_finalize_evidence(root, task_dir)
+    events = _events_lines(task_dir)
+    if snapshot is None:
+        events[-1].pop("required_review_authority")
+    else:
+        events[-1]["required_review_authority"] = snapshot
+    _write_task_event_log(task_dir, *events)
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    assert summary["authority"]["consistency"] == ("missing" if snapshot is None else "inconsistent")
+    assert summary["closure"]["evidence_ready"] is False
+    assert summary["derived_status"] != "finalize_ready"
+    assert any(d.code == "AIWF-DERIVED-AUTHORITY-001" for d in ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary))
+
+
+@pytest.mark.parametrize("field,value", [("actor", "other"), ("schema_version", "unknown"),
+    ("model", {"name": "different"}), ("result", {"status": "pass", "exit_code": 7}), ("extension", "new")])
+def test_projection_preserves_all_raw_event_fields(tmp_path: Path, field, value):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="projection_content_regression")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    original = _events_lines(task_dir)[0]
+    changed = dict(original)
+    changed[field] = value
+    global_path = ai_workflow.get_event_log_path(root)
+    global_path.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    assert summary["projection"]["missing_global_event_count"] == 1
+    assert summary["projection"]["orphan_global_event_count"] == 1
+    with global_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(original) + "\n")
+    assert ai_workflow.build_derived_evidence_summary(root, task_dir)["projection"]["duplicate_event_count"] == 0
+    assert ai_workflow._canonical_event_projection_key(root, original) == ai_workflow._canonical_event_projection_key(root, dict(reversed(list(original.items()))))
+
+
+def test_derived_summary_reports_review_metadata_mismatch(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_review_metadata_mismatch")
+    _record_finalize_evidence(root, task_dir)
+    _rewrite_task_metadata(task_dir / "task.md", review_status="pending")
+    _sync_index(root, task_dir)
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    diagnostics = ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)
+    codes = {item.code for item in diagnostics}
+    assert summary["review"]["latest_status"] == "pass"
+    assert summary["review"]["metadata_status"] == "pending"
+    assert summary["review"]["metadata_status_consistent"] is False
+    assert summary["closure"]["evidence_ready"] is False
+    assert summary["derived_status"] == "review_pass_but_nonfinal"
+    assert "AIWF-DERIVED-REVIEW-004" in codes
+
+
+def test_derived_summary_checks_global_schema_compatibility(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_global_schema_mismatch")
+    _record_finalize_evidence(root, task_dir)
+    global_path = ai_workflow.get_event_log_path(root)
+    rows = [json.loads(line) for line in global_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    task_path = ai_workflow.rel(root, task_dir)
+    for row in rows:
+        if row.get("task_path") == task_path and row.get("event_type") == "review_recorded":
+            row["schema_version"] = "aiwf-event-v99"
+            break
+    else:
+        raise AssertionError("review event was not projected to the global event log")
+    global_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    diagnostics = ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)
+    assert summary["projection"]["global_schema_compatibility"] == "unknown"
+    assert summary["projection"]["compatibility"] == "unknown"
+    assert summary["projection"]["unsupported_schema_count"] >= 1
+    assert any(item.code == "AIWF-DERIVED-SCHEMA-001" for item in diagnostics)
 
 
 def test_check_default_behavior_unchanged(tmp_path: Path):
@@ -6336,17 +6739,20 @@ def test_check_default_behavior_unchanged(tmp_path: Path):
     assert rc == 0
 
 
-def test_evidence_event_schema_v02_contains_required_fields(tmp_path: Path):
+def test_evidence_event_schema_v03_contains_authority_fields(tmp_path: Path):
     root = _init_repo(tmp_path)
     task_dir = _create_v2_task(root, date="20260513")
 
-    rc = ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="review passed")
+    rc = ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="review passed", decision_authority="human", recorded_by="codex")
     assert rc == 0
     events = _events_lines(task_dir)
     event = events[-1]
-    assert event["schema_version"] == "aiwf-event-v0.2"
+    assert event["schema_version"] == ai_workflow.AIWF_EVIDENCE_EVENT_SCHEMA_VERSION
     assert event["tool_version"] == ai_workflow.AIWF_TOOL_VERSION
-    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.8"
+    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.9"
+    assert event["required_review_authority"] == "human"
+    assert event["decision_authority"] == "human"
+    assert event["recorded_by"] == "codex"
     assert event["event_type"] == "review_recorded"
     assert event["event_group"] == "evidence"
     assert event["task_path"].startswith(".aiwf/records/ai_")
@@ -6374,7 +6780,7 @@ def test_historical_event_records_are_not_rewritten(tmp_path: Path):
     }
     ai_workflow._append_raw_event(root, task_dir, legacy_event)
 
-    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="new review") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="review", result="pass", command=None, reviewer="human", summary="new review", decision_authority="human", recorded_by="codex") == 0
     events = _events_lines(task_dir)
     assert len(events) == 2
     assert events[0]["tool_version"] == "1.6.1"
@@ -6397,6 +6803,9 @@ def test_review_freshness_accepts_legacy_and_v02_events(tmp_path: Path):
             "result": "pass",
             "kind": "review",
             "summary": "mixed-format review pass",
+            "required_review_authority": "human",
+            "decision_authority": "human",
+            "recorded_by": "codex",
         },
     )
 
@@ -6418,6 +6827,8 @@ def test_report_json_contains_summary_metrics(tmp_path: Path, capsys):
     assert "task_count" in summary
     assert "event_backed_task_count" in summary
     assert "post_finalize_event_count" in summary
+    assert "derived_diagnostic_count" in summary
+    assert payload["tasks"][0]["derived_evidence"]["derived_status"] == "waiting_review"
     assert "diagnostic_code_ranking" in payload
 
 
@@ -6432,7 +6843,7 @@ def test_report_markdown_contains_summary_table(tmp_path: Path, capsys):
     assert "# AIWF Report" in out
     assert "| Metric | Value |" in out
     assert "| Code | Count |" in out
-    assert "| Date | Task | Status | Phase | Review | Events |" in out
+    assert "| Date | Task | Status | Phase | Review | Derived | Events |" in out
 
 
 def test_report_counts_malformed_events_without_crash(tmp_path: Path, capsys):
@@ -6448,6 +6859,284 @@ def test_report_counts_malformed_events_without_crash(tmp_path: Path, capsys):
     payload = json.loads(out)
     assert rc == 0
     assert payload["summary"]["malformed_event_count"] == 1
+
+
+def test_derived_summary_reports_complete_review_correction_loop(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_complete_correction_loop")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="fail",
+        command=None,
+        reviewer="codex",
+        summary="finding",
+        decision_authority="ai-agent",
+        recorded_by="codex",
+    ) == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="fixed") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest -q", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="pass",
+        command=None,
+        reviewer="human",
+        summary="fresh authorized review",
+        decision_authority="human",
+        recorded_by="codex",
+    ) == 0
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    diagnostics = ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)
+    assert summary["review"]["fail_count"] == 1
+    assert summary["review"]["fail_with_later_fix"] == 1
+    assert summary["review"]["fix_with_fresh_validation"] == 1
+    assert summary["review"]["fail_with_fresh_review"] == 1
+    assert summary["authority"]["consistency"] == "consistent"
+    assert summary["closure"]["evidence_ready"] is True
+    assert summary["derived_status"] == "finalize_ready"
+    assert diagnostics == []
+
+
+def test_derived_summary_reports_failed_review_without_fix_as_warning(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_review_without_fix")
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="fail",
+        command=None,
+        reviewer="codex",
+        summary="unresolved finding",
+        decision_authority="ai-agent",
+        recorded_by="codex",
+    ) == 0
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    codes = {item.code for item in ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)}
+    assert summary["derived_status"] == "review_failed_pending_fix"
+    assert "AIWF-DERIVED-REVIEW-001" in codes
+    assert "AIWF-DERIVED-REVIEW-003" in codes
+
+
+def test_derived_summary_reports_fix_without_fresh_validation(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_fix_without_validation")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="fail",
+        command=None,
+        reviewer="codex",
+        summary="finding",
+        decision_authority="ai-agent",
+        recorded_by="codex",
+    ) == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="fixed") == 0
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    codes = {item.code for item in ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)}
+    assert summary["derived_status"] == "validation_pending"
+    assert summary["review"]["fix_with_fresh_validation"] == 0
+    assert "AIWF-DERIVED-REVIEW-002" in codes
+
+
+def test_derived_summary_identifies_review_pass_but_nonfinalized(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_pass_nonfinal")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="pass",
+        command=None,
+        reviewer="human",
+        summary="ready but not finalized",
+        decision_authority="human",
+        recorded_by="codex",
+    ) == 0
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    assert summary["review"]["latest_status"] == "pass"
+    assert summary["review"]["freshness"] == "fresh"
+    assert summary["review"]["pass_but_nonfinal"] is True
+    assert summary["closure"]["finalized"] is False
+    assert ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary) == []
+
+
+def test_derived_projection_exact_match_is_clean(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_projection_exact")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    assert summary["projection"]["local_event_count"] == summary["projection"]["global_event_count"]
+    assert summary["projection"]["missing_global_event_count"] == 0
+    assert summary["projection"]["orphan_global_event_count"] == 0
+    assert summary["projection"]["duplicate_event_count"] == 0
+
+
+def test_derived_projection_detects_missing_global_event(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_projection_missing")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    ai_workflow.get_event_log_path(root).write_text("", encoding="utf-8")
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    diagnostics = ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)
+    assert summary["projection"]["missing_global_event_count"] == 1
+    assert any(item.code == "AIWF-DERIVED-PROJECTION-001" for item in diagnostics)
+
+
+def test_derived_projection_detects_orphan_global_event(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_projection_orphan")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    global_path = ai_workflow.get_event_log_path(root)
+    with global_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "schema_version": ai_workflow.AIWF_EVIDENCE_EVENT_SCHEMA_VERSION,
+                    "timestamp": "2026-05-13T00:00:00Z",
+                    "event_type": "orphan_event",
+                    "task_path": ai_workflow.rel(root, task_dir),
+                }
+            )
+            + "\n"
+        )
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    diagnostics = ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)
+    assert summary["projection"]["orphan_global_event_count"] == 1
+    assert any(item.code == "AIWF-DERIVED-PROJECTION-002" for item in diagnostics)
+
+
+def test_derived_projection_detects_exact_duplicate_event(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_projection_duplicate")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    global_path = ai_workflow.get_event_log_path(root)
+    first_line = global_path.read_text(encoding="utf-8").splitlines()[0]
+    with global_path.open("a", encoding="utf-8") as handle:
+        handle.write(first_line + "\n")
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    diagnostics = ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)
+    assert summary["projection"]["global_duplicate_event_count"] == 1
+    assert any(item.code == "AIWF-DERIVED-PROJECTION-003" for item in diagnostics)
+
+
+def test_derived_projection_detects_ordering_anomaly(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_projection_ordering")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="ordering fixture") == 0
+    global_path = ai_workflow.get_event_log_path(root)
+    lines = global_path.read_text(encoding="utf-8").splitlines()
+    global_path.write_text("\n".join(reversed(lines)) + "\n", encoding="utf-8")
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    diagnostics = ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)
+    assert summary["projection"]["ordering_anomaly"] is True
+    assert any(item.code == "AIWF-DERIVED-PROJECTION-004" for item in diagnostics)
+
+
+def test_derived_summary_handles_legacy_event_schema_without_crash(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="derived_legacy_events", date="20260513")
+    _write_task_event_log(
+        task_dir,
+        {
+            "schema_version": "aiwf-event-v0.1",
+            "timestamp": "2026-05-13T00:00:00Z",
+            "event": "validation_recorded",
+            "result": "pass",
+        },
+    )
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    assert summary["projection"]["compatibility"] == "legacy"
+    assert summary["validation"]["pass_count"] == 1
+
+
+def test_derived_summary_handles_sparse_no_event_task(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="derived_sparse_task", date="20260513")
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    assert summary["derived_status"] == "waiting_review"
+    assert summary["projection"]["compatibility"] == "none"
+    assert summary["activity"]["last_activity_timestamp"] == "2026-05-13T00:00:00Z"
+
+
+def test_derived_authority_mismatch_is_warning_only(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="derived_authority_mismatch")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    _rewrite_task_metadata(task_dir / "task.md", review_status="pass")
+    _sync_index(root, task_dir)
+    ai_workflow._append_raw_event(
+        root,
+        task_dir,
+        {
+            "schema_version": ai_workflow.AIWF_EVIDENCE_EVENT_SCHEMA_VERSION,
+            "event_type": "review_recorded",
+            "result": {"status": "pass"},
+            "required_review_authority": "human",
+            "decision_authority": "ai-agent",
+            "recorded_by": "ai-agent",
+        },
+    )
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    diagnostics = ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary)
+    assert summary["authority"]["consistency"] == "inconsistent"
+    assert any(item.code == "AIWF-DERIVED-AUTHORITY-001" and item.severity == "warn" for item in diagnostics)
+
+
+def test_healthy_finalized_task_has_no_derived_diagnostics(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, name="derived_healthy_finalized", date="20260513")
+    _prepare_finalize_ready_task(root, task_dir)
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
+
+    summary = ai_workflow.build_derived_evidence_summary(root, task_dir)
+    assert summary["closure"]["finalized"] is True
+    assert ai_workflow._collect_derived_evidence_diagnostics(root, task_dir, summary) == []
+
+
+def test_doctor_prints_derived_workflow_evidence_summary(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _prepare_open_derived_task(root, name="doctor_derived_summary")
+    assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
+    assert ai_workflow.record_command(
+        root,
+        str(task_dir),
+        kind="review",
+        result="pass",
+        command=None,
+        reviewer="human",
+        summary="doctor summary review",
+        decision_authority="human",
+        recorded_by="codex",
+    ) == 0
+
+    capsys.readouterr()
+    rc = ai_workflow.doctor_command(root, str(task_dir))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Workflow Evidence Summary" in out
+    assert "Derived status:" in out
+    assert "pass_but_nonfinal: yes" in out
 
 
 def test_finalize_appends_implicit_phase_transition(tmp_path: Path):

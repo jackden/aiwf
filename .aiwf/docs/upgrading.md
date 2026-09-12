@@ -47,7 +47,7 @@ chmod +x ./aiwf
 ./aiwf upgrade --apply --source /path/to/new_aiwf_repo
 ```
 
-This sequence was verified against the current v1.7.13.post1 runtime.
+This sequence was verified against the current v1.7.14 runtime.
 
 ## Upgrade Modes
 
@@ -97,6 +97,19 @@ AIWF v1.7.9 introduces `review_agent.md` as the canonical AI/agent review
 artifact for new task records. Existing records that contain only
 `review_codex.md` remain supported through a legacy alias and do not require
 migration.
+
+## v1.7.14 review-authority release boundary
+
+The v1.7.14 runtime creates `ai-workflow-v1.7` tasks with
+`required_review_authority` (default `human`) and writes review evidence as
+`aiwf-event-v0.3`. New review records must provide
+`--decision-authority` and a non-empty `--recorded-by` (or `AIWF_ACTOR`).
+
+Upgrade preserves existing task artifacts and event rows. Legacy event schemas
+remain readable; finalized legacy tasks are not retroactively invalidated by
+the new authority semantics. An active older task that explicitly requires
+human review must obtain structured authority evidence before it can close.
+This is an evidence-consistency check, not human authentication.
 
 ## Relocation Behavior
 

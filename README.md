@@ -58,6 +58,14 @@ Replace `<task-path>` with the path printed by `new-task`. The finalize-ready
 check is read-only. Finalize closes the current workflow only after the
 required evidence and review decisions are complete.
 
+New tasks use structured review authority evidence. A task's
+`required_review_authority` policy is checked against the review's
+`decision_authority`; `recorded_by` identifies the actor that wrote the event
+and may differ from the decision authority. This is deterministic workflow
+evidence consistency, not authenticated human identity or cryptographic
+approval. `doctor` and `report` additionally expose derived correction-loop,
+projection, authority, and activity diagnostics without adding finalize gates.
+
 ## How AIWF Works
 
 <p align="center">
@@ -138,10 +146,10 @@ versions evolve independently.
 
 | Field | Value |
 | --- | --- |
-| Current Release | `1.7.13.post1` |
-| Tool Version | `1.7.13.post1` |
-| Workflow Protocol Version | `1.7.8` |
-| Latest Release Notes | [v1.7.13.post1](.aiwf/docs/releases/v1.7.13.post1.md) |
+| Current Release | `1.7.14` |
+| Tool Version | `1.7.14` |
+| Workflow Protocol Version | `1.7.9` |
+| Latest Release Notes | [v1.7.14](.aiwf/docs/releases/v1.7.14.md) |
 | GitHub Releases | [jackden/aiwf releases](https://github.com/jackden/aiwf/releases) |
 
 ## Documentation

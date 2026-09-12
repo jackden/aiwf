@@ -1,25 +1,32 @@
-# AI Workflow Protocol v1.7.8
+# AI Workflow Protocol v1.7.9
 
 This document is the canonical protocol semantics reference for repository-native AI workflow governance.
 
-## Version Identity Policy (v1.7.13.post1)
+## Version Identity Policy (v1.7.14)
 
-For the current lightweight, repository-native AIWF project, release identity and tool provenance normally move together.
-The `v1.7.13.post1` release advances release/tool identity while preserving workflow protocol semantics at `v1.7.8`.
-This does not introduce a package manager, database migration framework, or silent overwrite of workflow evidence.
+For the current lightweight, repository-native AIWF project, release identity and
+tool provenance normally move together. The `v1.7.14` release advances the
+workflow protocol from `1.7.8` to `1.7.9` because review closure now has
+structured decision-authority semantics. This does not introduce a package
+manager, database migration framework, or silent overwrite of workflow
+evidence.
 
 Current version state:
-- release version: `1.7.13.post1`
-- tool version: `1.7.13.post1`
-- workflow protocol version: `1.7.8`
+- release version: `1.7.14`
+- tool version: `1.7.14`
+- workflow protocol version: `1.7.9`
 
-Internal source-only post-release stamp:
-- source stamp: `1.7.12.post1`
-- public/tool release is: `1.7.13.post1`
-- this stamp adds additive post-finalization correction artifacts and a
-  deterministic inspection path without rewriting existing closure evidence.
+Semantics carried by this release:
+- deterministic review decision-authority validation in finalize readiness
+- derived workflow evidence diagnostics exposed through `doctor` and `report`
 
-This release identity is a fail-closed task creation safety correction. It does not imply workflow protocol semantic changes, event schema changes, finalize gate changes, or phase state machine changes.
+The existing metadata schema `ai-workflow-v1.7` and event schema
+`aiwf-event-v0.3` are unchanged by this release; no schema migration is
+introduced here.
+
+The derived diagnostics are observational. They do not add a finalize blocker,
+validation disposition, workflow phase, reliability score, or second source of
+workflow truth.
 
 Version-separation strategy may be revisited only if AIWF later requires:
 - external compatibility guarantees
@@ -53,6 +60,8 @@ Core metadata semantics:
 - `status`: task lifecycle state (draft/active/review/blocked/done/archived)
 - `workflow_phase`: coarse stage (`init`, `implementation`, `validation`, `review`, `finalized`)
 - `review_status`: review outcome (`pending`, `pass`, `fail`, `not_required`)
+- `required_review_authority`: authority required for final review closure
+  (`human` or `ai-agent`); new v1.7 tasks default to `human`
 - `finalized_at`: RFC3339 UTC timestamp written by tooling on first successful finalize
 - `finalized_by`: finalize actor identifier written by tooling (`tool`)
 
@@ -61,6 +70,46 @@ Protocol rules:
 - `status: done` must be compatible with `review_status` and `workflow_phase` checks.
 - `finalized_at` and `finalized_by` are nullable before finalize for v1.5 tasks.
 - LLM/manual prose is not workflow truth; metadata and deterministic commands are workflow truth.
+
+### Review decision authority
+
+Review closure uses three separate structured values:
+
+- `required_review_authority` is the task policy recorded in v1.7 metadata.
+- `decision_authority` is the authority asserted to have made the review
+  decision. A final `pass` must match the task requirement; a
+  `not_required` result uses `not_required` as its decision value.
+- `recorded_by` is the actor that writes the review evidence event.
+
+`reviewer` remains a workflow role and is not a substitute for either authority
+field. Likewise, an agent capability or model identity is not a decision
+authority. `recorded_by` may differ from `decision_authority`; for example, an
+agent may record a human decision that was supplied through an accountable
+workflow.
+
+When a task requires a specific review authority, the latest applicable final
+review decision MUST carry a valid decision authority that satisfies the
+required review authority before the task can become finalize-ready. The actor
+or tool recording the decision is evidence provenance and MUST NOT be treated
+as equivalent to the decision authority.
+
+For v1.7 records, review evidence written by `record` must contain the
+structured authority fields. `check --finalize-ready` and `finalize` validate
+the latest final review, including the required-authority snapshot in the event,
+the decision authority, and a non-empty recording actor. This validates the
+workflow authority assertion and evidence consistency; it does not authenticate
+that a real human performed the review and is not cryptographic approval.
+
+The existing `not_required` reason requirement remains in force. Older active
+records that explicitly require human review cannot close through a missing
+authority field. Older finalized records remain readable and are not
+retroactively invalidated solely by the current authority semantics.
+
+For active v1.2–v1.6 records, explicit required authority is honored; when
+absent, `reviewer: human` supplies the compatibility requirement. Recording a
+review preserves that inferred policy before updating the reviewer role.
+Pre-v1.6 records receive authority checks without adopting v1.6 validation or
+correction-loop gates.
 
 ## 2.1 Tool-Owned Task Metadata
 
@@ -203,9 +252,17 @@ Closure hardening:
 - if `finalize_success` exists, post-finalize evidence-changing events are treated as a closure violation.
 - `check --finalize-ready` runs finalize-level diagnostics in read-only mode for CI/agent gates. It does not modify task artifacts, metadata, indexes, reports, or either event log, and its readiness result is not closure evidence.
 - `check --finalize-ready` validates closure evidence hygiene, including pending validation/review residue, default template residue in required artifacts, and acceptance-criteria closure-decision states.
+- For v1.7 tasks, finalize readiness also requires the latest final review's
+  structured `required_review_authority`, `decision_authority`, and non-empty
+  `recorded_by`; the decision authority must satisfy the task policy.
+- This authority gate checks declared workflow evidence consistency, not human
+  identity authenticity. It preserves the distinction between capability,
+  authority, and the actor that records evidence.
 - Read-only preflight paths must bypass the event writer entirely, including when internal `AIWF_EVENT_LOG=1` is enabled. The current parser exposes no explicit event-logging option to combine with these modes.
 - A successful normal finalize may append phase/finalize evidence only after the metadata and index mutation succeeds. Failed finalize paths must not emit `finalize_success`.
-- v1.6.1 remains evidence-driven; strict phase-gated finalize is deferred and not enforced as `workflow_phase == review`.
+- v1.6 remains evidence-driven; strict phase-gated finalize is not enforced as
+  `workflow_phase == review`. v1.7 adds structured review authority without
+  adding a phase.
 - finalized required artifacts (`task.md`, `task_record.md`, `self_validation.md`, `review_agent.md`, `review_final.md`) are governance-controlled evidence after finalize.
 - `review_agent.md` is the canonical AI/agent review artifact for new tasks.
 - `review_codex.md` is a legacy alias retained for backward compatibility with existing records.
@@ -250,7 +307,7 @@ Post-finalize correction policy (errata workflow):
   - document drift scope and diagnosis
   - restore consistency with auditable commands/actions
   - validate repaired state (`check --finalize-ready`) and record results
-- Controlled amend/reopen runtime semantics are future work (v1.8+) and are not part of v1.7.1 patch behavior.
+  - Controlled amend/reopen runtime semantics remain future work (v1.9+) and are not part of v1.7.14 behavior.
 
 Pre-edit guard:
 
@@ -283,6 +340,24 @@ Recovery philosophy:
 - closure-evidence diagnostics validate workflow readiness, not business-completion truth
 - AIWF may require each acceptance-criteria item to have a closure decision, but it does not decide whether the underlying business claim is true
 
+### 4.1 Derived evidence diagnostics
+
+`doctor` and `report` may expose a derived workflow-evidence view calculated
+from task-local events and the global event projection. It may summarize
+validation pass/fail counts, review-fix-revalidation correction loops, review
+freshness, authority consistency, local/global projection discrepancies,
+schema compatibility, metadata/latest-review status consistency, and last
+activity age. A `review_pass_but_nonfinal` flag
+means that a final review pass exists while metadata is not finalized; it is an
+observation, not a failure.
+
+Derived output is deterministic and read-only with respect to workflow state.
+It must not create a reliability score, classify a validation failure's cause or
+disposition, add a finalize blocker, add a phase, rewrite historical events, or
+create a second source of truth. `check --finalize-ready` and `finalize` use
+their existing policy diagnostics; Task 002 derived warnings are not included
+in that gate.
+
 ## 5. Compatibility Policy
 
 Supported compatibility tiers:
@@ -293,6 +368,7 @@ Supported compatibility tiers:
 - `ai-workflow-v1.4`
 - `ai-workflow-v1.5`
 - `ai-workflow-v1.6`
+- `ai-workflow-v1.7`
 
 Compatibility expectations:
 
@@ -300,6 +376,9 @@ Compatibility expectations:
 - newer validation rules should not require mass migration for historical records
 - exporter/checker must continue best-effort handling for older metadata versions
 - v1.6 adds event-backed lifecycle evidence, finalize-readiness path checks, review/validation ordering checks, and post-finalize evidence warnings
+- v1.7 adds `required_review_authority` task metadata and structured review
+  authority evidence; older finalized records remain readable without forced
+  migration
 - v1.7.0 adds task-level pre-edit guard semantics without changing finalize authority
 
 ## 6. Governance vs Enforcement Split
@@ -363,25 +442,31 @@ For future task naming, avoid duplicated numeric prefixes when possible to reduc
 
 Existing finalized task paths should not be renamed only for cosmetic cleanup.
 
-## 9. Event Logging v0.1 / v0.2
+## 9. Event Logging v0.1 / v0.2 / v0.3
 
 AIWF may optionally record task-local workflow events under:
 `<task_dir>/.aiwf/events.jsonl`
 
 Event logging is controlled by `.env` / environment variables.
 
-The event log is an append-only raw data source for reliability experiments and lightweight workflow audit. It is not workflow authority and is not a tamper-proof ledger. Workflow authority remains metadata validation, diagnostics, and finalize semantics.
+The event log is an append-only raw data source for reliability experiments and lightweight workflow audit. It is not workflow authority and is not a tamper-proof ledger. Workflow authority remains metadata validation, diagnostics, and finalize semantics. For derived projection checks, the task-local event log is the task evidence stream and `.aiwf/events/events.jsonl` is its global projection; discrepancies are reported and are not automatically repaired.
 
-Event logging must not change finalize behavior.
+Optional command-event logging must not change finalize behavior. Evidence
+events are themselves consumed by the existing v1.6+ finalize path.
 
 Schema compatibility:
 
 - command events remain readable in `aiwf-event-v0.1`.
-- newly recorded evidence events use normalized `aiwf-event-v0.2` with:
+- newly recorded evidence events use normalized `aiwf-event-v0.3` with:
   - `event_type` / `event_group`
   - `result.status`
   - `payload`
   - task/model/context fields for dataset analysis.
+  - review authority fields when the event records a review:
+    `required_review_authority`, `decision_authority`, and `recorded_by`.
+- `aiwf-event-v0.1` command events and `aiwf-event-v0.2` normalized evidence
+  remain readable. Historical event rows are not rewritten or migrated by
+  this release.
 - legacy evidence events using `event` + string `result` remain readable.
 
 `export-experiment` summarizes task event logs for experiment analysis.

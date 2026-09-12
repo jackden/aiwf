@@ -1,4 +1,4 @@
-# Basic Lifecycle Example (AIWF v1.6.1)
+# Basic Lifecycle Example (AIWF v1.7.14)
 
 ## End-to-End Command Flow
 ```bash
@@ -20,6 +20,8 @@
   --kind review \
   --result pass \
   --reviewer human \
+  --decision-authority human \
+  --recorded-by codex \
   --summary "review passed"
 ./aiwf check \
   --path .aiwf/records/ai_20260516/001_demo_aiwf_task \
@@ -33,8 +35,11 @@
 
 ## Clarifications
 - `transition --to validation` and `transition --to review` are recommended for readability.
-- AIWF v1.6.1 does not require strict `workflow_phase == review` before finalize.
-- Strict phase-gated finalize is deferred to v1.7.
+- AIWF v1.7.14 does not require strict `workflow_phase == review` before finalize.
+- The final review decision authority must satisfy the task's
+  `required_review_authority`; the recording actor may be different.
+- `doctor`/`report` derived evidence is observational and does not add a new
+  finalize gate.
 
 ## Negative Example: Post-Finalize Record Rejection
 ```bash

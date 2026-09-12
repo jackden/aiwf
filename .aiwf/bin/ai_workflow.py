@@ -55,6 +55,7 @@ import re
 import subprocess
 import sys
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -99,12 +100,14 @@ SCHEMA_V13 = "ai-workflow-v1.3"
 SCHEMA_V14 = "ai-workflow-v1.4"
 SCHEMA_V15 = "ai-workflow-v1.5"
 SCHEMA_V16 = "ai-workflow-v1.6"
-CURRENT_SCHEMA_VERSION = SCHEMA_V16
-SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16}
-WORKFLOW_PROTOCOL_VERSION = "1.7.8"
-AIWF_TOOL_VERSION = "1.7.13.post1"
+SCHEMA_V17 = "ai-workflow-v1.7"
+CURRENT_SCHEMA_VERSION = SCHEMA_V17
+SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17}
+WORKFLOW_PROTOCOL_VERSION = "1.7.9"
+AIWF_TOOL_VERSION = "1.7.14"
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.1"
-AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.2"
+AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.3"
+KNOWN_EVENT_SCHEMA_VERSIONS = {"legacy", AIWF_EVENT_SCHEMA_VERSION, "aiwf-event-v0.2", AIWF_EVIDENCE_EVENT_SCHEMA_VERSION}
 AIWF_EXPERIMENT_SCHEMA_VERSION = "aiwf-experiment-v0.1"
 AIWF_DATASET_SCHEMA_VERSION = "1"
 AIWF_PACKAGE_RECORDS_MANIFEST_SCHEMA_VERSION = "aiwf-package-records-manifest-v1"
@@ -149,6 +152,8 @@ ALLOWED_STATUS = {"draft", "active", "review", "blocked", "done", "archived"}
 ALLOWED_PRIORITY = {"P0", "P1", "P2", "P3"}
 ALLOWED_RISK = {"low", "medium", "high", "critical"}
 ALLOWED_REVIEW_STATUS = {"pending", "pass", "fail", "not_required"}
+REVIEW_AUTHORITY_VALUES = {"human", "ai-agent"}
+REVIEW_DECISION_AUTHORITY_VALUES = REVIEW_AUTHORITY_VALUES | {"not_required"}
 ALLOWED_WORKFLOW_PHASE = {"init", "implementation", "validation", "review", "finalized"}
 ALLOWED_PHASE_TRANSITIONS = {
     "init": {"implementation"},
@@ -172,12 +177,18 @@ TASK_METADATA_SCHEMA: dict[str, dict[str, Any]] = {
     "owner": {"type": "string", "required_in": SUPPORTED_SCHEMA_VERSIONS, "default": "ai-agent"},
     "reviewer": {"type": "string", "required_in": SUPPORTED_SCHEMA_VERSIONS, "default": "human"},
     "review_status": {"type": "string", "required_in": SUPPORTED_SCHEMA_VERSIONS, "enum": ALLOWED_REVIEW_STATUS, "default": "pending"},
+    "required_review_authority": {
+        "type": "string",
+        "required_in": {SCHEMA_V17},
+        "enum": REVIEW_AUTHORITY_VALUES,
+        "default": "human",
+    },
     "blocked_reason": {"type": "nullable_string", "required_in": SUPPORTED_SCHEMA_VERSIONS, "default": None},
-    "workflow_phase": {"type": "string", "required_in": {SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16}, "enum": ALLOWED_WORKFLOW_PHASE, "default": "implementation"},
-    "phase_entered_at": {"type": "nullable_string", "required_in": {SCHEMA_V16}, "default": None},
-    "finalized_at": {"type": "nullable_string", "required_in": {SCHEMA_V15, SCHEMA_V16}, "default": None},
-    "finalized_by": {"type": "nullable_string", "required_in": {SCHEMA_V15, SCHEMA_V16}, "default": None},
-    "review_not_required_reason": {"type": "nullable_string", "required_in": {SCHEMA_V16}, "default": None},
+    "workflow_phase": {"type": "string", "required_in": {SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17}, "enum": ALLOWED_WORKFLOW_PHASE, "default": "implementation"},
+    "phase_entered_at": {"type": "nullable_string", "required_in": {SCHEMA_V16, SCHEMA_V17}, "default": None},
+    "finalized_at": {"type": "nullable_string", "required_in": {SCHEMA_V15, SCHEMA_V16, SCHEMA_V17}, "default": None},
+    "finalized_by": {"type": "nullable_string", "required_in": {SCHEMA_V15, SCHEMA_V16, SCHEMA_V17}, "default": None},
+    "review_not_required_reason": {"type": "nullable_string", "required_in": {SCHEMA_V16, SCHEMA_V17}, "default": None},
     "created_at": {"type": "string", "required_in": SUPPORTED_SCHEMA_VERSIONS},
     "updated_at": {"type": "string", "required_in": SUPPORTED_SCHEMA_VERSIONS},
     "project": {"type": "string", "required_in": SUPPORTED_SCHEMA_VERSIONS, "default": "generic"},
@@ -715,7 +726,7 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-META-001": {"severity": "error", "message": "Front matter exists but metadata cannot be parsed.", "suggested_fix": "Use valid YAML front matter with key: value pairs and close it with ---."},
     "AIWF-META-LEGACY-001": {"severity": "warn", "message": "Legacy task without metadata front matter.", "suggested_fix": "Keep as legacy, or add metadata front matter if this task is migrated."},
     "AIWF-META-002": {"severity": "error", "message": "Missing metadata field: {field}.", "suggested_fix": "Add `{field}` to task.md front matter."},
-    "AIWF-META-003": {"severity": "error", "message": "Unsupported schema_version: {schema_version}.", "suggested_fix": "Use one of: legacy, ai-workflow-v1.2, ai-workflow-v1.3, ai-workflow-v1.4, ai-workflow-v1.5, ai-workflow-v1.6."},
+    "AIWF-META-003": {"severity": "error", "message": "Unsupported schema_version: {schema_version}.", "suggested_fix": "Use one of: legacy, ai-workflow-v1.2, ai-workflow-v1.3, ai-workflow-v1.4, ai-workflow-v1.5, ai-workflow-v1.6, ai-workflow-v1.7."},
     "AIWF-META-004": {"severity": "error", "message": "Invalid format for field {field}: {value}.", "suggested_fix": "Update `{field}` to match required format."},
     "AIWF-META-005": {"severity": "error", "message": "task_id mismatch: expected {expected}.", "suggested_fix": "Set `task_id: \"{expected}\"` to match the directory prefix."},
     "AIWF-META-006": {"severity": "error", "message": "task_name mismatch: expected {expected}.", "suggested_fix": "Set `task_name: \"{expected}\"` to match the directory suffix."},
@@ -783,11 +794,28 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-PATH-017": {"severity": "error", "message": "review not_required missing reason.", "suggested_fix": "Set review_not_required_reason with explicit rationale."},
     "AIWF-PATH-018": {"severity": "error", "message": "metadata review_status is inconsistent with latest review decision.", "suggested_fix": "Align metadata review_status with the latest review_recorded result."},
     "AIWF-PATH-019": {"severity": "error", "message": "Post-finalize evidence event detected: {event_type}.", "suggested_fix": "Remove post-finalize evidence events or reopen work in a new task before finalize."},
+    "AIWF-PATH-025": {"severity": "error", "message": "Latest review decision authority `{decision_authority}` does not satisfy required authority `{required_review_authority}`.", "suggested_fix": "Record a fresh final review with `--decision-authority {required_review_authority}`. `recorded_by` may remain the actor that records the decision."},
+    "AIWF-PATH-026": {"severity": "error", "message": "Latest final review is missing structured authority evidence: required_review_authority, decision_authority, and recorded_by must be consistent.", "suggested_fix": "Record a fresh review with explicit structured authority fields; workflow evidence is not cryptographic identity proof."},
+    "AIWF-PATH-027": {"severity": "error", "message": "Review event required authority `{event_required_review_authority}` disagrees with task required authority `{required_review_authority}`.", "suggested_fix": "Record a fresh review after aligning the task authority policy and event evidence."},
+    "AIWF-DERIVED-REVIEW-001": {"severity": "warn", "message": "Derived evidence shows {count} failed review decision(s) without a later fix.", "suggested_fix": "Inspect the review/fix event sequence; this diagnostic does not create a finalize gate."},
+    "AIWF-DERIVED-REVIEW-002": {"severity": "warn", "message": "Derived evidence shows {count} fix event(s) without a later validation pass.", "suggested_fix": "Run validation after the fix and record the result; this diagnostic does not create a new policy gate."},
+    "AIWF-DERIVED-REVIEW-003": {"severity": "warn", "message": "Derived evidence shows {count} failed review decision(s) without a later fresh final review.", "suggested_fix": "Inspect whether the correction loop needs a fresh review decision."},
+    "AIWF-DERIVED-REVIEW-004": {"severity": "warn", "message": "Derived evidence review status `{event_status}` disagrees with metadata review status `{metadata_status}`.", "suggested_fix": "Align task metadata with the latest review evidence; this warning does not create a finalize gate."},
+    "AIWF-DERIVED-VALIDATION-001": {"severity": "warn", "message": "Derived evidence shows {count} validation failure(s) without a later validation pass.", "suggested_fix": "Treat the result according to the existing workflow policy; unresolved validation evidence is reported here, not converted into a new finalize gate."},
+    "AIWF-DERIVED-AUTHORITY-001": {"severity": "warn", "message": "Derived evidence shows review authority consistency is `{consistency}` for required authority `{required_review_authority}`.", "suggested_fix": "Inspect structured authority evidence; this diagnostic is observational and does not create a finalize gate."},
+    "AIWF-DERIVED-PROJECTION-001": {"severity": "warn", "message": "Derived event projection is missing {count} task-local event(s) from the global event log.", "suggested_fix": "Inspect task-local and global event logs; this diagnostic is observational only."},
+    "AIWF-DERIVED-PROJECTION-002": {"severity": "warn", "message": "Derived event projection has {count} orphan global event(s) with no task-local match.", "suggested_fix": "Inspect the event projection and preserve historical evidence while resolving the discrepancy."},
+    "AIWF-DERIVED-PROJECTION-003": {"severity": "warn", "message": "Derived event projection contains {count} exact duplicate event occurrence(s).", "suggested_fix": "Review duplicate event rows; AIWF does not rewrite historical events automatically."},
+    "AIWF-DERIVED-PROJECTION-004": {"severity": "warn", "message": "Derived event projection has an ordering anomaly between task-local and global events.", "suggested_fix": "Inspect timestamps and source ordering; this diagnostic does not block finalize."},
+    "AIWF-DERIVED-SCHEMA-001": {"severity": "warn", "message": "Derived event evidence contains {count} unsupported schema event(s).", "suggested_fix": "Review the event schema version for compatibility; historical known legacy schemas remain readable."},
     "AIWF-PATH-020": {"severity": "error", "message": "Pending validation residue detected in closure artifact: {filename} / {section}.", "suggested_fix": "Replace pending validation template text with actual validation outcome or explicit skipped rationale before finalize."},
     "AIWF-PATH-021": {"severity": "error", "message": "Pending review residue detected in closure artifact: {filename} / {section}.", "suggested_fix": "Replace pending review template text with the actual review decision and reviewer attribution before finalize."},
     "AIWF-PATH-022": {"severity": "error", "message": "Default template residue detected in {filename} / {section}.", "suggested_fix": "Replace the generated template text in this required section with task-specific closure evidence before finalize."},
     "AIWF-PATH-023": {"severity": "error", "message": "Acceptance Criteria section exists but no item has a closure decision.", "suggested_fix": "Update each acceptance-criteria item to a closure state such as passed, deferred, or not applicable before finalize."},
     "AIWF-PATH-024": {"severity": "error", "message": "Acceptance Criteria contain unresolved or blocking closure states.", "suggested_fix": "Resolve unchecked/failed/blocked acceptance-criteria items, or mark them deferred/not applicable with rationale before finalize."},
+    "AIWF-REVIEW-AUTHORITY-001": {"severity": "error", "message": "Review result `{result}` requires an explicit decision authority.", "suggested_fix": "Record the review again with `--decision-authority human` or `--decision-authority ai-agent`."},
+    "AIWF-REVIEW-AUTHORITY-002": {"severity": "error", "message": "Review evidence requires a non-empty recorded_by actor.", "suggested_fix": "Set `--recorded-by <actor>` or configure a non-empty AIWF_ACTOR value."},
+    "AIWF-REVIEW-AUTHORITY-003": {"severity": "error", "message": "Review decision authority is invalid: `{decision_authority}`.", "suggested_fix": "Use `human`, `ai-agent`, or `not_required` only for the matching review result."},
     "AIWF-META-PROFILE-004": {"severity": "warn", "message": "Current profile points to a missing profile file.", "suggested_fix": "Run `./aiwf metadata profile list`, or `./aiwf metadata profile use <existing-profile>`, or create the missing profile."},
     "AIWF-META-RUNTIME-001": {"severity": "error", "message": "Invalid runtime metadata option {option}: {value}.", "suggested_fix": "Use `AIWF_EVENT_LOG=1` to enable event logging or `AIWF_EVENT_LOG=0` to disable it."},
     "AIWF-FINALIZED-001": {"severity": "warn", "message": "Finalized task modified after finalized_at.", "suggested_fix": "Review post-finalize edits and rerun check/doctor before additional changes."},
@@ -3412,6 +3440,7 @@ SCHEMA_RANK = {
     SCHEMA_V14: 14,
     SCHEMA_V15: 15,
     SCHEMA_V16: 16,
+    SCHEMA_V17: 17,
 }
 
 
@@ -4584,6 +4613,107 @@ def _event_result_status(event: dict[str, Any]) -> str:
     return str(result or "")
 
 
+def _event_field(event: Mapping[str, Any], field_name: str) -> Any:
+    if field_name in event:
+        return event.get(field_name)
+    payload = event.get("payload")
+    if isinstance(payload, Mapping) and field_name in payload:
+        return payload.get(field_name)
+    return None
+
+
+def _task_required_review_authority(metadata: Mapping[str, Any]) -> Optional[str]:
+    schema_version = str(metadata.get("schema_version", LEGACY_SCHEMA_VERSION))
+    finalized = str(metadata.get("status", "")) == "done" or str(metadata.get("workflow_phase", "")) == "finalized"
+    if schema_version != SCHEMA_V17 and finalized:
+        # Historical finalized records are not retroactively invalidated by
+        # the v1.8 authority semantics.
+        return None
+
+    explicit = str(metadata.get("required_review_authority", "")).strip()
+    if explicit in REVIEW_AUTHORITY_VALUES:
+        return explicit
+
+    # Older records may have an explicit Human workflow role but no structured
+    # authority field. They remain readable, but an active Human-required task
+    # cannot use that legacy gap to close without authority evidence.
+    if schema_version in SUPPORTED_SCHEMA_VERSIONS and str(metadata.get("reviewer", "")).strip() == "human":
+        return "human"
+    return None
+
+
+def _collect_review_authority_diagnostics(
+    root: Path,
+    task_dir: Path,
+    metadata: Mapping[str, Any],
+    review_event: Mapping[str, Any],
+    review_result: str,
+) -> list[Diagnostic]:
+    required = _task_required_review_authority(metadata)
+    if required is None:
+        return []
+
+    schema_version = str(metadata.get("schema_version", LEGACY_SCHEMA_VERSION))
+    formal_semantics = schema_version == SCHEMA_V17
+    event_required = _event_field(review_event, "required_review_authority")
+    decision = _event_field(review_event, "decision_authority")
+    recorded_by = _event_field(review_event, "recorded_by")
+    diagnostics: list[Diagnostic] = []
+
+    if review_result == "not_required":
+        if not formal_semantics:
+            # Pre-v1.7 tasks used the review result/reason fields as their
+            # not-required contract. Do not retroactively require structured
+            # authority fields for that legacy result.
+            return diagnostics
+        if not isinstance(event_required, str):
+            diagnostics.append(make_diagnostic("AIWF-PATH-026", rel(root, _metadata_path(root, task_dir)), blocker=True))
+        elif event_required != required:
+            diagnostics.append(
+                make_diagnostic(
+                    "AIWF-PATH-027",
+                    rel(root, _metadata_path(root, task_dir)),
+                    blocker=True,
+                    event_required_review_authority=event_required,
+                    required_review_authority=required,
+                )
+            )
+        if decision != "not_required":
+            diagnostics.append(make_diagnostic("AIWF-PATH-026", rel(root, _metadata_path(root, task_dir)), blocker=True))
+        if not isinstance(recorded_by, str) or not recorded_by.strip():
+            diagnostics.append(make_diagnostic("AIWF-PATH-026", rel(root, _metadata_path(root, task_dir)), blocker=True))
+        return diagnostics
+
+    if formal_semantics and not isinstance(event_required, str):
+        diagnostics.append(make_diagnostic("AIWF-PATH-026", rel(root, _metadata_path(root, task_dir)), blocker=True))
+    elif isinstance(event_required, str) and event_required != required:
+        diagnostics.append(
+            make_diagnostic(
+                "AIWF-PATH-027",
+                rel(root, _metadata_path(root, task_dir)),
+                blocker=True,
+                event_required_review_authority=event_required,
+                required_review_authority=required,
+            )
+        )
+
+    decision_is_valid = isinstance(decision, str) and decision in REVIEW_AUTHORITY_VALUES
+    if not decision_is_valid or not isinstance(recorded_by, str) or not recorded_by.strip():
+        diagnostics.append(make_diagnostic("AIWF-PATH-026", rel(root, _metadata_path(root, task_dir)), blocker=True))
+        return diagnostics
+    if decision != required:
+        diagnostics.append(
+            make_diagnostic(
+                "AIWF-PATH-025",
+                rel(root, _metadata_path(root, task_dir)),
+                blocker=True,
+                decision_authority=decision,
+                required_review_authority=required,
+            )
+        )
+    return diagnostics
+
+
 def _event_group(event_type: str) -> str:
     if event_type in {"phase_transition", "finalize_success"}:
         return "workflow"
@@ -4605,6 +4735,9 @@ def _event_payload_from_legacy(event: dict[str, Any]) -> dict[str, Any]:
         "workflow_mode",
         "actor",
         "model",
+        "required_review_authority",
+        "decision_authority",
+        "recorded_by",
         "result",
     }:
         payload.pop(key, None)
@@ -4744,7 +4877,19 @@ def _collect_path_policy_diagnostics(
                     )
                     break
 
-    if not include_finalize_checks or not is_v16:
+    if not include_finalize_checks:
+        return diagnostics
+
+    if not is_v16:
+        # Apply authority policy to active legacy tasks without importing the
+        # v1.6 validation/freshness gates into those schema generations.
+        if _task_required_review_authority(metadata) is not None:
+            _review_index, review_event = _latest_review_decision(events)
+            review_result = _event_result_status(review_event) if review_event else ""
+            if review_result not in FINAL_REVIEW_RESULTS:
+                diagnostics.append(make_diagnostic("AIWF-PATH-026", rel(root, _metadata_path(root, task_dir)), blocker=True))
+            else:
+                diagnostics.extend(_collect_review_authority_diagnostics(root, task_dir, metadata, review_event, review_result))
         return diagnostics
 
     # Validation evidence policy.
@@ -4775,6 +4920,16 @@ def _collect_path_policy_diagnostics(
             diagnostics.append(make_diagnostic("AIWF-PATH-017", rel(root, _metadata_path(root, task_dir)), blocker=True))
         if latest_review_result in FINAL_REVIEW_RESULTS and review_status != latest_review_result:
             diagnostics.append(make_diagnostic("AIWF-PATH-018", rel(root, _metadata_path(root, task_dir)), blocker=True))
+        if latest_review_result in FINAL_REVIEW_RESULTS:
+            diagnostics.extend(
+                _collect_review_authority_diagnostics(
+                    root,
+                    task_dir,
+                    metadata,
+                    latest_review_event,
+                    latest_review_result,
+                )
+            )
 
     # Review fail -> fix policy.
     if review_fail_indexes:
@@ -5100,6 +5255,8 @@ def record_command(
     command: Optional[str],
     reviewer: Optional[str],
     summary: Optional[str],
+    decision_authority: Optional[str] = None,
+    recorded_by: Optional[str] = None,
 ) -> int:
     target = _resolve_command_target_path(root, raw_target)
     if target is None:
@@ -5156,6 +5313,43 @@ def record_command(
             event["reviewer"] = reviewer
         if summary:
             event["summary"] = summary
+
+        schema_version = str(metadata.get("schema_version", LEGACY_SCHEMA_VERSION))
+        formal_semantics = schema_version == SCHEMA_V17
+        required_authority = _task_required_review_authority(metadata)
+        if required_authority is not None and schema_version != SCHEMA_V17 and "required_review_authority" not in metadata:
+            # Preserve an inferred Human policy before projecting a possibly
+            # agent-owned reviewer role below. This is a compatibility
+            # snapshot, not a mass migration of legacy records.
+            metadata["required_review_authority"] = required_authority
+        authority = decision_authority.strip() if isinstance(decision_authority, str) else None
+        if formal_semantics and (
+            authority not in REVIEW_DECISION_AUTHORITY_VALUES
+            or (result != "not_required" and authority == "not_required")
+            or (result == "not_required" and authority != "not_required")
+        ):
+            diag = make_diagnostic(
+                "AIWF-REVIEW-AUTHORITY-001" if authority is None else "AIWF-REVIEW-AUTHORITY-003",
+                rel(root, target),
+                blocker=True,
+                result=result,
+                decision_authority=authority or "(missing)",
+            )
+            _print_diagnostics([diag])
+            return 2
+
+        if formal_semantics or decision_authority is not None or recorded_by is not None:
+            actor = recorded_by.strip() if isinstance(recorded_by, str) else str(load_aiwf_env(root).get("AIWF_ACTOR", "tool")).strip()
+            if not actor:
+                diag = make_diagnostic("AIWF-REVIEW-AUTHORITY-002", rel(root, target), blocker=True)
+                _print_diagnostics([diag])
+                return 2
+            event["recorded_by"] = actor
+            if authority is not None:
+                event["decision_authority"] = authority
+            if required_authority is not None:
+                event["required_review_authority"] = required_authority
+
         metadata["review_status"] = result
         if reviewer:
             metadata["reviewer"] = reviewer
@@ -6075,6 +6269,9 @@ def _append_evidence_event(root: Path, task_dir: Path, event: dict[str, Any]) ->
         "result": {"status": result_status},
         "payload": payload_data,
     }
+    for field_name in ("required_review_authority", "decision_authority", "recorded_by"):
+        if field_name in event:
+            normalized[field_name] = event[field_name]
     for key, value in payload_data.items():
         normalized.setdefault(key, value)
     _append_raw_event(root, task_dir, normalized)
@@ -6304,6 +6501,407 @@ def _load_jsonl_events_with_stats(path: Path) -> tuple[list[dict[str, Any]], int
             continue
         events.append(item)
     return events, malformed_count
+
+
+def _event_targets_task(root: Path, event: Mapping[str, Any], task_dir: Path) -> bool:
+    task_rel = rel(root, task_dir)
+    explicit_path_seen = False
+    for field_name in ("task_path", "task_dir", "task"):
+        if field_name not in event and not (
+            isinstance(event.get("payload"), Mapping) and field_name in event.get("payload", {})
+        ):
+            continue
+        explicit_path_seen = True
+        value = _event_field(event, field_name)
+        normalized = _normalize_repo_relative_path(root, value)
+        if normalized is not None:
+            if normalized == task_rel:
+                return True
+            continue
+        if field_name == "task" and isinstance(value, str):
+            if value.strip() == task_dir.name:
+                return True
+
+    if explicit_path_seen:
+        return False
+    task_id, _task_name = split_task_dir_name(task_dir)
+    event_task_id = _event_field(event, "task_id")
+    return bool(task_id and isinstance(event_task_id, str) and event_task_id.strip() == task_id)
+
+
+def _canonical_event_projection_key(root: Path, event: Mapping[str, Any]) -> str:
+    # Projection writes the same raw event to both logs. Preserve every field
+    # (including provenance, schema and extensions); only JSON key order and
+    # whitespace are irrelevant to exact event equality.
+    return json.dumps(dict(event), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _event_schema_compatibility(events: Sequence[Mapping[str, Any]]) -> tuple[str, int, int]:
+    schema_versions = {str(event.get("schema_version", "legacy")) for event in events}
+    legacy_count = sum(
+        1
+        for event in events
+        if str(event.get("schema_version", "legacy")) in {"legacy", "aiwf-event-v0.1", "aiwf-event-v0.2"}
+    )
+    unsupported_count = sum(
+        1 for event in events if str(event.get("schema_version", "legacy")) not in KNOWN_EVENT_SCHEMA_VERSIONS
+    )
+    if not schema_versions:
+        compatibility = "none"
+    elif unsupported_count:
+        compatibility = "unknown"
+    elif any(version == AIWF_EVIDENCE_EVENT_SCHEMA_VERSION for version in schema_versions):
+        compatibility = "mixed" if legacy_count else "current"
+    else:
+        compatibility = "legacy"
+    return compatibility, legacy_count, unsupported_count
+
+
+def _format_activity_age(timestamp: Optional[dt.datetime]) -> Optional[str]:
+    if timestamp is None:
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+    seconds = max(0, int((dt.datetime.now(dt.timezone.utc) - timestamp).total_seconds()))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def build_derived_evidence_summary(root: Path, task_dir: Path) -> dict[str, Any]:
+    metadata_payload = load_task_metadata(task_dir)
+    metadata = metadata_payload.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+
+    local_events, local_malformed = _load_events_with_stats(task_dir)
+    global_events_all, global_malformed = _load_jsonl_events_with_stats(get_event_log_path(root))
+    global_events = [event for event in global_events_all if _event_targets_task(root, event, task_dir)]
+    source_events: Sequence[Mapping[str, Any]] = local_events if local_events else global_events
+
+    review_events = [event for event in local_events if _event_type(event) == "review_recorded"]
+    validation_events = [event for event in local_events if _event_type(event) == "validation_recorded"]
+    fix_events = [event for event in local_events if _event_type(event) == "fix_recorded"]
+    review_fail_indexes = [idx for idx, event in enumerate(local_events) if _event_type(event) == "review_recorded" and _event_result_status(event) == "fail"]
+    fix_indexes = [idx for idx, event in enumerate(local_events) if _event_type(event) == "fix_recorded"]
+    validation_pass_indexes = [idx for idx, event in enumerate(local_events) if _event_type(event) == "validation_recorded" and _event_result_status(event) == "pass"]
+    validation_fail_indexes = [idx for idx, event in enumerate(local_events) if _event_type(event) == "validation_recorded" and _event_result_status(event) == "fail"]
+    final_review_indexes = [
+        idx
+        for idx, event in enumerate(local_events)
+        if _event_type(event) == "review_recorded" and _event_result_status(event) in FINAL_REVIEW_RESULTS
+    ]
+
+    review_fail_with_later_fix = sum(1 for idx in review_fail_indexes if any(fix_idx > idx for fix_idx in fix_indexes))
+    fix_with_fresh_validation = sum(1 for idx in fix_indexes if any(val_idx > idx for val_idx in validation_pass_indexes))
+    review_fail_with_fresh_review = sum(
+        1
+        for idx in review_fail_indexes
+        if any(review_idx > idx for review_idx in final_review_indexes)
+    )
+    validation_fail_with_later_pass = sum(
+        1 for idx in validation_fail_indexes if any(val_idx > idx for val_idx in validation_pass_indexes)
+    )
+
+    latest_review = review_events[-1] if review_events else None
+    latest_review_status = _event_result_status(latest_review) if latest_review else "none"
+    latest_review_index = final_review_indexes[-1] if final_review_indexes else -1
+    last_relevant_index = max(
+        [
+            idx
+            for idx, event in enumerate(local_events)
+            if _event_type(event) in {"fix_recorded", "review_recorded"}
+            and (_event_result_status(event) == "fail" or _event_type(event) == "fix_recorded")
+        ]
+        or [-1]
+    )
+    if latest_review is None:
+        review_freshness = "missing"
+    elif latest_review_status not in FINAL_REVIEW_RESULTS:
+        review_freshness = "non_final"
+    elif latest_review_index > last_relevant_index:
+        review_freshness = "fresh"
+    else:
+        review_freshness = "stale"
+
+    required_authority = _task_required_review_authority(metadata)
+    if required_authority is None:
+        required_authority_value = "legacy_unspecified"
+    else:
+        required_authority_value = required_authority
+    decision_authority = _event_field(latest_review, "decision_authority") if latest_review else None
+    recorded_by = _event_field(latest_review, "recorded_by") if latest_review else None
+    if latest_review is None:
+        authority_consistency = "pending"
+    elif required_authority is None:
+        authority_consistency = "legacy_compatible"
+    else:
+        authority_codes = {
+            item.code for item in _collect_review_authority_diagnostics(
+                root, task_dir, metadata, latest_review, latest_review_status
+            )
+        }
+        if authority_codes & {"AIWF-PATH-025", "AIWF-PATH-027"}:
+            authority_consistency = "inconsistent"
+        elif authority_codes:
+            authority_consistency = "missing"
+        else:
+            authority_consistency = "not_applicable" if latest_review_status == "not_required" else "consistent"
+
+    local_keys = [_canonical_event_projection_key(root, event) for event in local_events]
+    global_keys = [_canonical_event_projection_key(root, event) for event in global_events]
+    local_counts = Counter(local_keys)
+    global_counts = Counter(global_keys)
+    missing_global_count = sum(max(count - global_counts.get(key, 0), 0) for key, count in local_counts.items())
+    orphan_global_count = sum(max(count - local_counts.get(key, 0), 0) for key, count in global_counts.items())
+    local_duplicate_count = sum(max(count - 1, 0) for count in local_counts.values())
+    global_duplicate_count = sum(max(count - 1, 0) for count in global_counts.values())
+    ordering_anomaly = bool(local_keys and global_keys and local_keys != global_keys and missing_global_count == 0 and orphan_global_count == 0)
+    schema_events_by_key: dict[str, Mapping[str, Any]] = {}
+    for event in [*local_events, *global_events]:
+        schema_events_by_key.setdefault(_canonical_event_projection_key(root, event), event)
+    schema_events = list(schema_events_by_key.values())
+    compatibility, legacy_schema_count, unsupported_schema_count = _event_schema_compatibility(schema_events)
+    local_compatibility, _local_legacy_schema_count, _local_unsupported_schema_count = _event_schema_compatibility(local_events)
+    global_compatibility, _global_legacy_schema_count, _global_unsupported_schema_count = _event_schema_compatibility(global_events)
+
+    activity_timestamp: Optional[dt.datetime] = None
+    activity_raw: Optional[str] = None
+    for event in source_events:
+        parsed = _parse_iso_timestamp(event.get("timestamp"))
+        if parsed is not None and (activity_timestamp is None or parsed >= activity_timestamp):
+            activity_timestamp = parsed
+            activity_raw = str(event.get("timestamp"))
+    if activity_timestamp is None:
+        fallback = metadata.get("updated_at") or metadata.get("created_at")
+        if isinstance(fallback, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", fallback.strip()):
+            activity_timestamp = dt.datetime.fromisoformat(fallback.strip()).replace(tzinfo=dt.timezone.utc)
+            activity_raw = f"{fallback.strip()}T00:00:00Z"
+
+    metadata_review_status = str(metadata.get("review_status", ""))
+    review_status_consistent = bool(
+        latest_review_status in FINAL_REVIEW_RESULTS
+        and metadata_review_status == latest_review_status
+    )
+
+    evidence_ready = bool(
+        latest_review_status in FINAL_REVIEW_RESULTS
+        and review_status_consistent
+        and review_freshness == "fresh"
+        and validation_pass_indexes
+        and review_fail_with_later_fix == len(review_fail_indexes)
+        and fix_with_fresh_validation == len(fix_indexes)
+        and review_fail_with_fresh_review == len(review_fail_indexes)
+        and authority_consistency in {"consistent", "not_applicable", "legacy_compatible"}
+    )
+    finalized = str(metadata.get("status", "")) == "done" or str(metadata.get("workflow_phase", "")) == "finalized"
+    if finalized:
+        derived_status = "finalized"
+    elif str(metadata.get("status", "")) == "blocked":
+        derived_status = "blocked"
+    elif review_fail_indexes and review_fail_with_later_fix < len(review_fail_indexes):
+        derived_status = "review_failed_pending_fix"
+    elif fix_indexes and fix_with_fresh_validation < len(fix_indexes):
+        derived_status = "validation_pending"
+    elif review_fail_indexes and review_fail_with_fresh_review < len(review_fail_indexes):
+        derived_status = "waiting_review"
+    elif evidence_ready:
+        derived_status = "finalize_ready"
+    elif latest_review_status == "pass":
+        derived_status = "review_pass_but_nonfinal"
+    elif latest_review_status == "not_required":
+        derived_status = "review_pass_but_nonfinal"
+    elif latest_review_status == "fail":
+        derived_status = "waiting_review"
+    elif str(metadata.get("review_status", "")) == "pending":
+        derived_status = "waiting_review"
+    else:
+        derived_status = "active"
+
+    return {
+        "derived_status": derived_status,
+        "validation": {
+            "pass_count": len(validation_pass_indexes),
+            "fail_count": len(validation_fail_indexes),
+            "later_pass_after_failure": validation_fail_with_later_pass == len(validation_fail_indexes) if validation_fail_indexes else False,
+            "fail_without_later_pass_count": len(validation_fail_indexes) - validation_fail_with_later_pass,
+        },
+        "review": {
+            "fail_count": len(review_fail_indexes),
+            "fail_with_later_fix": review_fail_with_later_fix,
+            "fix_count": len(fix_indexes),
+            "fix_with_fresh_validation": fix_with_fresh_validation,
+            "fail_with_fresh_review": review_fail_with_fresh_review,
+            "latest_status": latest_review_status,
+            "metadata_status": metadata_review_status,
+            "metadata_status_consistent": review_status_consistent,
+            "freshness": review_freshness,
+            "pass_but_nonfinal": latest_review_status == "pass" and not finalized,
+        },
+        "authority": {
+            "required_review_authority": required_authority_value,
+            "decision_authority": decision_authority,
+            "recorded_by": recorded_by,
+            "consistency": authority_consistency,
+        },
+        "closure": {
+            "evidence_ready": evidence_ready,
+            "finalized": finalized,
+        },
+        "projection": {
+            "local_event_count": len(local_events),
+            "global_event_count": len(global_events),
+            "missing_global_event_count": missing_global_count,
+            "orphan_global_event_count": orphan_global_count,
+            "local_duplicate_event_count": local_duplicate_count,
+            "global_duplicate_event_count": global_duplicate_count,
+            "duplicate_event_count": local_duplicate_count + global_duplicate_count,
+            "ordering_anomaly": ordering_anomaly,
+            "compatibility": compatibility,
+            "legacy_schema_count": legacy_schema_count,
+            "unsupported_schema_count": unsupported_schema_count,
+            "local_schema_compatibility": local_compatibility,
+            "global_schema_compatibility": global_compatibility,
+            "local_malformed_count": local_malformed,
+            "global_malformed_count": global_malformed,
+        },
+        "activity": {
+            "last_activity_timestamp": activity_raw,
+            "age_since_last_activity": _format_activity_age(activity_timestamp),
+        },
+    }
+
+
+def _collect_derived_evidence_diagnostics(
+    root: Path,
+    task_dir: Path,
+    summary: Optional[dict[str, Any]] = None,
+) -> list[Diagnostic]:
+    summary = summary or build_derived_evidence_summary(root, task_dir)
+    diagnostics: list[Diagnostic] = []
+    task_path = rel(root, task_dir)
+    validation = summary["validation"]
+    review = summary["review"]
+    authority = summary["authority"]
+    projection = summary["projection"]
+
+    unresolved_review_fixes = review["fail_count"] - review["fail_with_later_fix"]
+    if unresolved_review_fixes:
+        diagnostics.append(make_diagnostic("AIWF-DERIVED-REVIEW-001", task_path, count=unresolved_review_fixes))
+    unresolved_fix_validation = review["fix_count"] - review["fix_with_fresh_validation"]
+    if unresolved_fix_validation:
+        diagnostics.append(make_diagnostic("AIWF-DERIVED-REVIEW-002", task_path, count=unresolved_fix_validation))
+    unresolved_fresh_reviews = review["fail_count"] - review["fail_with_fresh_review"]
+    if unresolved_fresh_reviews:
+        diagnostics.append(make_diagnostic("AIWF-DERIVED-REVIEW-003", task_path, count=unresolved_fresh_reviews))
+    if review["latest_status"] in FINAL_REVIEW_RESULTS and not review["metadata_status_consistent"]:
+        diagnostics.append(
+            make_diagnostic(
+                "AIWF-DERIVED-REVIEW-004",
+                task_path,
+                event_status=review["latest_status"],
+                metadata_status=review["metadata_status"],
+            )
+        )
+    unresolved_validation = validation["fail_without_later_pass_count"]
+    if unresolved_validation:
+        diagnostics.append(make_diagnostic("AIWF-DERIVED-VALIDATION-001", task_path, count=unresolved_validation))
+    if authority["consistency"] in {"inconsistent", "missing"}:
+        diagnostics.append(
+            make_diagnostic(
+                "AIWF-DERIVED-AUTHORITY-001",
+                task_path,
+                consistency=authority["consistency"],
+                required_review_authority=authority["required_review_authority"],
+            )
+        )
+    if projection["missing_global_event_count"]:
+        diagnostics.append(
+            make_diagnostic(
+                "AIWF-DERIVED-PROJECTION-001",
+                task_path,
+                count=projection["missing_global_event_count"],
+            )
+        )
+    if projection["orphan_global_event_count"]:
+        diagnostics.append(
+            make_diagnostic(
+                "AIWF-DERIVED-PROJECTION-002",
+                task_path,
+                count=projection["orphan_global_event_count"],
+            )
+        )
+    if projection["duplicate_event_count"]:
+        diagnostics.append(
+            make_diagnostic(
+                "AIWF-DERIVED-PROJECTION-003",
+                task_path,
+                count=projection["duplicate_event_count"],
+            )
+        )
+    if projection["ordering_anomaly"]:
+        diagnostics.append(make_diagnostic("AIWF-DERIVED-PROJECTION-004", task_path))
+    if projection["unsupported_schema_count"]:
+        diagnostics.append(
+            make_diagnostic(
+                "AIWF-DERIVED-SCHEMA-001",
+                task_path,
+                count=projection["unsupported_schema_count"],
+            )
+        )
+    return diagnostics
+
+
+def _print_derived_evidence_summary(summary: Mapping[str, Any]) -> None:
+    validation = summary.get("validation", {})
+    review = summary.get("review", {})
+    authority = summary.get("authority", {})
+    closure = summary.get("closure", {})
+    projection = summary.get("projection", {})
+    activity = summary.get("activity", {})
+    print("\nWorkflow Evidence Summary")
+    print("Validation:")
+    print(f"  pass: {validation.get('pass_count', 0)}")
+    print(f"  fail: {validation.get('fail_count', 0)}")
+    print(f"  later_pass_after_failure: {'yes' if validation.get('later_pass_after_failure') else 'no'}")
+    print("Review:")
+    print(f"  fail: {review.get('fail_count', 0)}")
+    print(f"  corrected_after_fail: {review.get('fail_with_later_fix', 0)}/{review.get('fail_count', 0)}")
+    print(f"  fresh_review_after_fail: {review.get('fail_with_fresh_review', 0)}/{review.get('fail_count', 0)}")
+    print(f"  latest_status: {review.get('latest_status', 'none')}")
+    print(f"  metadata_status: {review.get('metadata_status', 'unknown') or 'unknown'}")
+    print(f"  metadata_status_consistent: {'yes' if review.get('metadata_status_consistent') else 'no'}")
+    print(f"  freshness: {review.get('freshness', 'missing')}")
+    print(f"  pass_but_nonfinal: {'yes' if review.get('pass_but_nonfinal') else 'no'}")
+    print("Authority:")
+    print(f"  required: {authority.get('required_review_authority', 'legacy_unspecified')}")
+    print(f"  decision: {authority.get('decision_authority') or 'unknown'}")
+    print(f"  recorded_by: {authority.get('recorded_by') or 'unknown'}")
+    print(f"  consistent: {authority.get('consistency', 'pending')}")
+    print("Closure:")
+    print(f"  evidence_ready: {'yes' if closure.get('evidence_ready') else 'no'}")
+    print(f"  finalized: {'yes' if closure.get('finalized') else 'no'}")
+    print("Projection:")
+    print(f"  missing: {projection.get('missing_global_event_count', 0)}")
+    print(f"  orphan: {projection.get('orphan_global_event_count', 0)}")
+    print(f"  duplicates: {projection.get('duplicate_event_count', 0)}")
+    print(f"  ordering_anomaly: {'yes' if projection.get('ordering_anomaly') else 'no'}")
+    print(f"  schema_compatibility: {projection.get('compatibility', 'none')}")
+    print(f"  local_schema_compatibility: {projection.get('local_schema_compatibility', 'none')}")
+    print(f"  global_schema_compatibility: {projection.get('global_schema_compatibility', 'none')}")
+    print("Activity:")
+    print(f"  last_activity_timestamp: {activity.get('last_activity_timestamp') or 'unknown'}")
+    print(f"  age_since_last_activity: {activity.get('age_since_last_activity') or 'unknown'}")
+    print(f"Derived status: {summary.get('derived_status', 'unknown')}")
 
 
 def _dataset_task_indexes(root: Path, task_dirs: Sequence[Path]) -> dict[str, dict[str, set[str]]]:
@@ -8721,6 +9319,7 @@ def _diagnostic_ranking(root: Path, task_dirs: Sequence[Path]) -> list[dict[str,
             v11_missing_is_fail=True,
             include_finalize_checks=True,
         )
+        diagnostics.extend(_collect_derived_evidence_diagnostics(root, task_dir))
         for diag in diagnostics:
             if diag.severity == "info":
                 continue
@@ -8740,6 +9339,9 @@ def build_report_payload(root: Path, raw_target: Optional[str]) -> dict[str, Any
     finalized_count = 0
     draft_count = 0
     review_count = 0
+    derived_status_counts: dict[str, int] = {}
+    derived_diagnostic_count = 0
+    derived_diagnostic_task_count = 0
 
     for task_dir in task_dirs:
         metadata_payload = load_task_metadata(task_dir)
@@ -8777,6 +9379,13 @@ def build_report_payload(root: Path, raw_target: Optional[str]) -> dict[str, Any
 
         date_token = task_dir.parent.name.replace("ai_", "", 1) if AI_DATE_RE.match(task_dir.parent.name) else ""
         task_id, task_name = split_task_dir_name(task_dir)
+        derived_summary = build_derived_evidence_summary(root, task_dir)
+        derived_diagnostics = _collect_derived_evidence_diagnostics(root, task_dir, derived_summary)
+        derived_status = str(derived_summary.get("derived_status", "unknown"))
+        derived_status_counts[derived_status] = derived_status_counts.get(derived_status, 0) + 1
+        derived_diagnostic_count += len(derived_diagnostics)
+        if derived_diagnostics:
+            derived_diagnostic_task_count += 1
         task_entry = {
             "date": date_token,
             "task_id": task_id or "",
@@ -8793,6 +9402,9 @@ def build_report_payload(root: Path, raw_target: Optional[str]) -> dict[str, Any
             "latest_event_status": latest_event_status,
             "legacy_task": str(metadata.get("schema_version", LEGACY_SCHEMA_VERSION)) == LEGACY_SCHEMA_VERSION,
             "event_schema_versions": event_schema_versions,
+            "derived_status": derived_status,
+            "derived_evidence": derived_summary,
+            "derived_diagnostic_codes": [item.code for item in derived_diagnostics],
         }
         tasks.append(task_entry)
 
@@ -8814,6 +9426,9 @@ def build_report_payload(root: Path, raw_target: Optional[str]) -> dict[str, Any
             "malformed_event_count": malformed_total,
             "blocked_event_count": blocked_events,
             "post_finalize_event_count": post_finalize_total,
+            "derived_status_counts": derived_status_counts,
+            "derived_diagnostic_count": derived_diagnostic_count,
+            "derived_diagnostic_task_count": derived_diagnostic_task_count,
         },
         "diagnostic_code_ranking": _diagnostic_ranking(root, task_dirs),
         "tasks": tasks,
@@ -8841,6 +9456,8 @@ def _render_report_markdown(payload: dict[str, Any]) -> str:
         "malformed_event_count",
         "blocked_event_count",
         "post_finalize_event_count",
+        "derived_diagnostic_count",
+        "derived_diagnostic_task_count",
     ]:
         lines.append(f"| {key} | {summary.get(key, 0)} |")
 
@@ -8862,18 +9479,19 @@ def _render_report_markdown(payload: dict[str, Any]) -> str:
         [
             "",
             "## Tasks",
-            "| Date | Task | Status | Phase | Review | Events |",
-            "|---|---|---|---|---|---:|",
+            "| Date | Task | Status | Phase | Review | Derived | Events |",
+            "|---|---|---|---|---|---|---:|",
         ]
     )
     for task in tasks:
         task_label = f"{task.get('task_id', '')}_{task.get('task_name', '')}".strip("_")
         lines.append(
             f"| {task.get('date', '')} | {task_label} | {task.get('status', '')} | "
-            f"{task.get('workflow_phase', '')} | {task.get('review_status', '')} | {task.get('event_count', 0)} |"
+            f"{task.get('workflow_phase', '')} | {task.get('review_status', '')} | "
+            f"{task.get('derived_status', '')} | {task.get('event_count', 0)} |"
         )
     if not tasks:
-        lines.append("| - | - | - | - | - | 0 |")
+        lines.append("| - | - | - | - | - | - | 0 |")
     return "\n".join(lines) + "\n"
 
 
@@ -9259,9 +9877,12 @@ def doctor_command(root: Path, raw_target: str) -> int:
         v11_missing_is_fail=True,
         include_finalize_checks=True,
     )
+    derived_summary = build_derived_evidence_summary(root, target)
+    diagnostics.extend(_collect_derived_evidence_diagnostics(root, target, derived_summary))
     err, warn = _print_diagnostics(diagnostics)
     blockers = sum(1 for item in diagnostics if item.blocker and item.severity == "error")
     print(f"\nSummary: {len(diagnostics)} findings, {err} ERROR, {warn} WARN, {blockers} finalize blockers")
+    _print_derived_evidence_summary(derived_summary)
     exit_code = 2 if err else 0
     _try_append_aiwf_event(root, target, command="doctor", exit_code=exit_code, diagnostics=diagnostics)
     return exit_code
@@ -9560,6 +10181,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--result", default=None, help="result value for validation/review records")
     p.add_argument("--command", default=None, help="command string evidence only (not executed)")
     p.add_argument("--reviewer", default=None, help="reviewer name for review records")
+    p.add_argument(
+        "--decision-authority",
+        default=None,
+        help="decision authority for review records: human, ai-agent, or not_required",
+    )
+    p.add_argument("--recorded-by", default=None, help="actor that records the review decision; defaults to AIWF_ACTOR")
     p.add_argument("--summary", default=None, help="summary for review/fix/safety evidence")
     p.set_defaults(
         func=lambda a, r: record_command(
@@ -9570,6 +10197,8 @@ def build_parser() -> argparse.ArgumentParser:
             command=a.command,
             reviewer=a.reviewer,
             summary=a.summary,
+            decision_authority=a.decision_authority,
+            recorded_by=a.recorded_by,
         )
     )
 
