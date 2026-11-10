@@ -101,7 +101,7 @@ related_tasks:
 
 ## Metadata CLI Validation Hints
 
-`./aiwf metadata validate` emits targeted guidance for AI agent attribution metadata:
+`./aiwf metadata validate` emits targeted guidance for configured context metadata:
 
 - `AIWF-META-001` for invalid `source`
 - `AIWF-META-002` for invalid `confidence`
@@ -165,3 +165,10 @@ task table or `Total: 0` line is printed.
 - `AIWF-PATH-025` through `AIWF-PATH-027` are finalize-readiness errors for
   structured review authority consistency. They do not authenticate human
   identity or provide a cryptographic approval ledger.
+
+## Optional Actor Identity Input
+
+`AIWF-IDENTITY-001` warns when optional per-event identity input is malformed or
+unsupported. AIWF records unknown identity rather than promoting invalid
+attribution. The warning does not block validation, review, finalize readiness,
+or finalize. Source labels are declared provenance, not authenticated identity.

@@ -1,4 +1,4 @@
-# Basic Lifecycle Example (AIWF v1.7.14)
+# Basic Lifecycle Example (AIWF v1.7.15)
 
 ## End-to-End Command Flow
 ```bash
@@ -35,11 +35,13 @@
 
 ## Clarifications
 - `transition --to validation` and `transition --to review` are recommended for readability.
-- AIWF v1.7.14 does not require strict `workflow_phase == review` before finalize.
+- AIWF v1.7.15 does not require strict `workflow_phase == review` before finalize.
 - The final review decision authority must satisfy the task's
   `required_review_authority`; the recording actor may be different.
 - `doctor`/`report` derived evidence is observational and does not add a new
   finalize gate.
+
+- Unknown or conflicting actor identity remains valid provenance evidence and does not change closure readiness.
 
 ## Negative Example: Post-Finalize Record Rejection
 ```bash

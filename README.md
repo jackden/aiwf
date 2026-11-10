@@ -146,10 +146,10 @@ versions evolve independently.
 
 | Field | Value |
 | --- | --- |
-| Current Release | `1.7.14` |
-| Tool Version | `1.7.14` |
-| Workflow Protocol Version | `1.7.9` |
-| Latest Release Notes | [v1.7.14](.aiwf/docs/releases/v1.7.14.md) |
+| Current Release | `1.7.15` |
+| Tool Version | `1.7.15` |
+| Workflow Protocol Version | `1.7.10` |
+| Latest Release Notes | [v1.7.15](.aiwf/docs/releases/v1.7.15.md) |
 | GitHub Releases | [jackden/aiwf releases](https://github.com/jackden/aiwf/releases) |
 
 ## Documentation

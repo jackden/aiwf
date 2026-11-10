@@ -27,7 +27,8 @@ Commands:
   export-experiment --path <task_dir>
   report [--path <path>] [--format json|markdown]
   metadata show|status|init|validate|allowed-values|report
-  metadata profile create|list|use|current|show
+  metadata profile create|list|use|current|show|migrate
+  profile migrate [name] [--dry-run]
   agents print-block
   agents check [--path AGENTS.md]
   agents install [--path AGENTS.md] --yes
@@ -54,6 +55,8 @@ import shutil
 import re
 import subprocess
 import sys
+import stat
+import tempfile
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
@@ -103,13 +106,13 @@ SCHEMA_V16 = "ai-workflow-v1.6"
 SCHEMA_V17 = "ai-workflow-v1.7"
 CURRENT_SCHEMA_VERSION = SCHEMA_V17
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17}
-WORKFLOW_PROTOCOL_VERSION = "1.7.9"
-AIWF_TOOL_VERSION = "1.7.14"
-AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.1"
-AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.3"
-KNOWN_EVENT_SCHEMA_VERSIONS = {"legacy", AIWF_EVENT_SCHEMA_VERSION, "aiwf-event-v0.2", AIWF_EVIDENCE_EVENT_SCHEMA_VERSION}
+WORKFLOW_PROTOCOL_VERSION = "1.7.10"
+AIWF_TOOL_VERSION = "1.7.15"
+AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.4"
+AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.4"
+KNOWN_EVENT_SCHEMA_VERSIONS = {"legacy", "aiwf-event-v0.1", "aiwf-event-v0.2", "aiwf-event-v0.3", AIWF_EVIDENCE_EVENT_SCHEMA_VERSION}
 AIWF_EXPERIMENT_SCHEMA_VERSION = "aiwf-experiment-v0.1"
-AIWF_DATASET_SCHEMA_VERSION = "1"
+AIWF_DATASET_SCHEMA_VERSION = "2"
 AIWF_PACKAGE_RECORDS_MANIFEST_SCHEMA_VERSION = "aiwf-package-records-manifest-v1"
 AIWF_PACKAGE_RECORDS_PACKAGE_VERSION = "1"
 AIWF_PACKAGE_RECORDS_HASH_POLICY = "aiwf-package-records-v1"
@@ -318,6 +321,7 @@ DATASET_ALLOWED_TASK_FIELDS = (
     "blocked_by_count",
     "supersedes_count",
     "export_warnings",
+    "actor_identity_evidence",
 )
 DATASET_FINALIZE_EVENT_TYPES = frozenset({"finalize_success", "finalize_failed", "finalize_blocked"})
 DATASET_RECORDED_EVENT_SUFFIX = "_recorded"
@@ -439,7 +443,7 @@ METADATA_VALUE_REGISTRY: dict[str, dict[str, Any]] = {
     "tool": {
         "default": "unknown",
         "values": ALLOWED_METADATA_TOOL,
-        "description": "AI tool or agent used to perform the work.",
+        "description": "Configured AI tool context; not evidence of the actor that executed an event.",
         "notes": "Use `custom_agent`, `script`, `manual`, or `other` for unlisted tools.",
         "value_descriptions": {
             "unknown": "Tool is not known.",
@@ -469,7 +473,7 @@ METADATA_VALUE_REGISTRY: dict[str, dict[str, Any]] = {
     "provider": {
         "default": "unknown",
         "values": ALLOWED_METADATA_PROVIDER,
-        "description": "Model provider or model serving source.",
+        "description": "Configured model provider context; not an observed execution provider.",
         "notes": "Use `local`, `self_hosted`, `custom`, or `other` for unlisted providers.",
         "value_descriptions": {
             "unknown": "Provider is not known.",
@@ -511,13 +515,13 @@ METADATA_VALUE_REGISTRY: dict[str, dict[str, Any]] = {
     "model_name": {
         "default": "unknown",
         "values": None,
-        "description": "Free-text model name, for example `deepseek-v4-flash`.",
+        "description": "Configured free-text model name, for example `deepseek-v4-flash`; not execution identity.",
         "notes": "No allow-list is used because model names change frequently.",
     },
     "reasoning_effort": {
         "default": "unknown",
         "values": ALLOWED_METADATA_REASONING_EFFORT,
-        "description": "Recorded reasoning effort setting. This is not a model quality score.",
+        "description": "Configured reasoning effort hint; not observed execution configuration or a model quality score.",
         "value_descriptions": {
             "unknown": "Not recorded or unknown.",
             "none": "Tool/model has no reasoning effort concept.",
@@ -542,7 +546,7 @@ METADATA_VALUE_REGISTRY: dict[str, dict[str, Any]] = {
     "confidence": {
         "default": "medium",
         "values": ALLOWED_METADATA_CONFIDENCE,
-        "description": "Confidence in metadata attribution, not model quality or answer confidence.",
+        "description": "Legacy configured metadata confidence; never actor identity confidence or execution verification.",
         "value_descriptions": {
             "low": "Metadata attribution is uncertain.",
             "medium": "Metadata attribution has a clear source but is not fully verified.",
@@ -1353,6 +1357,10 @@ def _iter_all_task_dirs(root: Path) -> list[Path]:
 
 
 def _extract_event_ai_agent(event: dict[str, Any]) -> dict[str, str]:
+    """Read configured metadata only, including historical attribution envelopes."""
+    configured = event.get("configured_context")
+    if isinstance(configured, dict) and isinstance(configured.get("metadata"), dict):
+        return _normalize_ai_agent_metadata(configured["metadata"])
     if isinstance(event.get("ai_agent"), dict):
         metadata = {
             "tool": str(event["ai_agent"].get("tool", "unknown")),
@@ -1372,6 +1380,135 @@ def _extract_event_ai_agent(event: dict[str, Any]) -> dict[str, str]:
             }
         )
     return dict(AI_AGENT_METADATA_DEFAULT)
+
+
+def _unknown_actor_identity() -> dict[str, Any]:
+    return {"observations": [], "status": "unknown"}
+
+
+def _normalize_actor_identity(value: Any) -> tuple[dict[str, Any], Optional[str]]:
+    """Validate supplied evidence and derive status without verifying its source."""
+    unknown = _unknown_actor_identity()
+    if not isinstance(value, Mapping) or set(value) - {"observations", "status"}:
+        return unknown, "identity must contain only observations and optional status"
+    rows = value.get("observations")
+    if not isinstance(rows, list):
+        return unknown, "identity observations must be a list"
+    observations: list[dict[str, str]] = []
+    identity_fields = ("agent", "provider", "model", "reasoning_effort")
+    allowed_pairs = {("actor", "self_report"), ("host", "runtime_observation"), ("runtime", "runtime_observation")}
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) - {"source", "method", *identity_fields}:
+            return unknown, "observation has unsupported fields or shape"
+        source, method = row.get("source"), row.get("method")
+        if not isinstance(source, str) or not isinstance(method, str) or (source, method) not in allowed_pairs:
+            return unknown, "observation source/method is unsupported"
+        if source == "actor" and "reasoning_effort" in row:
+            return unknown, "reasoning effort requires a host/runtime observation"
+        observation = {"source": source, "method": method}
+        for field in identity_fields:
+            if field not in row:
+                continue
+            raw = row[field]
+            if not isinstance(raw, str):
+                return unknown, f"observation {field} must be a string"
+            try:
+                raw.encode("utf-8")
+            except UnicodeError:
+                return unknown, f"observation {field} must contain valid Unicode"
+            claim = raw.strip()
+            if claim and claim.lower() != "unknown":
+                observation[field] = claim
+        if any(field in observation for field in identity_fields):
+            observations.append(observation)
+    if not observations:
+        return unknown, None
+    conflicting = any(
+        len({row[field] for row in observations if field in row}) > 1
+        for field in identity_fields
+    )
+    status = "conflicting" if conflicting else (
+        "observed" if any(row["source"] in {"host", "runtime"} for row in observations) else "self_reported"
+    )
+    return {"observations": observations, "status": status}, None
+
+
+def _resolve_event_actor_identity(actor_identity: Any = None) -> dict[str, Any]:
+    """Only a direct per-event argument or live process input can supply identity."""
+    value = actor_identity
+    if value is None:
+        raw = os.environ.get("AIWF_ACTOR_IDENTITY")
+        if raw is None:
+            return _unknown_actor_identity()
+        try:
+            value = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            print("WARN: AIWF-IDENTITY-001: malformed optional identity JSON; recording unknown identity.", file=sys.stderr)
+            return _unknown_actor_identity()
+    identity, error = _normalize_actor_identity(value)
+    if error:
+        print(f"WARN: AIWF-IDENTITY-001: {error}; recording unknown identity.", file=sys.stderr)
+    return identity
+
+
+def _configured_event_context(root: Path, context: Mapping[str, Any]) -> dict[str, Any]:
+    resolved = resolve_ai_agent_metadata_with_sources(root)
+    return {
+        "metadata": _normalize_ai_agent_metadata({field: record.value for field, record in resolved.items()}),
+        "metadata_sources": {
+            field: {"layer": record.source_layer, "path": record.source_path}
+            for field, record in resolved.items()
+        },
+        "model": dict(context["model"]),
+    }
+
+
+def _event_actor_identity_evidence(event: Mapping[str, Any]) -> dict[str, Any]:
+    """A qualified analytical view; never upgrades legacy configured attribution."""
+    configured = event.get("configured_context")
+    if not isinstance(configured, Mapping):
+        configured = {
+            field: dict(event[field])
+            for field in ("ai_agent", "model")
+            if isinstance(event.get(field), Mapping)
+        }
+    else:
+        configured = dict(configured)
+    error = None
+    if "actor_identity" in event:
+        identity, error = _normalize_actor_identity(event["actor_identity"])
+    else:
+        identity = _unknown_actor_identity()
+    status = identity["status"]
+    legacy_configured = (
+        str(event.get("schema_version", "legacy")) != AIWF_EVIDENCE_EVENT_SCHEMA_VERSION
+        and any(isinstance(event.get(field), Mapping) for field in ("ai_agent", "model"))
+    )
+    if status == "conflicting":
+        classes = ["conflicting"]
+    elif status == "observed":
+        classes = sorted({
+            f"{row['source']}_observed" if row["source"] in {"host", "runtime"} else "self_reported"
+            for row in identity["observations"]
+        })
+    elif status == "self_reported":
+        classes = ["self_reported"]
+    else:
+        classes = ["configured_legacy" if legacy_configured else "unknown"]
+    out = {
+        "event_type": _event_type(dict(event)),
+        "schema_version": str(event.get("schema_version", "legacy")),
+        "actor_identity": identity,
+        "evidence_classes": classes,
+        "execution_attribution": "unverified" if classes == ["configured_legacy"] else status,
+        "configured_context": configured,
+    }
+    if legacy_configured:
+        agent = event.get("ai_agent")
+        out["configured_source"] = "legacy_profile" if isinstance(agent, Mapping) and agent.get("source") == "profile" else "legacy_configured"
+    if error:
+        out["identity_warning"] = error
+    return out
 
 
 def aiwf_event_logging_enabled(env: dict[str, str]) -> bool:
@@ -4735,6 +4872,9 @@ def _event_payload_from_legacy(event: dict[str, Any]) -> dict[str, Any]:
         "workflow_mode",
         "actor",
         "model",
+        "ai_agent",
+        "actor_identity",
+        "configured_context",
         "required_review_authority",
         "decision_authority",
         "recorded_by",
@@ -5087,6 +5227,7 @@ def append_aiwf_event(
     exit_code: int,
     diagnostics: Sequence[Diagnostic],
     extra_result: Optional[dict[str, Any]] = None,
+    actor_identity: Any = None,
 ) -> None:
     if not is_task_specific_dir(task_dir):
         return
@@ -5095,7 +5236,6 @@ def append_aiwf_event(
         return
 
     context = build_event_context(env)
-    ai_agent = resolve_ai_agent_metadata(root)
     diagnostics_summary = summarize_diagnostics(diagnostics)
     status = _event_status_from(exit_code, diagnostics_summary)
     result_payload: dict[str, Any] = {"exit_code": exit_code, "status": status}
@@ -5109,8 +5249,8 @@ def append_aiwf_event(
         "task_path": rel(root, task_dir),
         "workflow_mode": context["workflow_mode"],
         "actor": context["actor"],
-        "model": context["model"],
-        "ai_agent": ai_agent,
+        "configured_context": _configured_event_context(root, context),
+        "actor_identity": _resolve_event_actor_identity(actor_identity),
         "result": result_payload,
         "diagnostics": diagnostics_summary,
     }
@@ -5125,6 +5265,7 @@ def _try_append_aiwf_event(
     exit_code: int,
     diagnostics: Sequence[Diagnostic],
     extra_result: Optional[dict[str, Any]] = None,
+    actor_identity: Any = None,
 ) -> None:
     try:
         append_aiwf_event(
@@ -5134,6 +5275,7 @@ def _try_append_aiwf_event(
             exit_code=exit_code,
             diagnostics=diagnostics,
             extra_result=extra_result,
+            actor_identity=actor_identity,
         )
     except Exception as exc:
         print(f"WARN: failed to append AIWF event log: {exc}", file=sys.stderr)
@@ -6239,10 +6381,9 @@ def _append_raw_event(root: Path, task_dir: Path, event: dict[str, Any]) -> None
             f.write("\n")
 
 
-def _append_evidence_event(root: Path, task_dir: Path, event: dict[str, Any]) -> None:
+def _append_evidence_event(root: Path, task_dir: Path, event: dict[str, Any], *, actor_identity: Any = None) -> None:
     env = load_aiwf_env(root)
     context = build_event_context(env)
-    ai_agent = resolve_ai_agent_metadata(root)
     event_type = _event_type(event)
     result_status = _event_result_status(event)
     if not result_status:
@@ -6253,6 +6394,8 @@ def _append_evidence_event(root: Path, task_dir: Path, event: dict[str, Any]) ->
         payload_data = dict(payload)
     else:
         payload_data = _event_payload_from_legacy(event)
+    for field in ("ai_agent", "model", "actor_identity", "configured_context"):
+        payload_data.pop(field, None)
 
     normalized = {
         "schema_version": AIWF_EVIDENCE_EVENT_SCHEMA_VERSION,
@@ -6264,8 +6407,8 @@ def _append_evidence_event(root: Path, task_dir: Path, event: dict[str, Any]) ->
         "task_path": rel(root, task_dir),
         "actor": context["actor"],
         "workflow_mode": context["workflow_mode"],
-        "model": context["model"],
-        "ai_agent": ai_agent,
+        "configured_context": _configured_event_context(root, context),
+        "actor_identity": _resolve_event_actor_identity(actor_identity),
         "result": {"status": result_status},
         "payload": payload_data,
     }
@@ -6283,7 +6426,8 @@ def _derive_experiment_context_from_events(events: Sequence[dict[str, Any]]) -> 
         if not isinstance(event, dict):
             continue
         workflow_mode = str(event.get("workflow_mode", "unknown"))
-        model = event.get("model", {})
+        configured = event.get("configured_context")
+        model = configured.get("model", {}) if isinstance(configured, Mapping) else event.get("model", {})
         if not isinstance(model, dict):
             model = {}
         row = (
@@ -6308,6 +6452,8 @@ def _derive_experiment_context_from_events(events: Sequence[dict[str, Any]]) -> 
             },
             "source": "events",
             "consistent": True,
+            "semantics": "configured_context_only",
+            "execution_attribution": "unverified",
         }
     return {
         "workflow_mode": "mixed",
@@ -6318,6 +6464,8 @@ def _derive_experiment_context_from_events(events: Sequence[dict[str, Any]]) -> 
         },
         "source": "events",
         "consistent": False,
+        "semantics": "configured_context_only",
+        "execution_attribution": "unverified",
     }
 
 
@@ -6347,6 +6495,8 @@ def export_experiment_command(root: Path, raw_target: str) -> int:
             "model": env_context["model"],
             "source": "current_env",
             "consistent": True,
+            "semantics": "configured_context_only",
+            "execution_attribution": "unverified",
         }
     else:
         context = event_context
@@ -6387,6 +6537,7 @@ def export_experiment_command(root: Path, raw_target: str) -> int:
         "schema_version": AIWF_EXPERIMENT_SCHEMA_VERSION,
         "task": {"path": rel(root, target)},
         "context": context,
+        "actor_identity_evidence": [_event_actor_identity_evidence(event) for event in events],
         "run_summary": {
             "event_count": len(events),
             "doctor_run_count": len(doctor_events),
@@ -6541,7 +6692,7 @@ def _event_schema_compatibility(events: Sequence[Mapping[str, Any]]) -> tuple[st
     legacy_count = sum(
         1
         for event in events
-        if str(event.get("schema_version", "legacy")) in {"legacy", "aiwf-event-v0.1", "aiwf-event-v0.2"}
+        if str(event.get("schema_version", "legacy")) in {"legacy", "aiwf-event-v0.1", "aiwf-event-v0.2", "aiwf-event-v0.3"}
     )
     unsupported_count = sum(
         1 for event in events if str(event.get("schema_version", "legacy")) not in KNOWN_EVENT_SCHEMA_VERSIONS
@@ -7143,6 +7294,7 @@ def collect_task_dataset_record(
         "blocked_by_count": _dataset_relationship_count(front, "blocked_by", warnings),
         "supersedes_count": _dataset_relationship_count(front, "supersedes", warnings),
         "export_warnings": warnings,
+        "actor_identity_evidence": [_event_actor_identity_evidence(event) for event in associated_events],
     }
     return {field: record[field] for field in DATASET_ALLOWED_TASK_FIELDS}
 
@@ -9606,14 +9758,167 @@ def metadata_profile_create_command(root: Path, name: str) -> int:
         print(f"profile already exists: {profile_name}")
         return 2
     ensure_dir(path.parent)
-    resolved = resolve_ai_agent_metadata(root)
-    seeded = _seed_profile_metadata_defaults(resolved)
-    print("Tip: run `./aiwf metadata allowed-values` to see metadata defaults, allowed values, and descriptions.")
-    lines = _metadata_to_env_lines(seeded)
-    lines.append("AIWF_EVENT_LOG=1")
+    print("Profile stores runtime configuration. Event identity requires explicit per-event evidence.")
+    lines = ["AIWF_EVENT_LOG=1"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"CREATED  {rel(root, path)}")
     return 0
+
+
+# Census-backed migration policy: classify fields explicitly so future registered
+# metadata keys are not silently removed by this cleanup command.
+PROFILE_MIGRATION_FIELD_POLICY: Mapping[str, str] = {
+    "tool": "configured tool hint; no workflow/integration consumer",
+    "provider": "configured provider hint; no routing/integration consumer",
+    "model_name": "configured model hint; no model execution/configuration consumer",
+    "reasoning_effort": "configured reasoning hint; no execution configuration consumer",
+    "source": "legacy configured acquisition label; not observation provenance",
+    "confidence": "legacy configured certainty; identity confidence is unsupported",
+}
+PROFILE_MIGRATION_ERROR = "AIWF-PROFILE-MIGRATE-001"
+
+
+def _profile_migration_safe_path(root: Path, path: Path) -> None:
+    """Require an existing regular profile/pointer with no symlink components."""
+    base = root.resolve()
+    try:
+        relative = path.relative_to(base)
+    except ValueError as exc:
+        raise ValueError("profile path is outside the repository") from exc
+    current = base
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"symlink profile path is not supported: {rel(base, current)}")
+        if not current.exists():
+            raise ValueError(f"profile path is missing: {rel(base, current)}")
+        if current != path and not current.is_dir():
+            raise ValueError(f"profile parent is not a directory: {rel(base, current)}")
+    if not path.is_file():
+        raise ValueError(f"profile path is not a regular file: {rel(base, path)}")
+    if not path.resolve().is_relative_to(base):
+        raise ValueError("profile path resolves outside the repository")
+
+
+def _profile_migration_plan(raw: bytes) -> tuple[bytes, list[tuple[str, str, str]]]:
+    """Validate the complete known schema before constructing a byte-preserving plan."""
+    text = raw.decode("utf-8", errors="strict")
+    # Key names come from the registered schema, but only census-classified fields
+    # are removable; classification is not inferred for future schema additions.
+    removal = {
+        AI_AGENT_METADATA_ENV_MAP[field]: (field, reason)
+        for field, reason in PROFILE_MIGRATION_FIELD_POLICY.items()
+    }
+    supported = set(removal) | {"AIWF_EVENT_LOG"}
+    seen: set[str] = set()
+    retained: list[str] = []
+    actions: list[tuple[str, str, str]] = []
+    for number, line in enumerate(text.splitlines(keepends=True), 1):
+        content = line.rstrip("\r\n")
+        if not content.strip() or content.lstrip().startswith("#"):
+            retained.append(line)
+            continue
+        assignment = re.fullmatch(r"[ \t]*([A-Z][A-Z0-9_]*)[ \t]*=[ \t]*(.*)", content)
+        if assignment is None:
+            raise ValueError(f"line {number}: malformed assignment")
+        key, encoded_value = assignment.groups()
+        if key not in supported:
+            raise ValueError(f"line {number}: unknown or unclassified profile field {key}")
+        if key in seen:
+            raise ValueError(f"line {number}: duplicate profile field {key}")
+        seen.add(key)
+        # No evaluation, interpolation, escaping, continuation, or shell control
+        # syntax. Only whole-line comments are supported by the actual loader;
+        # accepting assignment comments here would validate a different value.
+        if any(char in encoded_value for char in "$`\\;|&<>\x00"):
+            raise ValueError(f"line {number}: ambiguous shell/escape syntax for {key}")
+        encoded_value = encoded_value.strip()
+        if encoded_value.startswith(("'", '"')):
+            quote = encoded_value[0]
+            closing = encoded_value.find(quote, 1)
+            if closing == -1:
+                raise ValueError(f"line {number}: unclosed quote for {key}")
+            value = encoded_value[1:closing]
+            suffix = encoded_value[closing + 1:]
+            if suffix:
+                raise ValueError(f"line {number}: ambiguous quoted value for {key}")
+        else:
+            value = encoded_value
+            if any(char in value for char in "'\"#") or re.search(r"\s", value):
+                raise ValueError(f"line {number}: ambiguous unquoted value for {key}")
+        if not value or any(ord(char) < 32 for char in value):
+            raise ValueError(f"line {number}: empty or invalid value for {key}")
+        if key == "AIWF_EVENT_LOG":
+            if value not in {"0", "1"}:
+                raise ValueError(f"line {number}: invalid runtime configuration {key}={value}")
+            retained.append(line)
+            actions.append(("preserved", key, "runtime configuration controlling optional event logging"))
+        else:
+            field, reason = removal[key]
+            values = METADATA_VALUE_REGISTRY[field].get("values")
+            if values is not None and value not in values:
+                raise ValueError(f"line {number}: invalid configured {field} value {value}")
+            actions.append(("removed", key, f"reclassified as configured legacy evidence: {reason}"))
+    return "".join(retained).encode("utf-8"), actions
+
+
+def metadata_profile_migrate_command(root: Path, name: Optional[str] = None, *, dry_run: bool = False) -> int:
+    """Clean one known profile without changing workflow evidence or other config."""
+    temporary_path: Optional[Path] = None
+    try:
+        root = root.resolve()
+        if name is None:
+            pointer = _metadata_current_profile_path(root)
+            _profile_migration_safe_path(root, pointer)
+            profile_name = pointer.read_bytes().decode("utf-8", errors="strict").strip()
+        else:
+            profile_name = name
+        if METADATA_PROFILE_NAME_RE.fullmatch(profile_name) is None:
+            raise ValueError("invalid selected profile name; use an exact registered profile name")
+        path = _metadata_profile_path(root, profile_name)
+        _profile_migration_safe_path(root, path)
+        original = path.read_bytes()
+        original_stat = path.stat()
+        def unchanged_profile() -> bool:
+            current = path.stat()
+            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode")
+            return all(getattr(current, field) == getattr(original_stat, field) for field in fields) and path.read_bytes() == original
+        updated, actions = _profile_migration_plan(original)
+        print(f"Profile migration: {profile_name}")
+        for action, key, reason in actions:
+            print(f"  {action}: {key} — {reason}")
+        print("Historical evidence unchanged; only the selected profile is eligible for migration.")
+        if updated == original:
+            print("No migration required.")
+            return 0
+        if dry_run:
+            print("Dry-run: no files changed.")
+            return 0
+        # Recheck before creating a temporary file. No-op and dry-run never enter
+        # the mutation path or create a directory, report, or event.
+        _profile_migration_safe_path(root, path)
+        if not unchanged_profile():
+            raise ValueError("profile changed during migration; rerun the preflight")
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=".aiwf-profile-migrate-", delete=False) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_path, stat.S_IMODE(original_stat.st_mode))
+        _profile_migration_safe_path(root, path)
+        if not unchanged_profile():
+            raise ValueError("profile changed during migration; rerun the preflight")
+        os.replace(temporary_path, path)
+        temporary_path = None
+        print(f"MIGRATED  {rel(root, path)}")
+        return 0
+    except (OSError, ValueError, UnicodeError) as exc:
+        print(f"[ERROR] {PROFILE_MIGRATION_ERROR}")
+        print(f"Profile migration aborted without modification: {exc}")
+        return 2
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def metadata_profile_list_command(root: Path) -> int:
@@ -9774,6 +10079,11 @@ def metadata_report_command(root: Path) -> int:
     confidence_distribution: dict[str, int] = {}
     provider_distribution: dict[str, int] = {}
     tool_distribution: dict[str, int] = {}
+    identity_classes: dict[str, int] = {}
+    observed_model_events = 0
+    self_reported_model_events = 0
+    conflicting_identity_events = 0
+    unknown_identity_events = 0
 
     for task_dir in task_dirs:
         events = _load_events(task_dir)
@@ -9781,6 +10091,25 @@ def metadata_report_command(root: Path) -> int:
             if not isinstance(event, dict):
                 continue
             total_events += 1
+            evidence = _event_actor_identity_evidence(event)
+            identity = evidence["actor_identity"]
+            for evidence_class in evidence["evidence_classes"]:
+                identity_classes[evidence_class] = identity_classes.get(evidence_class, 0) + 1
+            if identity["status"] == "conflicting":
+                conflicting_identity_events += 1
+            elif identity["status"] == "unknown":
+                unknown_identity_events += 1
+            else:
+                # Aggregate observed status is insufficient: the model claim
+                # itself must have a host/runtime observation source.
+                observed_model_events += int(any(
+                    row["source"] in {"host", "runtime"} and "model" in row
+                    for row in identity["observations"]
+                ))
+                self_reported_model_events += int(any(
+                    row["source"] == "actor" and "model" in row
+                    for row in identity["observations"]
+                ))
             ai_agent = _extract_event_ai_agent(event)
             model_name = str(ai_agent.get("model_name", "unknown")).strip() or "unknown"
             if model_name == "unknown":
@@ -9798,6 +10127,7 @@ def metadata_report_command(root: Path) -> int:
 
     coverage = (known_model / total_events) if total_events else 0.0
     payload = {
+        "metadata_semantics": "configured_context_only",
         "metadata_coverage": {
             "total_events": total_events,
             "known_model": known_model,
@@ -9808,6 +10138,15 @@ def metadata_report_command(root: Path) -> int:
         "confidence_distribution": confidence_distribution,
         "provider_distribution": provider_distribution,
         "tool_distribution": tool_distribution,
+        "identity_evidence_classes": identity_classes,
+        "identity_coverage": {
+            "total_events": total_events,
+            "observed_model_events": observed_model_events,
+            "observed_model_coverage": round(observed_model_events / total_events, 3) if total_events else 0.0,
+            "self_reported_model_events": self_reported_model_events,
+            "conflicting_identity_events": conflicting_identity_events,
+            "unknown_identity_events": unknown_identity_events,
+        },
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
@@ -10349,6 +10688,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_profile_create = profile_sub.add_parser("create", help="create a metadata profile from effective metadata")
     p_profile_create.add_argument("name")
     p_profile_create.set_defaults(func=lambda a, r: metadata_profile_create_command(r, a.name))
+
+    p_profile_migrate = profile_sub.add_parser("migrate", help="clean census-classified legacy attribution from one profile")
+    p_profile_migrate.add_argument("name", nargs="?", default=None)
+    p_profile_migrate.add_argument("--dry-run", action="store_true")
+    p_profile_migrate.set_defaults(func=lambda a, r: metadata_profile_migrate_command(r, a.name, dry_run=a.dry_run))
+
+    p_profile_alias = sub.add_parser("profile", help="profile migration commands")
+    profile_alias_sub = p_profile_alias.add_subparsers(dest="profile_command", required=True)
+    p_migrate_alias = profile_alias_sub.add_parser("migrate", help="clean census-classified legacy attribution from one profile")
+    p_migrate_alias.add_argument("name", nargs="?", default=None)
+    p_migrate_alias.add_argument("--dry-run", action="store_true")
+    p_migrate_alias.set_defaults(func=lambda a, r: metadata_profile_migrate_command(r, a.name, dry_run=a.dry_run))
 
     p_profile_list = profile_sub.add_parser("list", help="list metadata profiles")
     p_profile_list.set_defaults(func=lambda a, r: metadata_profile_list_command(r))

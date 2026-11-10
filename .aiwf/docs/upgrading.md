@@ -47,7 +47,7 @@ chmod +x ./aiwf
 ./aiwf upgrade --apply --source /path/to/new_aiwf_repo
 ```
 
-This sequence was verified against the current v1.7.14 runtime.
+This bootstrap sequence remains the supported upgrade flow for v1.7.15.
 
 ## Upgrade Modes
 
@@ -102,7 +102,8 @@ migration.
 
 The v1.7.14 runtime creates `ai-workflow-v1.7` tasks with
 `required_review_authority` (default `human`) and writes review evidence as
-`aiwf-event-v0.3`. New review records must provide
+`aiwf-event-v0.3` in that release. Current v1.7.15 review records use v0.4
+and still must provide
 `--decision-authority` and a non-empty `--recorded-by` (or `AIWF_ACTOR`).
 
 Upgrade preserves existing task artifacts and event rows. Legacy event schemas
@@ -110,6 +111,34 @@ remain readable; finalized legacy tasks are not retroactively invalidated by
 the new authority semantics. An active older task that explicitly requires
 human review must obtain structured authority evidence before it can close.
 This is an evidence-consistency check, not human authentication.
+
+## v1.7.15 actor identity evidence boundary
+
+No user action or profile migration is required for a safe upgrade. Old profiles
+remain loadable and usable as configured context. Starting with this release,
+both command and evidence events use `aiwf-event-v0.4`, with execution identity
+kept separately in `actor_identity`. Profile model/provider/reasoning values
+never become execution observations. Missing identity is unknown and valid;
+conflicting identity remains preserved without automatic resolution. Neither
+state adds closure blockers. Review decision authority remains unchanged.
+
+Historical task artifacts, validation/review events, finalize events, and
+finalized manifests remain unchanged. Readers accept legacy/new mixtures, and
+dataset version `2` marks legacy configured attribution as unverified.
+This is an evidence semantics change, not a metadata cleanup patch.
+
+Optional cleanup after upgrade:
+
+```bash
+./aiwf profile migrate --dry-run
+./aiwf profile migrate
+```
+
+These commands operate only on the selected profile; provide a profile name to
+select another. Migration preserves runtime configuration, removes census-backed
+deprecated attribution fields, and rejects malformed, duplicate, or unknown keys
+before writing. Repeating migration is a no-op. No-migration and migrated
+configuration are both supported. See [metadata.md](metadata.md).
 
 ## Relocation Behavior
 

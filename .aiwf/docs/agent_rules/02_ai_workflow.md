@@ -19,7 +19,7 @@ Deterministic correctness enforcement is implemented in `.aiwf/bin/ai_workflow.p
 - Prevent premature completion claims.
 - Preserve legacy records without forced mass migration.
 - Keep AGENTS.md governance instructions aligned with AIWF completion authority.
-- Keep release/tool/protocol version metadata aligned in current v1.7.14 governance scope unless explicit compatibility requirements require separation.
+- Keep release/tool/protocol version metadata aligned in current v1.7.15 governance scope unless explicit compatibility requirements require separation.
 
 ## Agent Instruction Surface
 
@@ -55,7 +55,8 @@ Task body may be edited by the agent. Front matter is tool-owned workflow metada
 
 - Do not use `owner` or `reviewer` as a shortcut for tool/provider/model provenance.
 - Normal AI-generated task metadata should keep neutral workflow roles such as `owner: "ai-agent"` and `reviewer: "human"`.
-- Actual agent identity belongs in AIWF metadata profiles, explicit env metadata, or task-local event provenance.
+- Profiles and legacy env metadata describe configured context. Event-level `actor_identity` observations carry execution provenance; configured values must not be promoted to execution observations.
+- Unknown/conflicting identity is valid and does not add closure blockers. Identity evidence is not review decision authority or authenticated model identity.
 - Historical finalized records may keep older values; do not mass-migrate or rewrite them as part of unrelated work.
 
 ## Source Record Boundary
@@ -137,13 +138,14 @@ runtime code
 - Use `./aiwf inspect --path <task_dir>` to distinguish historical closure from
   current effective state; do not infer current state from finalized prose
   alone when a correction artifact is present.
-- The current semantic runtime boundary is `v1.7.14`; post-finalization
+- The current semantic runtime boundary is `v1.7.15`; post-finalization
   correction remains additive and separate from review authority evidence.
 
-## v1.7.14 Scope Note
+## v1.7.15 Scope Note
 
-- AIWF remains evidence-driven; v1.7.14 carries the reviewed structured review
-  authority consistency semantics in the existing finalize-readiness checks.
+- AIWF remains evidence-driven; v1.7.15 separates configured context from
+  event-level actor identity evidence while preserving structured review
+  authority consistency semantics in existing finalize-readiness checks.
 - Do not assume strict phase-gated finalize in governance text.
 - Do not state `finalize requires workflow_phase == review`; no new phase gate
   was introduced.

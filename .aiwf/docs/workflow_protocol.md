@@ -1,37 +1,26 @@
-# AI Workflow Protocol v1.7.9
+# AI Workflow Protocol v1.7.10
 
 This document is the canonical protocol semantics reference for repository-native AI workflow governance.
 
-## Version Identity Policy (v1.7.14)
-
-For the current lightweight, repository-native AIWF project, release identity and
-tool provenance normally move together. The `v1.7.14` release advances the
-workflow protocol from `1.7.8` to `1.7.9` because review closure now has
-structured decision-authority semantics. This does not introduce a package
-manager, database migration framework, or silent overwrite of workflow
-evidence.
+## Version Identity Policy (v1.7.15)
 
 Current version state:
-- release version: `1.7.14`
-- tool version: `1.7.14`
-- workflow protocol version: `1.7.9`
+- release version: `1.7.15`
+- tool version: `1.7.15`
+- workflow protocol version: `1.7.10`
 
-Semantics carried by this release:
-- deterministic review decision-authority validation in finalize readiness
-- derived workflow evidence diagnostics exposed through `doctor` and `report`
+This release changes event actor-attribution and dataset normalization semantics.
+Both command and evidence writers now emit `aiwf-event-v0.4`; dataset output uses
+version `2`. Task metadata remains `ai-workflow-v1.7`. Existing review decision
+authority, finalize, and derived diagnostic semantics remain in force.
 
-The existing metadata schema `ai-workflow-v1.7` and event schema
-`aiwf-event-v0.3` are unchanged by this release; no schema migration is
-introduced here.
+This is a runtime/evidence semantic release, not packaging or metadata cleanup.
+No historical event, task artifact, or finalized manifest migration is required.
+Profiles remain compatible as configured context; optional profile migration
+cleans deprecated attribution fields without rewriting historical evidence.
 
-The derived diagnostics are observational. They do not add a finalize blocker,
-validation disposition, workflow phase, reliability score, or second source of
-workflow truth.
-
-Version-separation strategy may be revisited only if AIWF later requires:
-- external compatibility guarantees
-- schema compatibility negotiation
-- independent runtime/protocol release channels
+Release/tool/protocol identities remain coordinated for this lightweight project.
+Independent release channels or schema negotiation require explicit future design.
 
 ## 1. System Scope
 
@@ -154,35 +143,57 @@ Legacy relocation conflict handling:
 - Conflict handling does not overwrite, merge, delete, or publish a successful migration/upgrade report. `--check` and `--dry-run` expose the same blocker without changing files.
 - This is runtime integrity behavior; it does not change event schema, workflow phases, or finalize semantics.
 
-## 2.3 AI Agent Metadata Attribution
+## 2.3 Configured Context and Actor Identity Evidence
 
-AIWF tracks operator-facing AI attribution metadata through:
+Configured identity ≠ self-reported identity ≠ observed identity. AIWF must not
+make a stronger actor-attribution claim than its evidence source supports.
 
-- `tool`
-- `provider`
-- `model_name`
-- `reasoning_effort`
-- `source`
-- `confidence`
+Metadata profiles and legacy metadata/env fields (`tool`, `provider`,
+`model_name`, `reasoning_effort`, `source`, `confidence`) describe configured
+context. They remain readable, usable, and displayable through `metadata`
+commands; existing precedence and allow-list validation remain. New profiles
+contain `AIWF_EVENT_LOG=1` only. `metadata init` remains available for configured
+context. Profile configuration is never execution observation.
 
-Operator reference rules:
+New events carry separate `configured_context` and `actor_identity` objects.
+`actor_identity` contains `observations[]` and derived `status`. Observations
+use `source: runtime|host` with `method: runtime_observation`, or
+`source: actor` with `method: self_report`. Optional identity fields include
+`agent`, `provider`, and `model`; execution `reasoning_effort` is supported only
+for runtime/host observations. No identity confidence score is introduced.
 
-- `./aiwf metadata allowed-values` is the canonical CLI reference for defaults, descriptions, and allow-listed values.
-- `provider`, `tool`, `reasoning_effort`, `source`, and `confidence` use allow-lists.
-- `model_name` remains free text because model identifiers churn quickly.
-- `metadata init` uses neutral defaults (`unknown` plus `explicit_env` / `medium`) rather than inferring a provider/tool choice.
-- `metadata profile create` writes profile-backed metadata (`source=profile`) while preserving any already known tool/provider/model values it can safely reuse.
-- `metadata profile show [name]` shows stored profile metadata and runtime options for the current or specified profile.
-- `metadata show` shows effective metadata plus source layer/path for each field.
-- `metadata status` shows profile, local override, shell override, runtime options, effective metadata, and resolution summary.
-- `AIWF_EVENT_LOG` is a runtime option, not an AI attribution metadata field.
+No observations yields `unknown`; actor-only observations yield `self_reported`;
+runtime/host observations yield `observed`; incompatible observations yield
+`conflicting`. Matching observations remain preserved. AIWF does not resolve
+conflicts or verify identity. Source labels are declared provenance, not
+authenticated model identity.
 
-Task front matter uses workflow role fields:
+Observations come from a direct per-event integration input or transient live
+process `AIWF_ACTOR_IDENTITY` JSON. This input is never sourced from profiles,
+local metadata, or repository `.env`. Malformed input warns and yields unknown
+identity without blocking the workflow.
 
-- `owner` and `reviewer` are workflow roles, not tool/provider/model provenance.
-- New task metadata should default to `owner: "ai-agent"` and `reviewer: "human"`.
-- Actual tool, provider, model, and reasoning profile belong in AIWF metadata/env profiles or `.aiwf/events/events.jsonl` provenance.
-- Historical records may still contain older values such as `owner: "codex"`; these remain compatible and are not migrated retroactively.
+Unknown identity is a valid workflow evidence state. Actor identity evidence
+does not participate in completion authority or closure readiness: unknown,
+missing, and conflicting identity do not add validation, review, authority,
+AC closure, finalize-readiness, or finalize blockers. `owner` and `reviewer`
+remain workflow roles, and `recorded_by` remains the evidence recording actor.
+None substitutes for `decision_authority`. Identity evidence is provenance,
+not workflow authority, model governance, or agent orchestration.
+
+Optional `profile migrate [name] [--dry-run]` (also available under
+`metadata profile migrate`) uses the consumer census to remove only deprecated
+attribution keys, preserve runtime configuration, and report reasons. Missing
+name selects the current profile. Malformed, duplicate, or unknown keys fail
+closed before mutation. Dry-run and subsequent no-op migrations do not rewrite
+files; migration never changes historical evidence. See [metadata.md](metadata.md).
+
+Dataset version `2` adds each task's per-event `actor_identity_evidence` list.
+Evidence classes distinguish `runtime_observed`, `host_observed`,
+`self_reported`, `configured_legacy`, `unknown`, and `conflicting`. Legacy
+`ai_agent` or naked model metadata is unverified configured evidence, never an
+observed execution identity. Classes are not merged because model names match.
+See [model_workflow_analysis.md](model_workflow_analysis.md).
 
 ## 2.4 Task ID lookup and new-task preflight
 
@@ -307,7 +318,7 @@ Post-finalize correction policy (errata workflow):
   - document drift scope and diagnosis
   - restore consistency with auditable commands/actions
   - validate repaired state (`check --finalize-ready`) and record results
-  - Controlled amend/reopen runtime semantics remain future work (v1.9+) and are not part of v1.7.14 behavior.
+  - Controlled amend/reopen runtime semantics remain future work (v1.9+) and are not part of v1.7.15 behavior.
 
 Pre-edit guard:
 
@@ -442,34 +453,23 @@ For future task naming, avoid duplicated numeric prefixes when possible to reduc
 
 Existing finalized task paths should not be renamed only for cosmetic cleanup.
 
-## 9. Event Logging v0.1 / v0.2 / v0.3
+## 9. Event Logging and Evidence Schema Compatibility
 
-AIWF may optionally record task-local workflow events under:
-`<task_dir>/.aiwf/events.jsonl`
+AIWF records task-local events under `<task_dir>/.aiwf/events.jsonl`;
+`.aiwf/events/events.jsonl` is the global projection. Logs are append-only raw
+evidence for analysis, not tamper-proof ledgers or workflow completion authority.
+`AIWF_EVENT_LOG` controls optional command logging and remains a runtime option.
+Required validation/review evidence still participates in existing closure checks.
 
-Event logging is controlled by `.env` / environment variables.
+Both new command and evidence events use `aiwf-event-v0.4`, with configured
+context and event-level Actor Identity Evidence. Command events retain their
+command/result/diagnostics envelope; evidence events retain event type/group,
+result, and payload.
+Review evidence retains `required_review_authority`, `decision_authority`, and
+`recorded_by`. New events do not emit legacy `ai_agent` or naked model attribution.
 
-The event log is an append-only raw data source for reliability experiments and lightweight workflow audit. It is not workflow authority and is not a tamper-proof ledger. Workflow authority remains metadata validation, diagnostics, and finalize semantics. For derived projection checks, the task-local event log is the task evidence stream and `.aiwf/events/events.jsonl` is its global projection; discrepancies are reported and are not automatically repaired.
-
-Optional command-event logging must not change finalize behavior. Evidence
-events are themselves consumed by the existing v1.6+ finalize path.
-
-Schema compatibility:
-
-- command events remain readable in `aiwf-event-v0.1`.
-- newly recorded evidence events use normalized `aiwf-event-v0.3` with:
-  - `event_type` / `event_group`
-  - `result.status`
-  - `payload`
-  - task/model/context fields for dataset analysis.
-  - review authority fields when the event records a review:
-    `required_review_authority`, `decision_authority`, and `recorded_by`.
-- `aiwf-event-v0.1` command events and `aiwf-event-v0.2` normalized evidence
-  remain readable. Historical event rows are not rewritten or migrated by
-  this release.
-- legacy evidence events using `event` + string `result` remain readable.
-
-`export-experiment` summarizes task event logs for experiment analysis.
-
-`report` provides repository/task summaries in JSON or Markdown for dataset readiness analysis.
-Report outputs are analysis artifacts and not source-of-truth completion state.
+Readers support historical `aiwf-event-v0.1`, `aiwf-event-v0.2`,
+`aiwf-event-v0.3`, and legacy `event` + string `result` rows. Historical bytes
+are never rewritten or promoted to observed identity. Dataset normalization is
+a derived analytical projection and does not change source evidence or closure.
+`export-experiment` and `report` remain analysis tools, not workflow truth.

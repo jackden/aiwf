@@ -2711,7 +2711,7 @@ def test_dataset_export_basic_schema_and_allowed_fields(tmp_path: Path):
     _create_task(root, date="20260513")
 
     payload = _run_dataset_export(root)
-    assert payload["dataset_version"] == "1"
+    assert payload["dataset_version"] == "2"
     assert payload["generated_at"]
     assert payload["records_root"] == "docs"
     assert payload["task_count"] == 1
@@ -3063,7 +3063,7 @@ def test_dataset_export_allows_valid_repo_local_absolute_output(tmp_path: Path):
     rc = ai_workflow.main(["--repo-root", str(root), "dataset", "export", "--output", str(target)])
 
     assert rc == 0
-    assert json.loads(target.read_text(encoding="utf-8"))["dataset_version"] == "1"
+    assert json.loads(target.read_text(encoding="utf-8"))["dataset_version"] == "2"
 
 
 def test_dataset_export_allows_records_sibling_prefix(tmp_path: Path):
@@ -5398,22 +5398,22 @@ def test_diagnostics_registry_consistency():
 
 
 def test_current_release_version_projection_is_converged():
-    assert ai_workflow.AIWF_TOOL_VERSION == "1.7.14"
-    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.9"
+    assert ai_workflow.AIWF_TOOL_VERSION == "1.7.15"
+    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.10"
     assert ai_workflow.CURRENT_SCHEMA_VERSION == ai_workflow.SCHEMA_V17
-    assert ai_workflow.AIWF_EVIDENCE_EVENT_SCHEMA_VERSION == "aiwf-event-v0.3"
+    assert ai_workflow.AIWF_EVIDENCE_EVENT_SCHEMA_VERSION == "aiwf-event-v0.4"
 
     runtime_text = (REPO_ROOT / ".aiwf" / "bin" / "ai_workflow.py").read_text(encoding="utf-8")
-    assert 'AIWF_TOOL_VERSION = "1.7.14"' in runtime_text
-    assert 'WORKFLOW_PROTOCOL_VERSION = "1.7.9"' in runtime_text
+    assert 'AIWF_TOOL_VERSION = "1.7.15"' in runtime_text
+    assert 'WORKFLOW_PROTOCOL_VERSION = "1.7.10"' in runtime_text
     readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "| Current Release | `1.7.14` |" in readme_text
-    assert "| Workflow Protocol Version | `1.7.9` |" in readme_text
-    assert "v1.7.14.md" in readme_text
+    assert "| Current Release | `1.7.15` |" in readme_text
+    assert "| Workflow Protocol Version | `1.7.10` |" in readme_text
+    assert "v1.7.15.md" in readme_text
     protocol_text = (REPO_ROOT / ".aiwf" / "docs" / "workflow_protocol.md").read_text(encoding="utf-8")
-    assert "# AI Workflow Protocol v1.7.9" in protocol_text
+    assert "# AI Workflow Protocol v1.7.10" in protocol_text
     assert "review decision MUST carry a valid decision authority" in protocol_text
-    release_text = (REPO_ROOT / ".aiwf" / "docs" / "releases" / "v1.7.14.md").read_text(encoding="utf-8")
+    release_text = (REPO_ROOT / ".aiwf" / "docs" / "releases" / "v1.7.15.md").read_text(encoding="utf-8")
     assert "Why This Is Not a `.post` Release" in release_text
     assert "cross-task dependency enforcement" in release_text
     historical_text = (REPO_ROOT / ".aiwf" / "docs" / "releases" / "v1.7.13.post1.md").read_text(encoding="utf-8")
@@ -5483,14 +5483,15 @@ def test_event_logging_enabled_and_export_experiment(tmp_path: Path):
     lines = [line for line in event_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 1
     first = json.loads(lines[0])
-    assert first["schema_version"] == "aiwf-event-v0.1"
+    assert first["schema_version"] == "aiwf-event-v0.4"
     assert first["tool_version"] == ai_workflow.AIWF_TOOL_VERSION
-    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.9"
+    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.10"
     assert first["command"] == "doctor"
     assert first["workflow_mode"] == "aiwf_deterministic"
-    assert first["model"]["name"] == "test-model"
-    assert first["model"]["class"] == "local_quantized"
-    assert first["model"]["provider"] == "test-provider"
+    assert first["configured_context"]["model"]["name"] == "test-model"
+    assert first["configured_context"]["model"]["class"] == "local_quantized"
+    assert first["configured_context"]["model"]["provider"] == "test-provider"
+    assert first["actor_identity"]["status"] == "unknown"
 
     events = ai_workflow._load_events(task_dir)
     assert len(events) == 1
@@ -6739,7 +6740,7 @@ def test_check_default_behavior_unchanged(tmp_path: Path):
     assert rc == 0
 
 
-def test_evidence_event_schema_v03_contains_authority_fields(tmp_path: Path):
+def test_evidence_event_schema_v04_contains_authority_fields(tmp_path: Path):
     root = _init_repo(tmp_path)
     task_dir = _create_v2_task(root, date="20260513")
 
@@ -6749,7 +6750,7 @@ def test_evidence_event_schema_v03_contains_authority_fields(tmp_path: Path):
     event = events[-1]
     assert event["schema_version"] == ai_workflow.AIWF_EVIDENCE_EVENT_SCHEMA_VERSION
     assert event["tool_version"] == ai_workflow.AIWF_TOOL_VERSION
-    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.9"
+    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.10"
     assert event["required_review_authority"] == "human"
     assert event["decision_authority"] == "human"
     assert event["recorded_by"] == "codex"
@@ -7549,10 +7550,7 @@ def test_metadata_profile_lifecycle_commands(tmp_path: Path, capsys):
     )
     assert ai_workflow.metadata_profile_create_command(root, "codex_high") == 0
     profile_text = (root / ".aiwf" / "metadata_profiles" / "codex_high.env").read_text(encoding="utf-8")
-    assert "AIWF_AGENT_TOOL=codex" in profile_text
-    assert "AIWF_MODEL_PROVIDER=openai" in profile_text
-    assert "AIWF_METADATA_SOURCE=profile" in profile_text
-    assert "AIWF_EVENT_LOG=1" in profile_text
+    assert profile_text == "AIWF_EVENT_LOG=1\n"
     capsys.readouterr()
     assert ai_workflow.metadata_profile_list_command(root) == 0
     listed = capsys.readouterr().out
@@ -7994,7 +7992,7 @@ def test_metadata_profile_use_warns_about_local_and_shell_override(
     assert "shell AIWF_* metadata variables are present and may override the active profile" in out
 
 
-def test_event_logging_includes_ai_agent_metadata(tmp_path: Path):
+def test_event_logging_separates_configured_metadata(tmp_path: Path):
     root = _init_repo(tmp_path)
     task_dir = _create_task(root, date="20260513")
     (root / ".env").write_text(
@@ -8026,13 +8024,15 @@ def test_event_logging_includes_ai_agent_metadata(tmp_path: Path):
     events = _events_lines(task_dir)
     assert events
     first = events[0]
-    assert "ai_agent" in first
-    assert first["ai_agent"]["tool"] == "codex"
-    assert first["ai_agent"]["provider"] == "openai"
-    assert first["ai_agent"]["model_name"] == "gpt-5.3-codex"
-    assert first["ai_agent"]["reasoning_effort"] == "high"
-    assert first["ai_agent"]["source"] == "explicit_env"
-    assert first["ai_agent"]["confidence"] == "high"
+    assert "ai_agent" not in first and "model" not in first
+    configured = first["configured_context"]["metadata"]
+    assert configured["tool"] == "codex"
+    assert configured["provider"] == "openai"
+    assert configured["model_name"] == "gpt-5.3-codex"
+    assert configured["reasoning_effort"] == "high"
+    assert configured["source"] == "explicit_env"
+    assert configured["confidence"] == "high"
+    assert first["actor_identity"] == {"observations": [], "status": "unknown"}
 
 
 def test_metadata_report_counts_known_and_unknown_model(tmp_path: Path, capsys):
@@ -8071,3 +8071,295 @@ def test_metadata_report_counts_known_and_unknown_model(tmp_path: Path, capsys):
     assert payload["metadata_coverage"]["known_model"] == 1
     assert payload["metadata_coverage"]["unknown_model"] == 1
     assert payload["metadata_coverage"]["coverage"] == 0.5
+
+
+def _identity_observation(source: str = "actor", **claims) -> dict[str, str]:
+    return {"source": source, "method": "self_report" if source == "actor" else "runtime_observation", **claims}
+
+
+@pytest.mark.parametrize("observations,status", [
+    ([], "unknown"),
+    ([_identity_observation(model="unknown")], "unknown"),
+    ([_identity_observation(agent="codex", provider="openai", model="model-a")], "self_reported"),
+    ([_identity_observation("host", model="model-a", reasoning_effort="xhigh")], "observed"),
+    ([_identity_observation("runtime", model="model-a")], "observed"),
+    ([_identity_observation("host", model="model-a"), _identity_observation(model="model-a")], "observed"),
+    ([_identity_observation("host", model="model-a"), _identity_observation(provider="openai")], "observed"),
+    ([_identity_observation("host", model="model-a"), _identity_observation(model="unknown")], "observed"),
+    ([_identity_observation("host", model="model-a"), _identity_observation(model="model-b")], "conflicting"),
+    ([_identity_observation(provider="openai"), _identity_observation(provider="other")], "conflicting"),
+    ([_identity_observation(agent="codex"), _identity_observation(agent="other")], "conflicting"),
+    ([_identity_observation("host", reasoning_effort="high"), _identity_observation("runtime", reasoning_effort="low")], "conflicting"),
+])
+def test_actor_identity_status_derives_evidence_without_ranking(observations, status):
+    supplied = {"observations": observations, "status": "observed"}
+    before = json.dumps(supplied)
+    normalized, error = ai_workflow._normalize_actor_identity(supplied)
+    assert error is None
+    assert normalized["status"] == status
+    assert json.dumps(supplied) == before
+    expected = [row for row in observations if any(row.get(field) not in {None, "unknown"} for field in ("agent", "provider", "model", "reasoning_effort"))]
+    assert normalized["observations"] == expected
+
+
+@pytest.mark.parametrize("value", [
+    None, [], {"observations": "invalid"},
+    {"observations": [], "confidence": "high"},
+    {"observations": [{"source": "profile", "method": "runtime_observation", "model": "x"}]},
+    {"observations": [{"source": "host", "method": "self_report", "model": "x"}]},
+    {"observations": [_identity_observation(model=123)]},
+    {"observations": [_identity_observation(model="x", reasoning_effort="high")]},
+    {"observations": [_identity_observation(model="x", confidence="high")]},
+    {"observations": [_identity_observation(model="valid"), {"source": "profile"}]},
+])
+def test_malformed_identity_does_not_create_an_attribution_claim(value):
+    identity, error = ai_workflow._normalize_actor_identity(value)
+    assert error
+    assert identity == {"observations": [], "status": "unknown"}
+
+
+def test_identity_process_input_never_loads_profile_local_or_repo_env(tmp_path: Path, monkeypatch):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    monkeypatch.delenv("AIWF_ACTOR_IDENTITY", raising=False)
+    identity_json = json.dumps({"observations": [_identity_observation("host", model="false-observation")]})
+    profile_dir = root / ".aiwf" / "metadata_profiles"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_text = f"AIWF_EVENT_LOG=1\nAIWF_MODEL_NAME=configured\nAIWF_METADATA_SOURCE=profile\nAIWF_ACTOR_IDENTITY={identity_json}\n"
+    (profile_dir / "legacy.env").write_text(profile_text, encoding="utf-8")
+    (root / ".aiwf" / "metadata.local.env").write_text(f"AIWF_ACTOR_IDENTITY={identity_json}\n", encoding="utf-8")
+    (root / ".env").write_text(f"AIWF_EVENT_LOG=1\nAIWF_MODEL_NAME=repo-configured\nAIWF_ACTOR_IDENTITY={identity_json}\n", encoding="utf-8")
+    assert ai_workflow.metadata_profile_use_command(root, "legacy") == 0
+    assert ai_workflow.metadata_validate_command(root) == 0
+    assert ai_workflow.check_path(root, str(task_dir), strict=False) == 0
+    ai_workflow._append_evidence_event(root, task_dir, {"event": "validation_recorded", "result": "pass"})
+    for event in _events_lines(task_dir):
+        assert event["actor_identity"] == {"observations": [], "status": "unknown"}
+        assert event["configured_context"]["metadata"]["model_name"] == "configured"
+        assert event["configured_context"]["model"]["name"] == "repo-configured"
+    assert (profile_dir / "legacy.env").read_text(encoding="utf-8") == profile_text
+
+
+@pytest.mark.parametrize("writer", ["command", "evidence"])
+def test_explicit_identity_argument_overrides_live_process_channel(tmp_path: Path, monkeypatch, writer):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    _enable_event_logging(root)
+    monkeypatch.setenv("AIWF_ACTOR_IDENTITY", json.dumps({"observations": [_identity_observation(model="process-model")]}))
+    explicit = {"observations": [_identity_observation("runtime", model="explicit-model")]}
+    if writer == "command":
+        ai_workflow.append_aiwf_event(root, task_dir, command="check", exit_code=0, diagnostics=[], actor_identity=explicit)
+    else:
+        ai_workflow._append_evidence_event(root, task_dir, {"event": "fix_recorded", "summary": "test"}, actor_identity=explicit)
+    event = _events_lines(task_dir)[-1]
+    assert event["actor_identity"] == {"observations": explicit["observations"], "status": "observed"}
+    assert event["schema_version"] == "aiwf-event-v0.4"
+    assert "ai_agent" not in event and "model" not in event
+
+
+def test_identity_reserved_fields_cannot_leak_through_payload(tmp_path: Path, monkeypatch):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    monkeypatch.delenv("AIWF_ACTOR_IDENTITY", raising=False)
+    fake = {"actor_identity": {"observations": [_identity_observation("host", model="fake")]},
+            "ai_agent": {"model_name": "fake"}, "model": {"name": "fake"}, "configured_context": {"fake": True}}
+    ai_workflow._append_evidence_event(root, task_dir, {"event": "fix_recorded", "payload": {**fake, "summary": "test"}})
+    event = _events_lines(task_dir)[-1]
+    assert event["actor_identity"] == {"observations": [], "status": "unknown"}
+    assert set(event["payload"]) == {"summary"}
+    assert event["configured_context"].get("fake") is None
+
+
+@pytest.mark.parametrize("input_json,expected_status", [
+    (None, "unknown"),
+    ("invalid JSON", "unknown"),
+    ("[" * 2000 + "]" * 2000, "unknown"),
+    ("{\"observations\":" + "9" * 5000 + "}", "unknown"),
+    (json.dumps({"observations": [_identity_observation("host", model="\ud800")]}), "unknown"),
+    (json.dumps({"observations": [_identity_observation(model="self-model")]}), "self_reported"),
+    (json.dumps({"observations": [_identity_observation("host", model="host-model")]}), "observed"),
+    (json.dumps({"observations": [_identity_observation("host", model="a"), _identity_observation(model="b")]}), "conflicting"),
+])
+def test_all_writer_caller_families_preserve_identity_and_closure(tmp_path: Path, monkeypatch, input_json, expected_status):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    _enable_event_logging(root)
+    if input_json is None:
+        monkeypatch.delenv("AIWF_ACTOR_IDENTITY", raising=False)
+    else:
+        monkeypatch.setenv("AIWF_ACTOR_IDENTITY", input_json)
+    _prepare_finalize_ready_task(root, task_dir)
+    assert ai_workflow.check_path(root, str(task_dir), strict=False) == 0
+    assert ai_workflow.doctor_command(root, str(task_dir)) == 0
+    assert ai_workflow.transition_command(root, str(task_dir), "review") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="fix", result=None, command=None, reviewer=None, summary="fix verified") == 0
+    assert ai_workflow.record_command(root, str(task_dir), kind="safety_ack", result=None, command=None, reviewer=None, summary="safe") == 0
+    _record_finalize_evidence(root, task_dir)
+    before = _snapshot_tree(root)
+    assert ai_workflow.check_path(root, str(task_dir), strict=False, finalize_ready=True) == 0
+    assert ai_workflow.finalize_command(root, str(task_dir), dry_run=True) == 0
+    assert _snapshot_tree(root) == before
+    assert ai_workflow.finalize_command(root, str(task_dir)) == 0
+    events = _events_lines(task_dir)
+    assert {ai_workflow._event_type(event) for event in events} >= {
+        "validation_recorded", "review_recorded", "fix_recorded", "safety_ack_recorded",
+        "phase_transition", "finalize_success", "check", "doctor", "finalize",
+    }
+    for event in events:
+        assert event["schema_version"] == "aiwf-event-v0.4"
+        assert event["actor_identity"]["status"] == expected_status
+        assert "ai_agent" not in event and "model" not in event
+    review = next(event for event in events if ai_workflow._event_type(event) == "review_recorded")
+    assert review["decision_authority"] == "human" and review["recorded_by"] == "codex"
+    before = _snapshot_tree(root)
+    assert ai_workflow.check_path(root, str(task_dir), strict=False, finalize_ready=True) == 0
+    assert ai_workflow.finalize_command(root, str(task_dir), dry_run=True) == 0
+    assert _snapshot_tree(root) == before
+
+
+def test_matching_identity_observations_keep_order_and_duplicates():
+    observations = [_identity_observation("host", model="a"), _identity_observation(model="a"), _identity_observation("host", model="a")]
+    identity, error = ai_workflow._normalize_actor_identity({"observations": observations})
+    assert error is None
+    assert identity["status"] == "observed"
+    assert identity["observations"] == observations
+
+
+def test_current_identity_schema_keeps_all_historical_schemas_readable():
+    versions = ["legacy", "aiwf-event-v0.1", "aiwf-event-v0.2", "aiwf-event-v0.3"]
+    assert ai_workflow._event_schema_compatibility([{"schema_version": version} for version in versions]) == ("legacy", 4, 0)
+    assert ai_workflow._event_schema_compatibility([{"schema_version": version} for version in versions + ["aiwf-event-v0.4"]]) == ("mixed", 4, 0)
+
+
+@pytest.mark.parametrize("writer", ["command", "evidence"])
+def test_invalid_unicode_identity_warns_and_both_writers_append_unknown(tmp_path: Path, capsys, writer):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    _enable_event_logging(root)
+    supplied = {"observations": [_identity_observation("host", model="\ud800")]}
+    if writer == "command":
+        ai_workflow.append_aiwf_event(root, task_dir, command="check", exit_code=0, diagnostics=[], actor_identity=supplied)
+    else:
+        ai_workflow._append_evidence_event(root, task_dir, {"event": "fix_recorded", "summary": "test"}, actor_identity=supplied)
+    assert _events_lines(task_dir)[-1]["actor_identity"] == {"observations": [], "status": "unknown"}
+    assert "valid Unicode" in capsys.readouterr().err
+
+
+def _seed_mixed_identity_events(root: Path, task_dir: Path) -> list[dict]:
+    model_context = {"name": "same-model", "class": "unknown", "provider": "openai"}
+    events = [
+        {"schema_version": "aiwf-event-v0.3", "ai_agent": {"model_name": "same-model", "provider": "openai", "source": source, "confidence": "high"}, "model": model_context}
+        for source in ("profile", "local_env", "shell_env", "explicit_env")
+    ]
+    events.append({"schema_version": "aiwf-event-v0.1", "model": model_context})
+    events.extend([
+        {"configured_context": {"metadata": {"model_name": "same-model"}, "model": model_context}},
+        {},
+        {"actor_identity": {"observations": [_identity_observation(model="same-model")]}},
+        {"actor_identity": {"observations": [_identity_observation("runtime", model="same-model")]}},
+        {"actor_identity": {"observations": [_identity_observation("host", model="same-model")]}},
+        {"actor_identity": {"observations": [_identity_observation("host", agent="codex"), _identity_observation(model="same-model")]}},
+        {"actor_identity": {"observations": [_identity_observation("host", model="same-model"), _identity_observation(model="other-model")]}},
+    ])
+    for event in events:
+        event.setdefault("schema_version", "aiwf-event-v0.4")
+        event.update(task_path=ai_workflow.rel(root, task_dir), event_type="validation_recorded", result={"status": "pass"}, timestamp="2026-05-13T00:00:00Z")
+        ai_workflow._append_raw_event(root, task_dir, event)
+    return events
+
+
+def test_dataset_v2_keeps_each_event_and_all_provenance_classes(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    raw_events = _seed_mixed_identity_events(root, task_dir)
+    before = _snapshot_tree(root)
+    payload = ai_workflow.build_dataset_export_payload(root)
+    assert _snapshot_tree(root) == before
+    assert payload["dataset_version"] == "2"
+    task = payload["tasks"][0]
+    evidence = task["actor_identity_evidence"]
+    assert task["event_count"] == len(raw_events) == len(evidence) == 12
+    for row, raw in zip(evidence[:5], raw_events[:5]):
+        assert row["evidence_classes"] == ["configured_legacy"]
+        assert row["execution_attribution"] == "unverified"
+        assert row["actor_identity"] == {"observations": [], "status": "unknown"}
+        assert row["configured_context"]["model"] == raw["model"]
+    assert evidence[0]["configured_source"] == "legacy_profile"
+    assert evidence[0]["configured_context"]["ai_agent"]["confidence"] == "high"
+    assert evidence[5]["evidence_classes"] == ["unknown"]
+    assert evidence[5]["configured_context"]["metadata"]["model_name"] == "same-model"
+    assert evidence[7]["evidence_classes"] == ["self_reported"]
+    assert evidence[8]["evidence_classes"] == ["runtime_observed"]
+    assert evidence[9]["evidence_classes"] == ["host_observed"]
+    assert evidence[10]["evidence_classes"] == ["host_observed", "self_reported"]
+    assert evidence[10]["actor_identity"]["observations"] == raw_events[10]["actor_identity"]["observations"]
+    assert evidence[11]["evidence_classes"] == ["conflicting"]
+    assert evidence[11]["actor_identity"]["observations"] == raw_events[11]["actor_identity"]["observations"]
+    assert _events_lines(task_dir) == raw_events
+
+
+def test_metadata_report_observes_model_source_rather_than_aggregate_status(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    _seed_mixed_identity_events(root, task_dir)
+    capsys.readouterr()
+    assert ai_workflow.metadata_report_command(root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["metadata_semantics"] == "configured_context_only"
+    assert payload["metadata_coverage"]["known_model"] == 6
+    assert payload["identity_coverage"] == {
+        "total_events": 12, "observed_model_events": 2, "observed_model_coverage": 0.167,
+        "self_reported_model_events": 2, "conflicting_identity_events": 1, "unknown_identity_events": 7,
+    }
+    assert payload["identity_evidence_classes"] == {
+        "configured_legacy": 5, "unknown": 2, "self_reported": 2,
+        "runtime_observed": 1, "host_observed": 2, "conflicting": 1,
+    }
+
+
+def test_experiment_export_qualifies_legacy_and_new_configured_context(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    events = _seed_mixed_identity_events(root, task_dir)
+    before = _snapshot_tree(root)
+    capsys.readouterr()
+    assert ai_workflow.export_experiment_command(root, str(task_dir)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["context"]["semantics"] == "configured_context_only"
+    assert payload["context"]["execution_attribution"] == "unverified"
+    assert len(payload["actor_identity_evidence"]) == len(events)
+    assert payload["actor_identity_evidence"][0]["evidence_classes"] == ["configured_legacy"]
+    assert payload["actor_identity_evidence"][8]["evidence_classes"] == ["runtime_observed"]
+    assert _snapshot_tree(root) == before
+
+
+def test_experiment_current_env_fallback_cannot_create_identity(tmp_path: Path, capsys, monkeypatch):
+    root = _init_repo(tmp_path)
+    task_dir = _create_task(root, date="20260513")
+    (root / ".env").write_text("AIWF_MODEL_NAME=configured-model\n", encoding="utf-8")
+    monkeypatch.setenv("AIWF_ACTOR_IDENTITY", json.dumps({"observations": [_identity_observation("host", model="live-model")]}))
+    capsys.readouterr()
+    assert ai_workflow.export_experiment_command(root, str(task_dir)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["context"]["model"]["name"] == "configured-model"
+    assert payload["context"]["execution_attribution"] == "unverified"
+    assert payload["actor_identity_evidence"] == []
+
+
+def test_package_embeds_dataset_v2_and_preserves_raw_event_fields(tmp_path: Path):
+    root = _init_repo(tmp_path)
+    task_dir = _create_v2_task(root, date="20260513")
+    events = _seed_mixed_identity_events(root, task_dir)
+    event_bytes = (task_dir / ".aiwf" / "events.jsonl").read_bytes()
+    output = root / "identity_package"
+    assert ai_workflow.main(["--repo-root", str(root), "package", "records", "--output", str(output), "--format", "directory"]) == 0
+    payload = json.loads((output / ai_workflow.AIWF_PACKAGE_RECORDS_DATASET_PATH).read_text(encoding="utf-8"))
+    manifest = json.loads((output / "package_manifest.json").read_text(encoding="utf-8"))
+    assert payload["dataset_version"] == manifest["dataset"]["schema_version"] == "2"
+    assert len(payload["tasks"][0]["actor_identity_evidence"]) == len(events)
+    raw_packaged = [json.loads(line) for line in (output / "events" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    # Raw packaging retains both local and repository projections; dataset
+    # inventory uses the repository projection as its existing source policy.
+    assert len(raw_packaged) == manifest["events"]["canonical_event_count"] == 2 * len(events)
+    assert sorted(json.dumps(event, sort_keys=True) for event in raw_packaged) == sorted(json.dumps(event, sort_keys=True) for event in events * 2)
+    assert (task_dir / ".aiwf" / "events.jsonl").read_bytes() == event_bytes

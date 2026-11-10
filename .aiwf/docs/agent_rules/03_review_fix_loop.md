@@ -39,7 +39,7 @@ Deterministic completion gating is enforced by `./aiwf finalize`.
 - `AIWF-FINALIZED-002` is expected closure enforcement in this flow.
 - `AIWF-PATH-019` indicates post-finalize event-chain contamination and should be handled via follow-up workflow.
 
-## Standard Command Flow (v1.7.14)
+## Standard Command Flow (v1.7.15)
 
 ```bash
 ./aiwf transition --path <task> --to validation
@@ -69,7 +69,7 @@ Review fail / fix / re-validation flow:
 
 Note:
 - Validation/review transitions are recommended for clarity.
-- v1.7.14 requires structured review decision authority on new review events;
+- v1.7.15 requires structured review decision authority on new review events;
   `recorded_by` is the recording actor and may differ from the decision authority.
 - AIWF does not enforce strict phase-gated finalize (`workflow_phase == review`
   is not a finalize prerequisite); no new phase was introduced.

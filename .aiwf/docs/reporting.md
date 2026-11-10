@@ -75,10 +75,31 @@ When analyzing output, split data by:
 - `aiwf-event-v0.1`
 - `aiwf-event-v0.2`
 - `aiwf-event-v0.3`
+- `aiwf-event-v0.4`
+- actor identity evidence class (separate from configured model names)
 - domain automation work
 - workflow tooling work
 
 ## Related References
 - Diagnostic catalog: [diagnostics.md](diagnostics.md)
-- Release baseline: [releases/v1.7.14.md](releases/v1.7.14.md)
+- Release baseline: [releases/v1.7.15.md](releases/v1.7.15.md)
 - Package Records release preparation: [releases/package_records_release_preparation.md](releases/package_records_release_preparation.md)
+
+## Dataset Actor Identity Normalization
+
+```bash
+./aiwf dataset export --output artifacts/workflow_dataset.json
+```
+
+Dataset version `2` includes a per-task `actor_identity_evidence` list, retaining
+identity provenance separately for every source event. New observations retain
+their source/method and classify as `runtime_observed`, `host_observed`,
+`self_reported`, `unknown`, or `conflicting`. Legacy `ai_agent` and model metadata
+classify as `configured_legacy`, with unverified execution attribution.
+Configured legacy hints never become observations, and equal model names never
+merge evidence classes. Mixed historical/new events can coexist in one dataset.
+
+Dataset output is derived; exporting does not modify source tasks, events, or
+finalized manifests. Identity diagnostics remain non-blocking for closure.
+For model comparisons, failure rates, or compliance analysis, use the
+[Model Workflow Analysis Guide](model_workflow_analysis.md).

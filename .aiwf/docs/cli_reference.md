@@ -70,3 +70,31 @@ Task 002 derived warnings as gates.
 
 Use the [Upgrade Guide](upgrading.md) and its explicit source package for an
 existing repository. Install never silently becomes upgrade.
+
+## Configured Metadata and Actor Identity
+
+```bash
+./aiwf metadata show
+./aiwf metadata status
+./aiwf metadata profile create <name>
+./aiwf metadata profile use <name>
+./aiwf profile migrate --dry-run
+./aiwf profile migrate
+./aiwf metadata profile migrate <name> --dry-run
+./aiwf dataset export --output artifacts/workflow_dataset.json
+```
+
+New profiles contain logging configuration only. Legacy metadata remains
+configured context and does not establish execution identity. Migration is
+optional, defaults to the selected current profile, and fails closed for
+malformed, duplicate, or unknown profile fields. Dry-run and repeated no-op
+migrations do not change files. Neither upgrade nor profile migration rewrites
+historical workflow evidence.
+
+New events use `aiwf-event-v0.4`. Supply event observations directly through an
+integration or transient live shell `AIWF_ACTOR_IDENTITY` JSON; profiles, local
+metadata, and repository `.env` cannot supply that input. Missing identity is
+valid; malformed input warns and becomes unknown without blocking the workflow.
+Identity source labels are declared provenance, not authenticated model identity.
+See [metadata.md](metadata.md) for the JSON shape and migration field policy, and
+[model_workflow_analysis.md](model_workflow_analysis.md) for dataset semantics.
