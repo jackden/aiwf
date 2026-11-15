@@ -107,7 +107,7 @@ SCHEMA_V17 = "ai-workflow-v1.7"
 CURRENT_SCHEMA_VERSION = SCHEMA_V17
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17}
 WORKFLOW_PROTOCOL_VERSION = "1.7.10"
-AIWF_TOOL_VERSION = "1.7.15"
+AIWF_TOOL_VERSION = "1.7.16"
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.4"
 AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.4"
 KNOWN_EVENT_SCHEMA_VERSIONS = {"legacy", "aiwf-event-v0.1", "aiwf-event-v0.2", "aiwf-event-v0.3", AIWF_EVIDENCE_EVENT_SCHEMA_VERSION}
@@ -1746,10 +1746,20 @@ def _find_agents_block_bounds(text: str) -> tuple[Optional[int], Optional[int]]:
     end = text.find(AGENTS_BLOCK_END)
     if begin < 0 and end < 0:
         return None, None
-    if begin < 0 or end < 0 or end < begin:
-        return begin if begin >= 0 else None, end if end >= 0 else None
-    end += len(AGENTS_BLOCK_END)
-    return begin, end
+
+    # A lone, misplaced, or repeated marker cannot delimit a safe replacement.
+    for start, marker in ((begin, AGENTS_BLOCK_BEGIN), (end, AGENTS_BLOCK_END)):
+        stop = start + len(marker)
+        if (
+            start < 0
+            or (start > 0 and text[start - 1] not in "\r\n" and text[:start] != "\ufeff")
+            or (stop < len(text) and text[stop] not in "\r\n")
+            or text.find(marker, stop) != -1
+        ):
+            return (begin, None) if begin >= 0 else (None, end)
+    if end < begin:
+        return begin, None
+    return begin, end + len(AGENTS_BLOCK_END)
 
 
 def agents_print_block_command(root: Path) -> int:
@@ -1804,20 +1814,15 @@ def agents_install_command(root: Path, raw_path: str, yes: bool) -> int:
         print(f"[INFO] installed managed block to {rel(root, target)} (created file)")
         return 0
 
-    original = target.read_text(encoding="utf-8", errors="replace")
-    begin, end = _find_agents_block_bounds(original)
-    if begin is None and end is None:
-        base = original.rstrip("\n")
-        updated = f"{base}\n\n{managed}\n" if base else f"{managed}\n"
-    elif begin is None or end is None:
+    with target.open(encoding="utf-8", errors="surrogateescape", newline="") as stream:
+        original = stream.read()
+    try:
+        updated = _install_agents_text(original, managed)
+    except ValueError:
         print("[ERROR] AIWF-AGENTS-003")
         print(f"{rel(root, target)}: managed AIWF block is incomplete.")
         return 2
-    else:
-        updated = f"{original[:begin].rstrip()}\n\n{managed}\n{original[end:].lstrip()}"
-        if not updated.endswith("\n"):
-            updated += "\n"
-    target.write_text(updated, encoding="utf-8")
+    target.write_text(updated, encoding="utf-8", errors="surrogateescape", newline="")
     print(f"[INFO] installed managed block to {rel(root, target)}")
     return 0
 
@@ -2261,10 +2266,13 @@ UPGRADE_FULL_UPDATE_PLAN: tuple[str, ...] = (
     ".aiwf/docs/**",
     ".aiwf/templates/**",
 )
+GUIDANCE_NOTES_PATH = ".aiwf/guidance"
+OPTIONAL_GUIDANCE_PACKAGE_FILES = (".aiwf/bin/guidance.py", ".aiwf/docs/guidance.md")
 UPGRADE_PRESERVED_PATHS: tuple[str, ...] = (
     ".aiwf/records/**",
     ".aiwf/events/**",
     ".aiwf/migrations/**",
+    f"{GUIDANCE_NOTES_PATH}/**",
     ".aiwf/config.yaml",
 )
 UPGRADE_COPY_SPECS: Mapping[str, tuple[str, str]] = {
@@ -2561,16 +2569,20 @@ def _install_first_symlink_component(path: Path) -> Optional[Path]:
 
 def _install_agents_text(original: Optional[str], managed: str) -> str:
     managed = managed.rstrip("\n")
-    if original is None:
+    if not original:
         return managed + "\n"
+    line_break = re.search(r"\r\n|\n|\r", original)
+    newline = line_break[0] if line_break else "\n"
+    managed = managed.replace("\n", newline)
     begin, end = _find_agents_block_bounds(original)
     if begin is None and end is None:
-        base = original.rstrip("\n")
-        return f"{base}\n\n{managed}\n" if base else f"{managed}\n"
+        separator = "" if original.endswith(newline * 2) else newline
+        if not original.endswith(newline):
+            separator += newline
+        return original + separator + managed + newline
     if begin is None or end is None:
         raise ValueError("existing AGENTS.md contains an incomplete AIWF managed block")
-    updated = f"{original[:begin].rstrip()}\n\n{managed}\n{original[end:].lstrip()}"
-    return updated if updated.endswith("\n") else updated + "\n"
+    return original[:begin] + managed + original[end:]
 
 
 def _install_target_required_paths() -> tuple[tuple[str, str], ...]:
@@ -2617,7 +2629,20 @@ def _install_preflight(root: Path, source_root: Path) -> tuple[list[str], str, l
     elif _install_path_within(source, target):
         blockers.append("source package must not be inside the target path")
 
-    markers = [path for path in (root / "aiwf", root / ".aiwf") if path.exists()]
+    aiwf_dir = root / ".aiwf"
+    markers = [path for path in (root / "aiwf", aiwf_dir) if path.exists() or path.is_symlink()]
+    guidance = root / GUIDANCE_NOTES_PATH
+    if (
+        aiwf_dir in markers
+        and not aiwf_dir.is_symlink()
+        and not guidance.is_symlink()
+        and guidance.is_dir()
+    ):
+        try:
+            if set(aiwf_dir.iterdir()) == {guidance}:
+                markers.remove(aiwf_dir)
+        except OSError as exc:
+            blockers.append(f"cannot inspect existing .aiwf directory: {exc}")
     agents_path = root / "AGENTS.md"
     agents_original: Optional[str] = None
     managed_present = False
@@ -2627,7 +2652,8 @@ def _install_preflight(root: Path, source_root: Path) -> tuple[list[str], str, l
         else:
             if not _install_path_is_writable(agents_path):
                 blockers.append(f"AGENTS.md is not writable: {agents_path}")
-            agents_original = agents_path.read_text(encoding="utf-8", errors="replace")
+            with agents_path.open(encoding="utf-8", errors="surrogateescape", newline="") as stream:
+                agents_original = stream.read()
             begin, end = _find_agents_block_bounds(agents_original)
             managed_present = begin is not None or end is not None
             if managed_present and (begin is None or end is None):
@@ -2811,7 +2837,7 @@ def install_command(root: Path, target: str, yes: bool) -> int:
         agents_path = target_root / "AGENTS.md"
         transaction.ensure_dir(agents_path.parent)
         transaction.remember_destination(agents_path)
-        agents_path.write_text(agents_text, encoding="utf-8")
+        agents_path.write_text(agents_text, encoding="utf-8", errors="surrogateescape", newline="")
         post_failures = _install_post_validation(target_root, source_root)
         if post_failures:
             raise ValueError("; ".join(post_failures))
@@ -2908,6 +2934,10 @@ def upgrade_command(
     current_info = _upgrade_current_info(root)
     source_info = _upgrade_source_info_unknown() if blockers else _upgrade_source_info(source_root)
     target_gaps = _upgrade_target_requirement_gaps(root)
+    target_gaps.extend(
+        path for path in OPTIONAL_GUIDANCE_PACKAGE_FILES
+        if (source_root / path).is_file() and not (root / path).is_file()
+    )
     relocation_entries = [
         entry
         for entry in (_candidate_legacy_docs_relocation_paths(root) if migrate_legacy_docs else [])

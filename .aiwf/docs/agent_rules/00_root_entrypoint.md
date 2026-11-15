@@ -13,6 +13,8 @@ The managed block content is sourced from `.aiwf/templates/AGENTS.block.md`.
 
 ## Guidance
 
+- Follow [Guidance use in task context](../guidance.md#guidance-use-in-task-context)
+  before the first substantive engineering decision in the current context.
 - Read `00_index.md` before applying non-trivial repo changes.
 - Read `02_ai_workflow.md` for workflow and tooling semantics.
 - Update only the managed block in root `AGENTS.md`; preserve any project-specific content outside the block.

@@ -47,7 +47,7 @@ chmod +x ./aiwf
 ./aiwf upgrade --apply --source /path/to/new_aiwf_repo
 ```
 
-This bootstrap sequence remains the supported upgrade flow for v1.7.15.
+This bootstrap sequence applies to v1.7.16.
 
 ## Upgrade Modes
 
@@ -72,6 +72,7 @@ The upgrade command preserves:
 - `.aiwf/records/**`
 - `.aiwf/events/**`
 - `.aiwf/migrations/**`
+- `.aiwf/guidance/**`
 - `.aiwf/config.yaml`
 
 Preserved means the source package must not overwrite those paths in the target repository.
@@ -102,7 +103,7 @@ migration.
 
 The v1.7.14 runtime creates `ai-workflow-v1.7` tasks with
 `required_review_authority` (default `human`) and writes review evidence as
-`aiwf-event-v0.3` in that release. Current v1.7.15 review records use v0.4
+`aiwf-event-v0.3` in that release. Review records use v0.4 starting in v1.7.15
 and still must provide
 `--decision-authority` and a non-empty `--recorded-by` (or `AIWF_ACTOR`).
 

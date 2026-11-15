@@ -2,25 +2,26 @@
 
 This document is the canonical protocol semantics reference for repository-native AI workflow governance.
 
-## Version Identity Policy (v1.7.15)
+## Version Identity Policy (v1.7.16)
 
 Current version state:
-- release version: `1.7.15`
-- tool version: `1.7.15`
+- release version: `1.7.16`
+- tool version: `1.7.16`
 - workflow protocol version: `1.7.10`
 
-This release changes event actor-attribution and dataset normalization semantics.
-Both command and evidence writers now emit `aiwf-event-v0.4`; dataset output uses
-version `2`. Task metadata remains `ai-workflow-v1.7`. Existing review decision
-authority, finalize, and derived diagnostic semantics remain in force.
+Version 1.7.16 ships the optional Evidence-linked Guidance helper. It reads
+project-owned notes and evidence outside the workflow completion path.
+Protocol 1.7.10 continues to govern review authority and finalize. Command and
+evidence events use `aiwf-event-v0.4`, dataset output uses version `2`, and
+task metadata uses `ai-workflow-v1.7`.
 
-This is a runtime/evidence semantic release, not packaging or metadata cleanup.
-No historical event, task artifact, or finalized manifest migration is required.
-Profiles remain compatible as configured context; optional profile migration
-cleans deprecated attribution fields without rewriting historical evidence.
+Version 1.7.15 introduced event actor attribution and dataset normalization.
+Existing profiles remain compatible as configured context. Optional profile
+migration removes deprecated attribution fields while preserving historical
+evidence. See [v1.7.15 release notes](releases/v1.7.15.md).
 
-Release/tool/protocol identities remain coordinated for this lightweight project.
-Independent release channels or schema negotiation require explicit future design.
+Release and tool versions advance together. The protocol version advances
+when workflow semantics change.
 
 ## 1. System Scope
 
@@ -93,6 +94,17 @@ The existing `not_required` reason requirement remains in force. Older active
 records that explicitly require human review cannot close through a missing
 authority field. Older finalized records remain readable and are not
 retroactively invalidated solely by the current authority semantics.
+
+Review PASS is interpreted within the actual scope assessed: implementation
+review checks the implementation; validation review checks validation design,
+results, or evidence; requirement/AC review checks AC against original
+requirements; workflow review checks evidence and protocol compliance.
+Implementation Review PASS does not automatically establish Requirement
+Interpretation PASS. AI Review PASS cannot substitute for required Human
+Review PASS; Human Review PASS does not establish infallible judgment.
+Different AI models participating in review do not by themselves establish
+semantic independence. These distinctions qualify evidence; they do not add a
+review-scope schema, required field, or mandatory review stage.
 
 For active v1.2–v1.6 records, explicit required authority is honored; when
 absent, `reviewer: human` supplies the compatibility requirement. Recording a
@@ -168,6 +180,11 @@ runtime/host observations yield `observed`; incompatible observations yield
 conflicts or verify identity. Source labels are declared provenance, not
 authenticated model identity.
 
+An `observed` status classifies supplied runtime/host observation evidence; it
+does not establish authenticated execution-model identity or identify all work
+contributors. Reported or configured identity must not be promoted to observed
+execution truth.
+
 Observations come from a direct per-event integration input or transient live
 process `AIWF_ACTOR_IDENTITY` JSON. This input is never sourced from profiles,
 local metadata, or repository `.env`. Malformed input warns and yields unknown
@@ -235,6 +252,27 @@ Re-running backfill for the same source identity is an idempotent no-op when the
 ## 3. Finalize Semantics
 
 `./aiwf finalize --path <task_dir>` is the workflow completion authority.
+
+Finalize is a workflow closure decision based on applicable deterministic
+checks and recorded evidence. Finalize PASS means those workflow closure
+conditions were satisfied; it does not verify underlying engineering or domain
+truth, correct requirement interpretation, complete implementation of the
+original requirements, or sufficient validation coverage.
+
+AC closure means parsed AC items satisfy the applicable closure-state rules;
+it does not establish requirement completeness or the truth of an AC claim.
+A requirement-to-AC mapping, when supplied, declares a relationship and does
+not prove semantic coverage. No requirement IDs, mappings, coverage percentage,
+semantic score, or AC correctness gate are introduced by this clarification.
+
+Validation PASS is evidence of a recorded validation result, not proof of
+validation sufficiency. `record --kind validation --command "<...>"` stores
+the supplied command description and result; AIWF does not execute that command
+or independently verify its exit code. Actual command execution needs its own
+supporting evidence. An executed passing check supports conclusions within its
+actual coverage; neither the recorded result nor execution alone establishes
+adequate coverage or requirement correctness. This describes existing behavior
+and adds no validation or finalize gate.
 
 First successful finalize:
 
@@ -318,7 +356,7 @@ Post-finalize correction policy (errata workflow):
   - document drift scope and diagnosis
   - restore consistency with auditable commands/actions
   - validate repaired state (`check --finalize-ready`) and record results
-  - Controlled amend/reopen runtime semantics remain future work (v1.9+) and are not part of v1.7.15 behavior.
+  - Controlled amend/reopen runtime semantics remain future work (v1.9+) and are not part of Protocol 1.7.10.
 
 Pre-edit guard:
 

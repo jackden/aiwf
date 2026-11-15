@@ -58,6 +58,17 @@ Replace `<task-path>` with the path printed by `new-task`. The finalize-ready
 check is read-only. Finalize closes the current workflow only after the
 required evidence and review decisions are complete.
 
+### What does Finalize PASS mean?
+
+AIWF Finalize PASS indicates that a task satisfied the applicable workflow
+closure conditions based on its recorded evidence, including required
+validation, review, and authority checks. It does not guarantee that original
+requirements were fully understood or implemented, that validation coverage
+was sufficient, or that the engineering result is correct. Engineering
+correctness remains subject to appropriate validation, domain expertise, and
+human judgment. See the [Workflow Protocol](.aiwf/docs/workflow_protocol.md#3-finalize-semantics)
+for the evidence boundaries.
+
 New tasks use structured review authority evidence. A task's
 `required_review_authority` policy is checked against the review's
 `decision_authority`; `recorded_by` identifies the actor that wrote the event
@@ -141,15 +152,15 @@ reasoning.
 ## Project Status and Current Release
 
 AIWF is under active development and is being evaluated through real engineering
-workflow records. Use tagged public releases for adoption. Tool and protocol
-versions evolve independently.
+workflow records. The version table describes this source tree. Use tagged
+public releases for adoption. Tool and protocol versions evolve independently.
 
 | Field | Value |
 | --- | --- |
-| Current Release | `1.7.15` |
-| Tool Version | `1.7.15` |
+| Current Release | `1.7.16` |
+| Tool Version | `1.7.16` |
 | Workflow Protocol Version | `1.7.10` |
-| Latest Release Notes | [v1.7.15](.aiwf/docs/releases/v1.7.15.md) |
+| Latest Release Notes | [v1.7.16](.aiwf/docs/releases/v1.7.16.md) |
 | GitHub Releases | [jackden/aiwf releases](https://github.com/jackden/aiwf/releases) |
 
 ## Documentation
@@ -157,6 +168,7 @@ versions evolve independently.
 - [Installation Guide](.aiwf/docs/adoption_guide.md)
 - [Upgrade Guide](.aiwf/docs/upgrading.md)
 - [CLI Reference](.aiwf/docs/cli_reference.md)
+- [Evidence-linked Guidance](.aiwf/docs/guidance.md)
 - [Workflow Protocol](.aiwf/docs/workflow_protocol.md)
 - [Agent Rules](.aiwf/docs/agent_rules/00_index.md)
 - [Reporting Guide](.aiwf/docs/reporting.md)

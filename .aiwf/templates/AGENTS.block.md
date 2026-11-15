@@ -1,7 +1,9 @@
 <!-- AIWF:BEGIN -->
 This repository uses AIWF.
+When starting or resuming work, read `.aiwf/docs/agent_rules/00_root_entrypoint.md`
+before the first substantive engineering decision, including in read-only analysis.
 Before editing repository files:
-- Read `.aiwf/docs/agent_rules/00_root_entrypoint.md`
+- Read `.aiwf/docs/agent_rules/00_root_entrypoint.md` if you have not read it for the current task context.
 - Read `.aiwf/docs/workflow_protocol.md`
 Use `./aiwf` for:
 - task creation

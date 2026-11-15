@@ -16,6 +16,8 @@ AIWF treats the region between these markers as managed content:
 ```
 
 Everything outside the managed block is user-owned content and must be preserved.
+Use one pair of markers on their own lines, in start-to-end order. An ambiguous
+or incomplete pair returns `AIWF-AGENTS-003` before a write.
 
 ## Template Source of Truth
 
@@ -49,35 +51,27 @@ Copy the template into the repository package before using the AGENTS helpers.
 - Replaces only the managed block when one already exists.
 - Preserves all block-external content.
 
-## Example Managed Block
-
-```md
-<!-- AIWF:BEGIN -->
-This repository uses AIWF.
-Before editing repository files:
-- Read `.aiwf/docs/agent_rules/00_root_entrypoint.md`
-- Read `.aiwf/docs/workflow_protocol.md`
-Use `./aiwf` for:
-- task creation
-- pre-edit guard
-- validation
-- review evidence
-- `./aiwf finalize`
-- `./aiwf check --path <task_path>`
-- `./aiwf check --path <task_path> --finalize-ready`
-Do not manually rewrite AIWF task front matter.
-AIWF workflow records are stored under:
-.aiwf/records/
-Workflow events are stored under:
-.aiwf/events/
-<!-- AIWF:END -->
-```
+The [managed template](../templates/AGENTS.block.md) points agents to the
+[root entrypoint](agent_rules/00_root_entrypoint.md) at task-context start or
+resumption, including read-only engineering analysis. Fresh installs generate
+the block from that template. This convention relies on agents reading their
+repository instructions.
 
 ## Current Usage Pattern
 
 - Use `./aiwf agents install --path AGENTS.md --yes` after first install or when a block needs to be refreshed.
 - Use `./aiwf agents check --path AGENTS.md` in validation and before commit.
 - Use `./aiwf agents print-block` when you want the canonical block text for review or comparison.
+
+For an existing project, bring the AIWF package up to date, then run
+`./aiwf agents check --path AGENTS.md`. If it reports `AIWF-AGENTS-OUTDATED`,
+run `./aiwf agents install --path AGENTS.md --yes`, then rerun the check.
+An earlier snapshot with the same tool version may be treated as current by
+`upgrade`. In that case, copy `.aiwf/bin/ai_workflow.py`,
+`.aiwf/bin/guidance.py`, `.aiwf/docs/guidance.md`,
+`.aiwf/docs/agent_rules/00_root_entrypoint.md`, this guide, the release notes,
+and `.aiwf/templates/AGENTS.block.md` from the intended package before
+refreshing the block.
 
 ## Notes
 

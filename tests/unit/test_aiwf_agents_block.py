@@ -155,6 +155,49 @@ def test_agents_install_replaces_only_managed_block(tmp_path: Path):
     assert AGENTS_TEMPLATE_TEXT.strip() in content
 
 
+@pytest.mark.parametrize("newline,prefix", [
+    (b"\n", "# 專案規則\n\n".encode()),
+    (b"\r\n", b"# Project rules\r\nKeep trailing spaces  \r\n\r\n"),
+    (b"\r", b"\xef\xbb\xbf"),
+])
+def test_agents_refresh_keeps_private_bytes(tmp_path: Path, capsys, newline: bytes, prefix: bytes):
+    root = _init_repo(tmp_path)
+    path = root / "AGENTS.md"
+    suffix = newline.join([b"", b"", b"    Keep this indented example", b"", b"End without final newline"])
+    old_block = newline.join([b"<!-- AIWF:BEGIN -->", b"Previous bootstrap", b"<!-- AIWF:END -->"])
+    original = prefix + old_block + suffix
+    path.write_bytes(original)
+
+    assert _run_agents_cli(root, ["check", "--path", "AGENTS.md"]) == 2
+    assert "AIWF-AGENTS-OUTDATED" in capsys.readouterr().out
+    assert path.read_bytes() == original
+
+    assert _run_agents_cli(root, ["install", "--path", "AGENTS.md", "--yes"]) == 0
+    capsys.readouterr()
+    assert _run_agents_cli(root, ["check", "--path", "AGENTS.md"]) == 0
+    assert "AIWF-AGENTS-OK" in capsys.readouterr().out
+    block = AGENTS_TEMPLATE_TEXT.rstrip("\n").encode().replace(b"\n", newline)
+    assert path.read_bytes() == prefix + block + suffix
+
+
+@pytest.mark.parametrize("original", [
+    b"<!-- AIWF:BEGIN -->\n<!-- AIWF:BEGIN -->\nPrivate instructions\n<!-- AIWF:END -->\n",
+    b"An example <!-- AIWF:BEGIN -->\nPrivate instructions\n<!-- AIWF:END --> appears here.\n",
+    b"<!-- AIWF:BEGIN -->\n<!-- AIWF:END -->\n<!-- AIWF:BEGIN -->\n<!-- AIWF:END -->\n",
+    b"<!-- AIWF:END -->\nPrivate instructions\n<!-- AIWF:BEGIN -->\n",
+])
+def test_agents_refresh_rejects_ambiguous_marker_bounds(tmp_path: Path, capsys, original: bytes):
+    root = _init_repo(tmp_path)
+    path = root / "AGENTS.md"
+    path.write_bytes(original)
+
+    assert _run_agents_cli(root, ["check", "--path", "AGENTS.md"]) == 2
+    assert "AIWF-AGENTS-003" in capsys.readouterr().out
+    assert _run_agents_cli(root, ["install", "--path", "AGENTS.md", "--yes"]) == 2
+    assert "AIWF-AGENTS-003" in capsys.readouterr().out
+    assert path.read_bytes() == original
+
+
 def test_agents_install_allows_repo_local_nested_path_via_cli(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
     nested_path = "docs/agents/AGENTS.md"

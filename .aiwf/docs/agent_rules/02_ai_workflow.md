@@ -19,7 +19,7 @@ Deterministic correctness enforcement is implemented in `.aiwf/bin/ai_workflow.p
 - Prevent premature completion claims.
 - Preserve legacy records without forced mass migration.
 - Keep AGENTS.md governance instructions aligned with AIWF completion authority.
-- Keep release/tool/protocol version metadata aligned in current v1.7.15 governance scope unless explicit compatibility requirements require separation.
+- Keep release and tool versions aligned. Advance the protocol version when workflow semantics change.
 
 ## Agent Instruction Surface
 
@@ -84,6 +84,26 @@ runtime code
 
 ## Deterministic Invariants
 
+### Evidence interpretation guidance
+
+Build AC from the actual requirements, rather than treating checkable AC
+closure as confirmation that the AC interpretation is correct or complete.
+Keep validation conclusions within the scope actually tested, and distinguish
+reported results from evidence of actual command execution. Describe review
+scope and limitations in prose so a PASS for implementation, validation,
+requirements/AC, or workflow evidence is not generalized to other claims.
+Describe finalize as workflow closure, never engineering correctness
+certification. Mark evidence that cannot be confirmed as unknown; do not infer
+execution identity, work contributors, independence, or decision authority
+from configured model names or supplied observation labels.
+
+This is evidence interpretation guidance, not additional required metadata,
+review fields, review stages, or runtime enforcement. The formal boundaries
+are in [Workflow Protocol](../workflow_protocol.md#3-finalize-semantics) and its
+review decision authority and actor identity sections.
+
+### Existing enforcement invariants
+
 - Use `new-task` / `next-id` for task ID allocation.
 - `new-task` is create-only; `new-task --update-existing` fails closed before any file write.
 - Within one `ai_YYYYMMDD` directory, normalized task names must be unique. New-task rejects duplicates before ID allocation, and task diagnostics report existing duplicates as blockers.
@@ -138,7 +158,7 @@ runtime code
 - Use `./aiwf inspect --path <task_dir>` to distinguish historical closure from
   current effective state; do not infer current state from finalized prose
   alone when a correction artifact is present.
-- The current semantic runtime boundary is `v1.7.15`; post-finalization
+- The current workflow semantics are defined by Protocol `v1.7.10`; post-finalization
   correction remains additive and separate from review authority evidence.
 
 ## v1.7.15 Scope Note

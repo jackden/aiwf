@@ -270,6 +270,18 @@ def test_install_preserves_existing_agents_content(tmp_path: Path):
     assert "<!-- AIWF:BEGIN -->" in installed
 
 
+def test_install_appends_agents_block_without_changing_project_bytes(tmp_path: Path):
+    target = tmp_path / "target"
+    target.mkdir()
+    agents = target / "AGENTS.md"
+    original = b"# Project instructions\r\n\r\n    Keep this indented example  "
+    agents.write_bytes(original)
+
+    assert ai_workflow.main(["install", "--target", str(target), "--yes"]) == 0
+    template = ai_workflow.aiwf_agents_managed_block(target)
+    assert agents.read_bytes() == original + b"\r\n\r\n" + template.encode().replace(b"\n", b"\r\n")
+
+
 def test_install_rejects_orphan_agents_block_without_writing(tmp_path: Path, capsys):
     target = tmp_path / "target"
     target.mkdir()
@@ -5398,24 +5410,35 @@ def test_diagnostics_registry_consistency():
 
 
 def test_current_release_version_projection_is_converged():
-    assert ai_workflow.AIWF_TOOL_VERSION == "1.7.15"
-    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == "1.7.10"
+    release = "1.7.16"
+    protocol = "1.7.10"
+    assert ai_workflow.AIWF_TOOL_VERSION == release
+    assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == protocol
     assert ai_workflow.CURRENT_SCHEMA_VERSION == ai_workflow.SCHEMA_V17
+    assert ai_workflow.AIWF_EVENT_SCHEMA_VERSION == "aiwf-event-v0.4"
     assert ai_workflow.AIWF_EVIDENCE_EVENT_SCHEMA_VERSION == "aiwf-event-v0.4"
+    assert ai_workflow.AIWF_DATASET_SCHEMA_VERSION == "2"
 
     runtime_text = (REPO_ROOT / ".aiwf" / "bin" / "ai_workflow.py").read_text(encoding="utf-8")
-    assert 'AIWF_TOOL_VERSION = "1.7.15"' in runtime_text
-    assert 'WORKFLOW_PROTOCOL_VERSION = "1.7.10"' in runtime_text
+    assert f'AIWF_TOOL_VERSION = "{release}"' in runtime_text
+    assert f'WORKFLOW_PROTOCOL_VERSION = "{protocol}"' in runtime_text
     readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "| Current Release | `1.7.15` |" in readme_text
-    assert "| Workflow Protocol Version | `1.7.10` |" in readme_text
-    assert "v1.7.15.md" in readme_text
+    assert f"| Current Release | `{release}` |" in readme_text
+    assert f"| Tool Version | `{release}` |" in readme_text
+    assert f"| Workflow Protocol Version | `{protocol}` |" in readme_text
+    assert f"| Latest Release Notes | [v{release}](.aiwf/docs/releases/v{release}.md) |" in readme_text
     protocol_text = (REPO_ROOT / ".aiwf" / "docs" / "workflow_protocol.md").read_text(encoding="utf-8")
-    assert "# AI Workflow Protocol v1.7.10" in protocol_text
+    assert f"# AI Workflow Protocol v{protocol}" in protocol_text
+    assert f"## Version Identity Policy (v{release})" in protocol_text
+    assert f"- release version: `{release}`" in protocol_text
+    assert f"- tool version: `{release}`" in protocol_text
+    assert f"- workflow protocol version: `{protocol}`" in protocol_text
     assert "review decision MUST carry a valid decision authority" in protocol_text
-    release_text = (REPO_ROOT / ".aiwf" / "docs" / "releases" / "v1.7.15.md").read_text(encoding="utf-8")
-    assert "Why This Is Not a `.post` Release" in release_text
-    assert "cross-task dependency enforcement" in release_text
+    release_text = (REPO_ROOT / ".aiwf" / "docs" / "releases" / f"v{release}.md").read_text(encoding="utf-8")
+    assert f"# AIWF v{release} " in release_text
+    assert f"- Release and tool version: `{release}`" in release_text
+    assert f"- Workflow protocol: `{protocol}`" in release_text
+    assert "Evidence-linked Guidance" in release_text
     historical_text = (REPO_ROOT / ".aiwf" / "docs" / "releases" / "v1.7.13.post1.md").read_text(encoding="utf-8")
     assert "1.7.13.post1" in historical_text
     assert "1.7.8" in historical_text

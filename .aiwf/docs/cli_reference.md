@@ -27,6 +27,9 @@ Use `record` for explicit validation, review, fix, and safety evidence. Use
 `doctor` for diagnostics and `inspect` to distinguish historical closure from
 an additive post-finalization correction.
 
+Use the optional [Guidance helper](guidance.md) to check or display
+project-owned notes linked to workflow evidence.
+
 ## Review authority evidence (v1.7.14)
 
 New tasks use schema `ai-workflow-v1.7` and default to
