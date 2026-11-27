@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import asdict
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -177,6 +179,9 @@ def test_install_writes_package_and_agents_block(tmp_path: Path, capsys):
 
     assert rc == 0
     assert "AIWF installed successfully." in output
+    mcp_guide = ".aiwf/docs/examples/mcp_setup.md"
+    assert mcp_guide in output
+    assert (target / mcp_guide).is_file()
     assert (target / "aiwf").is_file()
     assert (target / ".aiwf" / "bin" / "ai_workflow.py").is_file()
     assert (target / ".aiwf" / "config.yaml").is_file()
@@ -192,6 +197,7 @@ def test_install_writes_package_and_agents_block(tmp_path: Path, capsys):
     help_result = subprocess.run([str(target / "aiwf"), "--help"], cwd=target, text=True, capture_output=True, check=False)
     assert help_result.returncode == 0
     assert "install" in help_result.stdout
+    assert mcp_guide in help_result.stdout
 
 
 def test_source_wrapper_installs_from_external_working_directory(tmp_path: Path):
@@ -371,12 +377,12 @@ def test_install_copy_failure_rolls_back(monkeypatch, tmp_path: Path, capsys):
     original_copy = ai_workflow.safe_copy_file_no_symlink
     calls = 0
 
-    def fail_after_first(source: Path, destination: Path, allowed_root: Path) -> None:
+    def fail_after_first(source: Path, destination: Path, allowed_root: Path, dest_root: Path) -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("forced copy failure")
-        original_copy(source, destination, allowed_root)
+        original_copy(source, destination, allowed_root, dest_root)
 
     monkeypatch.setattr(ai_workflow, "safe_copy_file_no_symlink", fail_after_first)
     rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
@@ -390,14 +396,14 @@ def test_install_copy_failure_rolls_back(monkeypatch, tmp_path: Path, capsys):
 def test_install_agents_failure_rolls_back(monkeypatch, tmp_path: Path, capsys):
     target = tmp_path / "target"
     target.mkdir()
-    original_write_text = Path.write_text
+    original_writer = ai_workflow.destination_writer
 
-    def fail_agents_write(path: Path, data: str, *args, **kwargs):
+    def fail_agents_write(path: Path, root: Path):
         if path == target / "AGENTS.md":
             raise OSError("forced AGENTS failure")
-        return original_write_text(path, data, *args, **kwargs)
+        return original_writer(path, root)
 
-    monkeypatch.setattr(Path, "write_text", fail_agents_write)
+    monkeypatch.setattr(ai_workflow, "destination_writer", fail_agents_write)
     rc = ai_workflow.main(["install", "--target", str(target), "--yes"])
     output = capsys.readouterr().out
 
@@ -594,6 +600,7 @@ def _seed_minimal_upgrade_source(root: Path) -> Path:
     (root / ".aiwf" / "bin" / "safe_paths.py").write_text("class SafePathError(ValueError):\n    pass\n", encoding="utf-8")
     (root / ".aiwf" / "bin" / "lib").mkdir(parents=True, exist_ok=True)
     (root / ".aiwf" / "bin" / "lib" / "package_core.py").write_text("# package core\n", encoding="utf-8")
+    (root / ".aiwf" / "bin" / "lib" / "workflow_lock.py").write_text("# workflow storage lock\n", encoding="utf-8")
     (root / ".aiwf" / "docs").mkdir(parents=True, exist_ok=True)
     (root / ".aiwf" / "docs" / "workflow_protocol.md").write_text("protocol\n", encoding="utf-8")
     (root / ".aiwf" / "templates").mkdir(parents=True, exist_ok=True)
@@ -1784,6 +1791,120 @@ def test_new_task_keyboard_interrupt_leaves_no_orphan_directory(tmp_path: Path, 
     assert not (root / "docs" / "ai_20260602" / "001_keyboard_interrupt_task").exists()
 
 
+@pytest.mark.parametrize(("operation", "mode"), [
+    ("inspect", []), ("check", []), ("check", ["--finalize-ready"]), ("diagnostics", []),
+])
+def test_query_matches_runtime_without_recording_events(tmp_path, capsys, operation, mode):
+    root = _init_repo(tmp_path)
+    task = _create_v2_task(root)
+    _enable_event_logging(root)
+    path = task.relative_to(root).as_posix()
+    before = _snapshot_tree(root)
+    capsys.readouterr()
+    rc = ai_workflow.main(["--repo-root", str(root), "query", operation, "--path", path, *mode])
+    data = json.loads(capsys.readouterr().out)
+    assert data["execution"] == "ok" and data["exit_code"] == rc
+    assert data["contract_version"] == 1 and data["result"]["task_path"] == path
+    assert before == _snapshot_tree(root)
+    if operation == "diagnostics":
+        expected, _ = ai_workflow._doctor_projection(root, task)
+    elif operation == "check":
+        expected = ai_workflow._collect_task_diagnostics(
+            root, task, v11_missing_is_fail=True, include_finalize_checks=bool(mode))
+    old_command = "doctor" if operation == "diagnostics" else operation
+    assert rc == ai_workflow.main(["--repo-root", str(root), old_command, "--path", path, *mode])
+    output = capsys.readouterr().out
+    if operation == "inspect":
+        assert data["result"]["workflow_phase"] in output and not data["result"]["closure_preserved"]
+    else:
+        items = data["result"]["diagnostics"]
+        assert items == [asdict(item) for item in expected]
+        assert any(item["severity"] == "info" for item in items)
+        assert all(item["code"] in output for item in items if item["severity"] in {"error", "warn"})
+        query = " ".join(["./aiwf", "query", operation, *mode, "--path", path])
+        assert f"Full diagnostics: {query}" in output.splitlines()
+        if mode:
+            assert rc == 2 and data["result"]["workflow_result"] == "BLOCKED"
+        elif operation == "diagnostics":
+            assert "derived_status" in data["result"]["derived_evidence"]
+    if operation == "diagnostics" or (operation == "check" and not mode):
+        event_path = f"{path}/.aiwf/events.jsonl"
+        assert _snapshot_tree(root)[event_path] != before.get(event_path)
+
+
+def test_query_context_uses_installed_runtime_without_optional_packages_or_bytecode(tmp_path):
+    root = _init_repo(tmp_path)
+    _write_v2_config(root)
+    runtime_dir = root / ".aiwf/bin"
+    shutil.copytree(REPO_ROOT / ".aiwf/bin", runtime_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    result = subprocess.run([sys.executable, "-S", str(runtime_dir / "ai_workflow.py"), "--repo-root",
+                             str(root), "query", "context"], cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    context = json.loads(result.stdout)["result"]
+    assert context["tool_version"] == ai_workflow.AIWF_TOOL_VERSION
+    assert context["records_root"] == ".aiwf/records"
+    assert not context["capabilities"]["guidance"] and not context["capabilities"]["write_operations"]
+    assert not list(runtime_dir.rglob("__pycache__"))
+
+
+def test_query_diagnostics_does_not_resolve_foreign_event_paths_or_read_unrelated_inputs(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "project"
+    root.mkdir()
+    task = _create_v2_task(root)
+    foreign = tmp_path / "unrelated"
+    foreign.mkdir()
+    sibling = task.parent / "002_sibling"
+    sibling.mkdir()
+    (sibling / "task.md").symlink_to(foreign / "other-task.md")
+    (root / ".env").symlink_to(foreign / "project.env")
+    event_log = root / ".aiwf/events/events.jsonl"
+    event_log.parent.mkdir(parents=True, exist_ok=True)
+    event_log.write_text(json.dumps({"task_path": str(foreign / "task"), "command": "check"}) + "\n")
+    original = Path.resolve
+
+    def resolve_local(path, *args, **kwargs):
+        assert not path.is_relative_to(foreign)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_local)
+    capsys.readouterr()
+    ai_workflow.main(["--repo-root", str(root), "query", "diagnostics", "--path", task.relative_to(root).as_posix()])
+    result = json.loads(capsys.readouterr().out)
+    assert result["execution"] == "ok"
+    assert result["result"]["derived_evidence"]["projection"]["global_event_count"] == 0
+
+
+def test_query_rejects_noncanonical_targets_and_linked_inputs(tmp_path, capsys):
+    root = tmp_path / "project"
+    root.mkdir()
+    task = _create_v2_task(root)
+    path = task.relative_to(root).as_posix()
+    outside = tmp_path / "outside"
+    outside.write_text("unrelated file")
+
+    def reject(target):
+        capsys.readouterr()
+        assert ai_workflow.main(["--repo-root", str(root), "query", "diagnostics", "--path", target]) == 2
+        data = json.loads(capsys.readouterr().out)
+        assert data["result"] is None and data["execution"] == "error"
+        assert "unrelated file" not in str(data)
+
+    for wrong in (str(task), path + "/", "001", "../outside", "./" + path):
+        reject(wrong)
+    for input_path in (task / "review_final.md", task.parent / "index.md", root / ".aiwf/events/events.jsonl"):
+        input_path.parent.mkdir(parents=True, exist_ok=True)
+        saved = input_path.with_suffix(".saved")
+        if input_path.exists():
+            input_path.rename(saved)
+        input_path.symlink_to(outside)
+        reject(path)
+        input_path.unlink()
+        if saved.exists():
+            saved.rename(input_path)
+    (root / ".aiwf/config.yaml").write_text('aiwf_layout_version: 2\nrecord_root: "../project"\n')
+    reject(path)
+
+
 def test_check_passes_for_valid_v16_task(tmp_path: Path):
     root = _init_repo(tmp_path)
     task_dir = _create_task(root)
@@ -2295,6 +2416,19 @@ def test_relocate_apply_writes_config(tmp_path: Path, capsys):
     assert (root / ".aiwf" / "events" / "events.jsonl").exists()
 
 
+def test_legacy_record_relocation_uses_existing_v2_records_root(tmp_path):
+    root = _init_repo(tmp_path)
+    legacy = _seed_legacy_relocation_layout(root)
+    config = root / ".aiwf/config.yaml"
+    config.parent.mkdir()
+    data = b"aiwf_layout_version: 2\nrecord_root: .aiwf/team-records\nlegacy_enabled: false\n"
+    config.write_bytes(data)
+    assert ai_workflow.main(["--repo-root", str(root), "relocate", "--legacy-docs", "--apply"]) == 0
+    expected = root / ".aiwf/team-records" / legacy.parent.name / legacy.name / "task.md"
+    assert expected.read_text() == "task.md\n"
+    assert config.read_bytes() == data
+
+
 def test_upgrade_check_legacy_repo_does_not_relocate_tools_runtime(tmp_path: Path, capsys):
     root = _seed_upgrade_target_repo(tmp_path)
 
@@ -2316,7 +2450,7 @@ def test_upgrade_check_legacy_repo_does_not_relocate_tools_runtime(tmp_path: Pat
     assert "legacy tools/ai_workflow.py exists and is project-owned" in out
     assert "tools/ai_workflow.py -> .aiwf/bin/ai_workflow.py" not in out
     assert "blockers: none" in out
-    assert "./aiwf upgrade --dry-run --source" in out
+    assert f"./aiwf --repo-root {shlex.quote(str(root))} upgrade --dry-run --source" in out
 
 
 def test_upgrade_check_current_v2_repo_no_upgrade_needed(tmp_path: Path, capsys):
@@ -2410,8 +2544,8 @@ def test_upgrade_apply_preserves_project_docs_by_default(tmp_path: Path, capsys)
     assert (root / ".aiwf" / "docs" / "adoption_guide.md").exists()
     assert (root / ".aiwf" / "docs" / "agent_rules" / "00_index.md").exists()
     assert (root / ".aiwf" / "docs" / "examples" / "basic_lifecycle.md").exists()
-    if (REPO_ROOT / ".aiwf" / "docs" / "knowledge" / "README.md").exists():
-        assert (root / ".aiwf" / "docs" / "knowledge" / "README.md").exists()
+    assert not (root / ".aiwf" / "docs" / "knowledge" / "README.md").exists()
+    assert not (root / ".aiwf" / "bin" / "package_review_bundle.py").exists()
     assert not (root / ".aiwf" / "records" / "ai_20260610" / "001_legacy_task" / "task.md").exists()
     assert legacy_tools.read_text(encoding="utf-8") == legacy_tools_before
     assert "legacy tools/ai_workflow.py exists and is project-owned" in out
@@ -2547,9 +2681,10 @@ def test_upgrade_check_rejects_missing_source_lib(tmp_path: Path, capsys):
     out = capsys.readouterr().out
 
     assert rc == 2
-    assert "blockers: 2" in out
-    assert "missing required source package path: .aiwf/bin/lib" in out
-    assert "missing required source package path: .aiwf/bin/lib/package_core.py" in out
+    assert "blockers: 3" in out
+    missing = {line.split("missing required source package path: ", 1)[1]
+               for line in out.splitlines() if "missing required source package path: " in line}
+    assert missing == {".aiwf/bin/lib", ".aiwf/bin/lib/package_core.py", ".aiwf/bin/lib/workflow_lock.py"}
 
 
 def test_upgrade_check_rejects_missing_source_package_core(tmp_path: Path, capsys):
@@ -2599,6 +2734,24 @@ def test_upgrade_check_same_version_missing_runtime_dependency_requires_repair(t
     assert "Next:\n  none" not in out
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX launcher execute permissions")
+def test_source_side_upgrade_restores_nonexecutable_launcher(tmp_path: Path, capsys):
+    root = _seed_current_v2_repo(tmp_path)
+    launcher = root / "aiwf"
+    launcher.chmod(0o644)
+    for mode in ("--check", "--dry-run", "--apply"):
+        rc = ai_workflow.main(["--repo-root", str(root), "upgrade", mode, "--source", str(REPO_ROOT)])
+        out = capsys.readouterr().out
+        assert rc == 0
+        if mode != "--apply":
+            assert "repair_required: yes" in out and "Will update:\n  - aiwf\n" in out
+            assert not os.access(launcher, os.X_OK)
+    assert os.access(launcher, os.X_OK)
+    run = subprocess.run([launcher, "--version"], cwd=root, capture_output=True, text=True,
+                         env={**os.environ, "AIWF_PYTHON": sys.executable})
+    assert run.returncode == 0 and ai_workflow.AIWF_TOOL_VERSION in run.stdout
+
+
 def test_upgrade_check_same_version_missing_package_core_requires_repair(tmp_path: Path, capsys):
     root = _seed_current_v2_repo(tmp_path)
     (root / ".aiwf" / "bin" / "lib" / "package_core.py").unlink()
@@ -2629,6 +2782,44 @@ def test_upgrade_check_same_version_missing_template_requires_repair(tmp_path: P
     assert "Will update:\n  - .aiwf/templates/**" in out
 
 
+@pytest.mark.parametrize("contract", ["query", "mutation"])
+def test_declared_schema_checked_before_install_upgrade_and_same_version_repair(
+    tmp_path: Path, monkeypatch, capsys, contract: str
+):
+    source = tmp_path / "source"
+    _copy_supported_install_set(REPO_ROOT, source)
+    target = tmp_path / "target"
+    target.mkdir()
+    _seed_current_v2_repo(target)
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    _set_install_source(monkeypatch, source)
+    schema = Path(f".aiwf/docs/schemas/{contract}_result_v1.schema.json")
+    (source / schema).unlink()
+
+    assert ai_workflow.main(["install", "--target", str(fresh), "--yes"]) == 2
+    assert str(schema) in capsys.readouterr().out
+    assert list(fresh.iterdir()) == []
+
+    def upgrade(action):
+        return ai_workflow.main(["--repo-root", str(target), "upgrade", action, "--source", str(source)])
+
+    assert upgrade("--apply") == 2
+    assert str(schema) in capsys.readouterr().out
+    assert (target / schema).is_file()
+    shutil.copy2(REPO_ROOT / schema, source / schema)
+    (target / schema).unlink()
+    for action in ("--check", "--dry-run"):
+        assert upgrade(action) == 0
+        output = capsys.readouterr().out
+        assert "repair_required: yes" in output and "  - .aiwf/docs/**" in output
+        assert not (target / schema).exists()
+    assert upgrade("--apply") == 0
+    assert (target / schema).read_bytes() == (source / schema).read_bytes()
+    assert upgrade("--apply") == 0
+    assert "AIWF-UPGRADE-NOOP" in capsys.readouterr().out
+
+
 def test_upgrade_apply_same_version_repairs_missing_runtime_and_template(tmp_path: Path, capsys):
     root = _seed_current_v2_repo(tmp_path)
     (root / ".aiwf" / "bin" / "safe_paths.py").unlink()
@@ -2646,6 +2837,115 @@ def test_upgrade_apply_same_version_repairs_missing_runtime_and_template(tmp_pat
     assert (root / ".aiwf" / "templates" / "AGENTS.block.md").exists()
     assert "- installed .aiwf/bin" in out
     assert "- installed .aiwf/templates" in out
+
+
+def test_source_launcher_repairs_managed_bytes_and_preserves_adopter_files(tmp_path: Path):
+    target = _seed_current_v2_repo(tmp_path)
+    module = Path(".aiwf/bin/lib/package_core.py")
+    guide = Path(".aiwf/docs/adoption_guide.md")
+    template = Path(".aiwf/templates/AGENTS.block.md")
+    (target / module).write_bytes(b"")
+    (target / guide).unlink()
+    (target / template).write_bytes(b"x" * (REPO_ROOT / template).stat().st_size)
+    # Matching size and modification time alone cannot establish content equality.
+    shutil.copystat(REPO_ROOT / template, target / template)
+    config = target / ".aiwf/config.yaml"
+    config_bytes = (
+        b"# team settings\r\naiwf_layout_version: 2\r\nrecord_root: .aiwf/team-records\r\n"
+        b"event_log: .aiwf/team-events/history.jsonl\r\nlegacy_enabled: false\r\n"
+    )
+    config.write_bytes(config_bytes)
+    protected = [config]
+    for name in (
+        "AGENTS.md", "docs/local.md", ".aiwf/docs/target-only.md",
+        ".aiwf/guidance/local.md", ".aiwf/records/synthetic/task.md",
+        ".aiwf/events/events.jsonl", ".aiwf/migrations/previous.md",
+    ):
+        path = target / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"adopter content for {name}\n", encoding="utf-8")
+        protected.append(path)
+    original = _snapshot_text_files(protected)
+
+    def cli(cwd, *args):
+        return subprocess.run(
+            [str(cwd / "aiwf"), *args], cwd=cwd, text=True, capture_output=True,
+            env={**os.environ, "AIWF_PYTHON": sys.executable, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+
+    assert "ImportError" in cli(target, "--version").stderr
+    source_args = ["--repo-root", str(target), "upgrade", "--source", str(REPO_ROOT)]
+    for mode in ("--check", "--dry-run"):
+        result = cli(REPO_ROOT, *source_args, mode)
+        assert result.returncode == 0, result.stderr
+        assert "repair_required: yes" in result.stdout
+        assert result.stdout.count("  records: .aiwf/team-records\n") == 2
+        for name in (module, guide, template):
+            assert f"  - {name.as_posix()}\n" in result.stdout
+        assert (target / module).read_bytes() == b""
+        assert not (target / guide).exists()
+
+    result = cli(REPO_ROOT, *source_args, "--apply")
+    assert result.returncode == 0, result.stderr
+    assert "AIWF-UPGRADE-OK" in result.stdout
+    for name in (module, guide, template):
+        assert (target / name).read_bytes() == (REPO_ROOT / name).read_bytes()
+    result = cli(target, "upgrade", "--apply", "--source", str(REPO_ROOT))
+    assert result.returncode == 0, result.stderr
+    assert "AIWF-UPGRADE-NOOP" in result.stdout
+    _assert_text_files_unchanged(original)
+    assert config.read_bytes() == config_bytes
+    assert ai_workflow.get_record_root(target) == target / ".aiwf/team-records"
+
+
+def test_upgrade_verifies_copied_bytes_before_recording_success(tmp_path: Path, monkeypatch, capsys):
+    target = _seed_current_v2_repo(tmp_path)
+    guide = target / ".aiwf/docs/adoption_guide.md"
+    guide.write_text("old guide\n", encoding="utf-8")
+    # Simulate a copy that returned normally without delivering all its bytes.
+    monkeypatch.setattr(ai_workflow, "_copy_upgrade_artifacts", lambda *args: [".aiwf/docs"])
+    rc = ai_workflow.main(["--repo-root", str(target), "upgrade", "--apply", "--source", str(REPO_ROOT)])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert ".aiwf/docs/adoption_guide.md" in out and "AIWF-UPGRADE-OK" not in out
+    assert not list((target / ".aiwf/migrations").glob("*_upgrade.md"))
+
+
+def test_source_driven_interrupted_upgrade_keeps_old_runtime_until_payload_is_ready(
+    tmp_path: Path, monkeypatch, capsys
+):
+    target = _seed_current_v2_repo(tmp_path)
+    runtime = target / ".aiwf/bin/ai_workflow.py"
+    old_runtime = runtime.read_bytes().replace(
+        f'AIWF_TOOL_VERSION = "{ai_workflow.AIWF_TOOL_VERSION}"'.encode(), b'AIWF_TOOL_VERSION = "1.0"'
+    )
+    runtime.write_bytes(old_runtime)
+    template = target / ".aiwf/templates/AGENTS.block.md"
+    template.write_bytes(b"old template\n")
+    guide = target / ".aiwf/docs/adoption_guide.md"
+    guide.write_bytes(b"old guide\n")
+    copy = ai_workflow.safe_copy_file_no_symlink
+
+    def interrupt(source, destination, source_root, target_root):
+        if destination == template:
+            raise OSError("simulated interruption while writing the template")
+        copy(source, destination, source_root, target_root)
+
+    args = ["--repo-root", str(target), "upgrade", "--source", str(REPO_ROOT)]
+    with monkeypatch.context() as patch:
+        patch.setattr(ai_workflow, "safe_copy_file_no_symlink", interrupt)
+        assert ai_workflow.main([*args, "--apply"]) != 0
+    assert runtime.read_bytes() == old_runtime
+    assert guide.read_bytes() == (REPO_ROOT / ".aiwf/docs/adoption_guide.md").read_bytes()
+    assert template.read_bytes() == b"old template\n"
+    assert not list((target / ".aiwf/migrations").glob("*_upgrade.md"))
+    assert ai_workflow.main([*args, "--check"]) == 0
+    out = capsys.readouterr().out
+    assert "  - .aiwf/bin/ai_workflow.py\n" in out and "  - .aiwf/templates/AGENTS.block.md\n" in out
+    assert ai_workflow.main([*args, "--apply"]) == 0
+    assert "AIWF-UPGRADE-OK" in capsys.readouterr().out
+    assert ai_workflow.main([*args, "--apply"]) == 0
+    assert "AIWF-UPGRADE-NOOP" in capsys.readouterr().out
 
 
 def test_upgrade_check_rejects_source_runtime_symlink(tmp_path: Path, capsys):
@@ -2716,6 +3016,76 @@ def test_upgrade_check_normal_minimal_source_without_symlinks_still_succeeds(tmp
 
     assert rc == 0
     assert "blockers: none" in out
+
+
+@pytest.mark.parametrize("mode", ["--check", "--dry-run", "--apply"])
+@pytest.mark.parametrize("relative,directory", [
+    (".aiwf/docs/workflow_protocol.md", False),
+    (".aiwf/bin/lib", True),
+    (".aiwf/events/events.jsonl", False),
+    (".aiwf/migrations", True),
+])
+def test_upgrade_preflight_rejects_linked_destinations(tmp_path, capsys, monkeypatch, mode, relative, directory):
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    target = tmp_path / "target"
+    link = target / relative
+    link.parent.mkdir(parents=True)
+    # A dangling name inside the synthetic target is enough to exercise preflight.
+    _symlink_or_skip(link, target / "unused", target_is_directory=directory)
+    monkeypatch.setattr(ai_workflow, "_ensure_aiwf_upgrade_skeleton",
+                        lambda *_: pytest.fail("apply reached a writer before completing preflight"))
+    assert ai_workflow.main(["--repo-root", str(target), "upgrade", mode, "--source", str(source)]) == 2
+    output = capsys.readouterr().out
+    assert "destination preflight failed" in output and relative in output
+    assert not (target / "aiwf").exists()
+
+
+def test_legacy_docs_future_destination_checked_before_move(tmp_path, capsys, monkeypatch):
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    (source / ".aiwf/docs/examples").mkdir()
+    (source / ".aiwf/docs/examples/basic.md").write_text("example\n", encoding="utf-8")
+    target = tmp_path / "target"
+    examples = target / "docs/examples"
+    examples.mkdir(parents=True)
+    _symlink_or_skip(examples / "basic.md", target / "unused")
+    monkeypatch.setattr(ai_workflow, "relocate_command", lambda *_a, **_kw: pytest.fail("unexpected relocation"))
+    assert ai_workflow.main(["--repo-root", str(target), "upgrade", "--apply",
+                             "--migrate-legacy-docs", "--source", str(source)]) == 2
+    assert "docs/examples/basic.md" in capsys.readouterr().out
+    assert not (target / ".aiwf").exists()
+
+
+def test_install_preflight_rejects_dangling_agents_destination(tmp_path, capsys, monkeypatch):
+    target = tmp_path / "target"
+    target.mkdir()
+    _symlink_or_skip(target / "AGENTS.md", target / "unused")
+    monkeypatch.setattr(ai_workflow._InstallRollback, "create",
+                        lambda *_: pytest.fail("unexpected installation"))
+    assert ai_workflow.main(["install", "--target", str(target), "--yes"]) == 2
+    assert "AGENTS.md must not be a symlink" in capsys.readouterr().out
+    assert list(target.iterdir()) == [target / "AGENTS.md"]
+
+
+def test_maintenance_previews_and_write_capability(tmp_path, monkeypatch, capsys):
+    source = _seed_minimal_upgrade_source(tmp_path / "source")
+    target = tmp_path / "target"
+    target.mkdir()
+    complete = tmp_path / "complete"
+    complete.mkdir()
+    _seed_current_v2_repo(complete)
+    monkeypatch.setattr(os, "supports_dir_fd", set())
+    prefix = ["--repo-root", str(target)]
+    upgrade = [*prefix, "upgrade", "--source", str(source)]
+    install = ["install", "--target", str(target)]
+    relocate = [*prefix, "relocate"]
+    for args in (install, [*upgrade, "--check"], [*upgrade, "--dry-run"], [*relocate, "--dry-run"]):
+        assert ai_workflow.main(args) == 0
+    assert ai_workflow.main(["--repo-root", str(complete), "upgrade", "--apply", "--source", str(REPO_ROOT)]) == 0
+    assert "AIWF-UPGRADE-NOOP" in capsys.readouterr().out
+    for args in ([*install, "--yes"], [*upgrade, "--apply"], [*relocate, "--apply"]):
+        assert ai_workflow.main(args) == 2
+        assert "maintenance writes require no-follow directory handles" in capsys.readouterr().err
+        assert list(target.iterdir()) == []
 
 
 def test_dataset_export_basic_schema_and_allowed_fields(tmp_path: Path):
@@ -3271,7 +3641,7 @@ def test_package_records_cli_distinguishes_package_status_from_workflow_findings
     assert "Package Generation: PASS" in captured.out
     assert "Manifest Schema: PASS" in captured.out
     assert "Package Integrity: PASS" in captured.out
-    assert "Privacy/Security: PASS" in captured.out
+    assert "Built-in privacy checks: PASS (secret patterns" in captured.out
     assert "Workflow Evidence Findings: WARNING" in captured.out
     assert "Package validation failed" not in captured.out
     assert "Package validation failed" not in captured.err
@@ -3410,7 +3780,7 @@ def test_package_records_secret_detection_fails_closed(tmp_path: Path, capsys):
     assert not output_path.exists()
     captured = capsys.readouterr()
     assert "Package Generation: FAIL" in captured.err
-    assert "Privacy/Security: FAIL" in captured.err
+    assert "Built-in privacy checks: FAIL" in captured.err
     assert "package validation failed" not in captured.err.lower()
 
 
@@ -3507,7 +3877,8 @@ def test_package_records_directory_package_layout_and_redacted_content(tmp_path:
     assert "- Package Generation: PASS" in summary_text
     assert "- Manifest Schema: PASS" in summary_text
     assert "- Package Integrity: PASS" in summary_text
-    assert "- Privacy/Security: PASS" in summary_text
+    assert "- Built-in privacy checks: PASS" in summary_text
+    assert "review the included documents and events" in summary_text
     assert "- Workflow Evidence Findings: PASS" in summary_text
     assert "workflow evidence findings discovered" in summary_text
     assert "findings packaged" not in summary_text
@@ -3569,7 +3940,7 @@ def test_package_records_force_replaces_existing_output_after_safety_checks(tmp_
     root = _init_repo(tmp_path)
     _create_v2_task(root, name="force_package_task", date="20260601")
     output_dir = root / "records_package_dir"
-    output_dir.mkdir()
+    assert ai_workflow.main(["--repo-root", str(root), "package", "records", "--format", "directory", "--output", str(output_dir)]) == 0
     (output_dir / "stale.txt").write_text("stale\n", encoding="utf-8")
 
     rc = ai_workflow.main(
@@ -3850,7 +4221,7 @@ def test_package_records_task_id_selector_fails_when_ambiguous(tmp_path: Path):
     assert not output_path.exists()
 
 
-def test_package_records_task_path_selector_selects_exact_task(tmp_path: Path):
+def test_package_records_task_path_selector_selects_exact_task(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
     excluded = _create_v2_task(root, name="path_selector_excluded", date="20260601")
     selected = _create_v2_task(root, name="path_selector_selected", date="20260602")
@@ -3863,6 +4234,16 @@ def test_package_records_task_path_selector_selects_exact_task(tmp_path: Path):
 
     assert [item["source_path"] for item in payload["selected_tasks"]] == [ai_workflow.rel(root, selected)]
     assert {"source_path": ai_workflow.rel(root, excluded), "reason": "filtered_by_task"} in payload["excluded_tasks"]
+    assert "Excluded task paths listed in manifest field excluded_tasks: 1" in capsys.readouterr().out
+    archive = root / "selected.zip"
+    assert ai_workflow.main(["--repo-root", str(root), "package", "records", "--task",
+                             ai_workflow.rel(root, selected), "--output", str(archive)]) == 0
+    text = capsys.readouterr().out
+    assert "Excluded task paths listed in manifest field excluded_tasks: 1" in text
+    assert "Review package_manifest.json" in text
+    with zipfile.ZipFile(archive) as package:
+        summary = package.read("aiwf-records-package/package_summary.md").decode()
+        assert "Excluded task paths listed in manifest field excluded_tasks: 1" in summary
 
 
 def test_package_records_excluded_reasons_are_recorded(tmp_path: Path):
@@ -4241,7 +4622,7 @@ def test_package_records_legacy_record_path_mapping_associates_global_event(tmp_
 def test_package_records_task_id_precedence_wins_over_legacy_record_path(tmp_path: Path):
     root = _init_repo(tmp_path)
     task_id_selected = _create_v2_task(root, name="task_id_precedence_selected", date="20260601")
-    legacy_peer = _create_v2_task(root, name="legacy_precedence_peer", date="20260602")
+    legacy_peer = _create_v2_task(root, name="legacy_precedence_peer", date="20260601")
     _write_repo_event_log(
         root,
         json.dumps(
@@ -4592,6 +4973,17 @@ def test_structured_diagnostics_format_in_check(tmp_path: Path, capsys):
     assert rc == 2
     assert "AIWF-META-007" in out
     assert "Suggested Fix:" in out
+    assert "tool-owned metadata" in out
+
+
+def test_standard_task_check_points_to_the_separate_closure_check(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    task = _create_task(root)
+    capsys.readouterr()
+    assert ai_workflow.check_path(root, str(task), strict=False) == 0
+    first_lines = capsys.readouterr().out.splitlines()[:2]
+    assert first_lines[0] == "Task structure and metadata: PASS"
+    assert f"./aiwf check --path {ai_workflow.rel(root, task)} --finalize-ready" in first_lines[1]
 
 
 def test_finalize_dry_run_is_read_only_with_existing_event_log(tmp_path: Path, capsys):
@@ -4700,11 +5092,21 @@ def test_blocked_finalize_ready_is_read_only(tmp_path: Path, capsys):
     task_dir = _create_task(root)
     before_tree = _snapshot_tree(root)
 
+    capsys.readouterr()
     rc = ai_workflow.main(["--repo-root", str(root), "check", "--path", str(task_dir), "--finalize-ready"])
     captured = capsys.readouterr()
 
     assert rc == 2
+    assert captured.out.startswith("Finalize readiness (read-only): BLOCKED")
     assert "finalize blockers" in captured.out
+    groups = captured.out.split("Template text to replace with task-specific evidence:\n")[1]
+    grouped_paths = [line.strip().split(" (")[0] for line in groups.splitlines() if line.startswith("  ")]
+    assert len(grouped_paths) == len(set(grouped_paths)) >= 3
+    assert "Full diagnostics: ./aiwf query check --finalize-ready --path " + ai_workflow.rel(root, task_dir) in captured.out
+    assert ai_workflow.main(["--repo-root", str(root), "query", "check", "--finalize-ready",
+                             "--path", ai_workflow.rel(root, task_dir)]) == 2
+    full = json.loads(capsys.readouterr().out)["result"]["diagnostics"]
+    assert sum(d["code"] == "AIWF-PATH-022" for d in full) > len(grouped_paths)
     assert "READ-ONLY" in captured.out
     assert _snapshot_tree(root) == before_tree
     assert not ai_workflow.get_event_log_path(root).exists()
@@ -5049,6 +5451,15 @@ def test_list_command_filtering(tmp_path: Path, capsys):
     assert "task_two" not in out
 
 
+def test_list_shows_distinct_copyable_paths_for_the_same_name_on_two_dates(tmp_path: Path, capsys):
+    root = _init_repo(tmp_path)
+    paths = [_create_task(root, name="same_name", date=day) for day in ("20260508", "20260509")]
+    capsys.readouterr()
+    assert ai_workflow.main(["--repo-root", str(root), "list"]) == 0
+    rows = [line for line in capsys.readouterr().out.splitlines() if line.startswith("001 |")]
+    assert [row.split(" | ")[-1] for row in rows] == [ai_workflow.rel(root, path) for path in paths]
+
+
 def test_list_command_rejects_invalid_status_workflow_phase_review_status_before_discovery(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
     _create_v2_task(root, name="list_selector_task", date="20260509")
@@ -5144,6 +5555,12 @@ def test_correct_finalized_is_additive_and_inspect_projects_current_state(tmp_pa
     assert "Latest correction: 001" in inspect_out
     assert "Current implementation state: implementation_not_present" in inspect_out
     assert f"AIWF tool version: {ai_workflow.AIWF_TOOL_VERSION}" in inspect_out
+
+    assert ai_workflow.main(["--repo-root", str(root), "query", "inspect", "--path",
+                             task_dir.relative_to(root).as_posix()]) == 0
+    projection = json.loads(capsys.readouterr().out)["result"]
+    assert projection["closure_preserved"] and projection["workflow_phase"] == "finalized"
+    assert projection["latest_correction"]["current_effective_state"] == "implementation_not_present"
 
     assert ai_workflow.finalize_command(root, str(task_dir)) == 0
     capsys.readouterr()
@@ -5410,7 +5827,7 @@ def test_diagnostics_registry_consistency():
 
 
 def test_current_release_version_projection_is_converged():
-    release = "1.7.16"
+    release = "1.7.17.post4"
     protocol = "1.7.10"
     assert ai_workflow.AIWF_TOOL_VERSION == release
     assert ai_workflow.WORKFLOW_PROTOCOL_VERSION == protocol
@@ -6234,6 +6651,21 @@ def test_legacy_task_warns_not_errors(tmp_path: Path):
     assert rc == 0
 
 
+def test_event_readers_preserve_unicode_and_physical_source_lines(tmp_path: Path):
+    local = tmp_path / ".aiwf/events.jsonl"
+    local.parent.mkdir()
+    first = {"summary": "one\u0085two\u2028three\u2029four"}
+    last = {"command": "五\u2028六"}
+    # Include CRLF, a blank line, a malformed object, a non-object, and no final LF.
+    data = "\r\n".join([json.dumps(first, ensure_ascii=False), "", "{bad", "[]", json.dumps(last, ensure_ascii=False)])
+    local.write_bytes(data.encode("utf-8"))
+    assert ai_workflow._load_events_with_stats(tmp_path) == ([first, last], 2)
+    assert ai_workflow._load_jsonl_events_with_stats(local) == ([first, last], 2)
+    rows, malformed = ai_workflow._package_records_jsonl_rows(local)
+    assert rows == [{"event": first, "source_line": 1}, {"event": last, "source_line": 5}]
+    assert malformed == [3, 4]
+
+
 def test_v16_finalize_with_malformed_event_log_fails(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
     task_dir = _create_task(root, date="20260512")
@@ -6429,6 +6861,8 @@ def test_finalize_blocks_ai_decision_for_human_required_task(tmp_path: Path, cap
     out = capsys.readouterr().out
     assert rc == 2
     assert "AIWF-PATH-025" in out
+    assert "Waiting for human review. The agent review has been recorded." in out.splitlines()[:3]
+    assert "--decision-authority human" not in out
     assert "ai-agent" in out
     assert "human" in out
 
@@ -6438,9 +6872,14 @@ def test_finalize_blocks_ai_decision_for_human_required_task(tmp_path: Path, cap
     assert "AIWF-PATH-025" in out
     assert (task_dir / "task.md").read_text(encoding="utf-8") == before
     assert _read_task_metadata(task_dir)["status"] == "review"
+    assert ai_workflow.inspect_command(root, str(task_dir)) == 0
+    out = capsys.readouterr().out
+    assert "Latest recorded review: pass (decision authority: ai-agent)" in out
+    assert "Required review authority: human" in out
+    assert "Waiting for human review" in out
 
 
-def test_human_decision_recorded_by_agent_satisfies_human_authority(tmp_path: Path):
+def test_human_decision_recorded_by_agent_satisfies_human_authority(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
     task_dir = _prepare_open_derived_task(root, name="human_decision_recorded_by_agent")
     assert ai_workflow.record_command(root, str(task_dir), kind="validation", result="pass", command="pytest", reviewer=None, summary=None) == 0
@@ -6459,10 +6898,12 @@ def test_human_decision_recorded_by_agent_satisfies_human_authority(tmp_path: Pa
     assert event["required_review_authority"] == "human"
     assert event["decision_authority"] == "human"
     assert event["recorded_by"] == "codex"
+    assert ai_workflow.inspect_command(root, str(task_dir)) == 0
+    assert "Latest recorded review: pass (decision authority: human)" in capsys.readouterr().out
     assert ai_workflow.finalize_command(root, str(task_dir)) == 0
 
 
-def test_ai_agent_required_authority_does_not_create_false_human_blocker(tmp_path: Path):
+def test_ai_agent_required_authority_does_not_create_false_human_blocker(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
     task_dir = _prepare_open_derived_task(root, name="ai_authority_allowed")
     _rewrite_task_metadata(task_dir / "task.md", required_review_authority="ai-agent")
@@ -6479,6 +6920,10 @@ def test_ai_agent_required_authority_does_not_create_false_human_blocker(tmp_pat
         decision_authority="ai-agent",
         recorded_by="codex",
     ) == 0
+    assert ai_workflow.inspect_command(root, str(task_dir)) == 0
+    out = capsys.readouterr().out
+    assert "Required review authority: ai-agent" in out
+    assert "Waiting for human review" not in out
     assert ai_workflow.finalize_command(root, str(task_dir)) == 0
 
 
@@ -6522,6 +6967,9 @@ def test_active_v16_human_review_cannot_use_legacy_authority_gap(tmp_path: Path,
     assert rc == 2
     assert "AIWF-PATH-026" in out
     assert "AIWF-PATH-025" not in out
+    assert "The agent review has been recorded" not in out
+    assert ai_workflow.inspect_command(root, str(task_dir)) == 0
+    assert "Latest recorded review: pass (decision authority: unknown)" in capsys.readouterr().out
 
 
 def test_active_v16_human_policy_is_preserved_when_agent_records_review(tmp_path: Path, capsys):
@@ -6553,7 +7001,7 @@ def test_active_v16_human_policy_is_preserved_when_agent_records_review(tmp_path
     assert "AIWF-PATH-025" in out
 
 
-def test_legacy_finalized_record_is_not_retroactively_authority_invalidated(tmp_path: Path):
+def test_legacy_finalized_record_is_not_retroactively_authority_invalidated(tmp_path: Path, capsys):
     root = _init_repo(tmp_path)
     task_dir = _create_task(root, name="legacy_finalized_authority", date="20260513")
     _write_finalize_ready_docs(task_dir)
@@ -6567,7 +7015,9 @@ def test_legacy_finalized_record_is_not_retroactively_authority_invalidated(tmp_
         finalized_at="2026-05-13T12:00:00Z",
         finalized_by="tool",
     )
-    _rewrite_task_metadata(task_dir / "task.md", **metadata)
+    task_file = task_dir / "task.md"
+    _, body = ai_workflow.parse_front_matter(task_file.read_text(encoding="utf-8"))
+    task_file.write_text(ai_workflow.format_front_matter(metadata) + body.lstrip("\n"), encoding="utf-8")
     _sync_index(root, task_dir)
     _write_task_event_log(
         task_dir,
@@ -6591,6 +7041,11 @@ def test_legacy_finalized_record_is_not_retroactively_authority_invalidated(tmp_
     assert "AIWF-PATH-025" not in codes
     assert "AIWF-PATH-026" not in codes
     assert "AIWF-PATH-027" not in codes
+    assert ai_workflow.inspect_command(root, str(task_dir)) == 0
+    output = capsys.readouterr().out
+    assert "Required review authority: unknown" in output
+    assert "Latest recorded review: pass (decision authority: unknown)" in output
+    assert "Waiting for human review" not in output
 
 
 def test_review_event_required_authority_mismatch_is_deterministic(tmp_path: Path, capsys):
@@ -8386,3 +8841,188 @@ def test_package_embeds_dataset_v2_and_preserves_raw_event_fields(tmp_path: Path
     assert len(raw_packaged) == manifest["events"]["canonical_event_count"] == 2 * len(events)
     assert sorted(json.dumps(event, sort_keys=True) for event in raw_packaged) == sorted(json.dumps(event, sort_keys=True) for event in events * 2)
     assert (task_dir / ".aiwf" / "events.jsonl").read_bytes() == event_bytes
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_predictable_workflow_destination_refusal_preserves_state(tmp_path, capsys, legacy):
+    root = _init_repo(tmp_path)
+    task = _create_v2_task(root)
+    if legacy:
+        destination = root / "docs" / task.parent.name
+        task.parent.rename(destination)
+        task = destination / task.name
+    else:
+        config = root / ".aiwf/config.yaml"
+        config.write_text(config.read_text().replace(".aiwf/events/events.jsonl", "audit/events.jsonl"))
+    before = _snapshot_tree(root)
+    assert ai_workflow.main(["--repo-root", str(root), "transition", "--path", str(task), "--to", "validation"]) == 2
+    assert "AIWF-WRITE-DESTINATION" in capsys.readouterr().err
+    assert _snapshot_tree(root) == before
+    assert ai_workflow.main(["--repo-root", str(root), "new-task", "another_item"]) == 0
+
+
+def test_quoted_metadata_round_trips_through_workflow_updates(tmp_path):
+    yaml = pytest.importorskip("yaml")
+    root = _init_repo(tmp_path)
+    title = '檢查 "ready" C:\\temp\\files'
+    assert ai_workflow.create_task(root, "quoted_title", None, False, title=title) == 0
+    task, = ai_workflow._iter_all_task_dirs(root)
+    for phase in ("validation", "review"):
+        assert ai_workflow.transition_command(root, str(task), phase) == 0
+        text = (task / "task.md").read_text()
+        assert yaml.safe_load(text.split("---\n", 2)[1])["title"] == title
+        assert ai_workflow.parse_front_matter(text)[0]["title"] == title
+
+
+def test_inspect_finalized_requires_verifiable_manifest(tmp_path, capsys):
+    root = _init_repo(tmp_path)
+    task = _create_v2_task(root)
+    _prepare_finalize_ready_task(root, task)
+    assert ai_workflow.finalize_command(root, str(task)) == 0
+    args = ["--repo-root", str(root), "query", "inspect", "--path", ai_workflow.rel(root, task)]
+    capsys.readouterr()
+    assert ai_workflow.main(args) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["closure_preserved"] is True
+    with (task / "review_final.md").open("a") as output:
+        output.write("\nChanged\n")
+    assert ai_workflow.main(args) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["closure_preserved"] is False
+    (task / ".aiwf/events.jsonl").write_text("")
+    assert ai_workflow.main(args) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "AIWF-INSPECT-002"
+
+
+@pytest.mark.parametrize("flags", [[], ["--no-relocate"]])
+def test_upgrade_preserves_discovery_of_custom_v1_task(tmp_path, capsys, flags):
+    root = _seed_upgrade_target_repo(tmp_path)
+    config = root / ".aiwf/config.yaml"
+    config.write_text("layout:\n  records_root: work_history\n")
+    assert ai_workflow.create_task(root, "before_upgrade", None, False) == 0
+    task, = [p for p in ai_workflow._iter_all_task_dirs(root) if p.name.endswith("before_upgrade")]
+    contents = (task / "task.md").read_bytes()
+    args = ["--repo-root", str(root), "upgrade", "--source", str(REPO_ROOT), *flags]
+    capsys.readouterr()
+    assert ai_workflow.main([*args, "--check"]) == 0
+    assert capsys.readouterr().out.count("  records: work_history") == 2
+    assert ai_workflow.main([*args, "--apply"]) == 0
+    assert ai_workflow.get_record_root(root) == root / "work_history"
+    assert task in ai_workflow._iter_all_task_dirs(root)
+    assert (task / "task.md").read_bytes() == contents
+
+
+def test_upgrade_report_only_retry_preserves_original_plan(tmp_path, monkeypatch, capsys):
+    root = _seed_current_v2_repo(tmp_path)
+    old = root / ".aiwf/docs/adoption_guide.md"
+    old.write_text("outdated content")
+    writer = ai_workflow.destination_writer
+
+    def unavailable_report(path, *args, **kwargs):
+        if path.name.endswith("_upgrade.md"):
+            raise OSError("simulated report write failure after verification")
+        return writer(path, *args, **kwargs)
+
+    args = ["--repo-root", str(root), "upgrade", "--source", str(REPO_ROOT)]
+    with monkeypatch.context() as patch:
+        patch.setattr(ai_workflow, "destination_writer", unavailable_report)
+        assert ai_workflow.main([*args, "--apply"]) == 2
+    assert old.read_bytes() == (REPO_ROOT / ".aiwf/docs/adoption_guide.md").read_bytes()
+    assert ai_workflow.main([*args, "--check"]) == 0
+    assert "repair_required: yes" in capsys.readouterr().out
+    assert ai_workflow.main([*args, "--apply"]) == 0
+    assert "AIWF-UPGRADE-OK" in capsys.readouterr().out
+    report, = (root / ".aiwf/migrations").glob("*_upgrade.md")
+    assert "- .aiwf/docs" in report.read_text() and report.read_text().endswith("- PASS\n")
+    assert ai_workflow.main([*args, "--apply"]) == 0
+    assert "AIWF-UPGRADE-NOOP" in capsys.readouterr().out
+    assert list((root / ".aiwf/migrations").glob("*_upgrade.md")) == [report]
+
+
+def test_package_selection_preserves_id_ambiguity_and_local_dataset_source(tmp_path):
+    root = _init_repo(tmp_path)
+    first = _create_v2_task(root, name="first", date="20260601")
+    second = _create_v2_task(root, name="second", date="20260602")
+    _write_repo_event_log(root, json.dumps({"task_id": "001", "event": "historical"}))
+    for task in (first, second):
+        plan = _run_package_records_dry_run(root, task.name + ".json", ["--task", ai_workflow.rel(root, task)])
+        assert plan["events"]["global_event_count"] == 0
+        assert any(f["code"] == "AIWF-PACKAGE-RECORDS-AMBIGUOUS-EVENT-TASK-ID" for f in plan["validation"]["findings"])
+    _write_task_event_log(first, {"event_type": "validation", "result": "pass"})
+    for label, contents in [("empty", ""), ("unrelated", '{"event":"other"}\n')]:
+        ai_workflow.get_event_log_path(root).write_text(contents)
+        archive = root / (label + ".zip")
+        args = ["--repo-root", str(root), "package", "records", "--task", ai_workflow.rel(root, first),
+                "--task-local-events-only", "--output", str(archive)]
+        assert ai_workflow.main(args) == 0
+        with zipfile.ZipFile(archive) as z:
+            prefix = "aiwf-records-package/"
+            record, = json.loads(z.read(prefix + "dataset/aiwf_dataset.json"))["tasks"]
+            assert record["event_count"] == len(z.read(prefix + "events/events.jsonl").splitlines()) == 1
+            assert record["has_validation_event"]
+
+
+def test_legacy_string_encoding_survives_first_metadata_rewrite(tmp_path):
+    root = _init_repo(tmp_path)
+    task = _create_v2_task(root)
+    file = task / "task.md"
+    text = file.read_text().replace(ai_workflow._FRONT_MATTER_ENCODING + "\n", "")
+    title = r'Inspect C:\temp\new and "\\server\share"'
+    old_line = 'title: "' + title.replace('"', r'\"') + '"'
+    file.write_text("\n".join(old_line if line.startswith("title:") else line for line in text.split("\n")))
+    assert ai_workflow.load_task_metadata(task)["metadata"]["title"] == title
+    assert ai_workflow.transition_command(root, str(task), "validation") == 0
+    assert ai_workflow.load_task_metadata(task)["metadata"]["title"] == title
+    yaml = pytest.importorskip("yaml")
+    assert yaml.safe_load(file.read_text().split("---\n", 2)[1])["title"] == title
+
+
+def test_mixed_layout_handoff_selects_exact_task_and_legacy_guard_stops_edit(tmp_path, capsys, monkeypatch):
+    root = _init_repo(tmp_path)
+    current = _create_v2_task(root)
+    legacy = root / "docs" / current.parent.name / current.name
+    shutil.copytree(current, legacy)
+    shutil.copy2(current.parent / 'index.md', legacy.parent / 'index.md')
+    rel_legacy = ai_workflow.rel(root, legacy)
+    args = ["--repo-root", str(root)]
+    before = _snapshot_tree(legacy)
+    monkeypatch.setenv("AIWF_EVENT_LOG", "1")
+    assert ai_workflow.main([*args, "check", "--path", rel_legacy]) == 0
+    assert "read-only task" in capsys.readouterr().err
+    assert ai_workflow.main([*args, "guard", "--pre-edit", "--path", rel_legacy]) == 2
+    assert "AIWF-GUARD-005" in capsys.readouterr().out
+    assert _snapshot_tree(legacy) == before
+    base = [*args, "package", "records", "--dry-run"]
+    assert ai_workflow.main([*base, "--task", "001", "--output", str(root / "invalid.json")]) == 2
+    assert "ambiguous" in capsys.readouterr().err
+    default = _run_package_records_dry_run(root, "default.json")
+    assert len(default["selected_tasks"]) == 1
+    archive = root / "handoff.zip"
+    flags = ["--task", rel_legacy, "--task", ai_workflow.rel(root, current)]
+    assert ai_workflow.main([*args, "package", "records", *flags, "--output", str(archive)]) == 0
+    with zipfile.ZipFile(archive) as z:
+        manifest = json.loads(z.read("aiwf-records-package/package_manifest.json"))
+        rows = manifest["selected_tasks"]
+        assert {row["source_path"] for row in rows} == {rel_legacy, ai_workflow.rel(root, current)}
+        assert len({row["package_path"] for row in rows}) == 2
+        assert all("aiwf-records-package/" + row["package_path"] + "/task.md" in z.namelist() for row in rows)
+
+
+def test_package_output_protects_project_and_existing_handoff(tmp_path, monkeypatch):
+    root = _init_repo(tmp_path)
+    _create_v2_task(root)
+    for destination in (root, root.parent, root / ".aiwf", root / ".git", root / "docs", root / "aiwf"):
+        path, error = ai_workflow._package_records_safe_output_path(root, str(destination), [], force=True)
+        assert path is None and error
+    out = root / "prior.zip"
+    out.write_bytes(b"previous handoff")
+    def fail_write(staged, files):
+        staged.write_bytes(b"partial")
+        raise OSError("synthetic ZIP creation error")
+    monkeypatch.setattr(ai_workflow, "_package_records_write_zip", fail_write)
+    args = ["--repo-root", str(root), "package", "records", "--force", "--output", str(out)]
+    assert ai_workflow.main(args) == 2
+    assert out.read_bytes() == b"previous handoff"
+    unrelated = root / "directory"
+    unrelated.mkdir()
+    (unrelated / "document").write_text("keep")
+    assert ai_workflow.main([*args[:-1], str(unrelated), "--format", "directory"]) == 2
+    assert (unrelated / "document").read_text() == "keep"

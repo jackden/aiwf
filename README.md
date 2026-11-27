@@ -12,11 +12,19 @@ repository.
 Git records how code changed. AIWF records the workflow evidence used to
 validate, review, correct, and close the work.
 
+## Optional MCP workflow interface
+
+To use AIWF from Codex CLI, GitHub Copilot CLI or VS Code, install the optional adapter and point your client at the project that contains `./aiwf`. Start in read-only mode, call `aiwf_context` to verify the project, then list its tasks. The setup guide includes building from source, installing a wheel and enabling task creation. [MCP setup walkthrough (繁體中文)](.aiwf/docs/examples/mcp_setup.md)
+
+Adapter 0.3.2 supports MCP `2026-07-28` and `2025-11-25` over the same local stdio command. The adapter reference covers tool inputs, permissions, operator review and client configuration examples. [Adapter reference (English)](integrations/mcp/README.md)
+
 ## Install
 
-Use a trusted local AIWF source package: a directory containing the executable
-`aiwf` entrypoint and the committed `.aiwf/` package paths. Run the command from
-the repository that should receive AIWF:
+Use Python 3.10+ and a trusted local source package containing the executable
+`aiwf` and its `.aiwf/` package. Use macOS or Linux for installation and
+upgrade writes. On native Windows you can preview setup. Daily workflow writes
+also require a supported local filesystem on macOS or Linux.
+Run this command from the repository that should receive AIWF.
 
 ```bash
 /path/to/aiwf-package/aiwf install --target . --yes
@@ -36,27 +44,56 @@ release files, and review artifacts are intentionally excluded. Existing
 project-owned `tests/`, `.github/`, and `docs/` directories are preserved
 byte-for-byte.
 
-After installation, the first command is:
+## Quick start: verify your installation
+
+This task checks whether your project's root `AGENTS.md` contains the installed
+instruction block. In Bash, check that the installed Runtime can query this
+worktree, then create the task once.
 
 ```bash
-./aiwf new-task demo_task
+./aiwf query context && ./aiwf new-task verify_aiwf_install
 ```
 
-## Five-minute Quick Start
-
-Create a task, implement the requested change, then record validation and
-review evidence in the generated artifacts:
+Copy the complete dated path printed after `Task directory`. To resume in a
+new terminal, run `./aiwf list` and find that task's full path. Paste it at
+this prompt, even if another task has the same numeric ID on a different day.
 
 ```bash
-./aiwf new-task demo_task
-./aiwf check --path <task-path>
-./aiwf check --path <task-path> --finalize-ready
-./aiwf finalize --path <task-path>
+read -r -p 'Paste the task directory: ' TASK
 ```
 
-Replace `<task-path>` with the path printed by `new-task`. The finalize-ready
-check is read-only. Finalize closes the current workflow only after the
-required evidence and review decisions are complete.
+```bash
+./aiwf guard --pre-edit --path "$TASK"
+```
+
+Once the guard passes, describe the expected managed block in the body of
+`$TASK/task.md`. Keep its YAML header under AIWF's control. Run the actual
+installation test below. Bash records a pass only if the test exits successfully.
+
+```bash
+./aiwf transition --path "$TASK" --to validation
+./aiwf agents check --path AGENTS.md &&
+  ./aiwf record --path "$TASK" --kind validation --result pass \
+    --command './aiwf agents check --path AGENTS.md'
+```
+
+Write the observed result and any limitations in `self_validation.md`, describe
+the work in `task_record.md`, and mark each acceptance criterion in the body
+of `task.md` according to the evidence. If the test fails, record the failure
+and its output. After agent review, send the task and its evidence to the
+assigned human reviewer. Keep it open while awaiting their decision.
+
+```bash
+./aiwf check --path "$TASK"
+./aiwf check --path "$TASK" --finalize-ready
+```
+
+The first check examines task structure. The second also checks closure
+evidence, including completed review documents and the required review decision.
+A new task can pass the first and remain blocked on the second. Once the
+reviewer's actual decision has been recorded and readiness passes, run
+`./aiwf finalize --path "$TASK"`. The [worked example](.aiwf/docs/examples/basic_lifecycle.md)
+shows the review handoff, the failure path, and how to record closure.
 
 ### What does Finalize PASS mean?
 
@@ -157,15 +194,20 @@ public releases for adoption. Tool and protocol versions evolve independently.
 
 | Field | Value |
 | --- | --- |
-| Current Release | `1.7.16` |
-| Tool Version | `1.7.16` |
+| Current Release | `1.7.17.post4` |
+| Tool Version | `1.7.17.post4` |
 | Workflow Protocol Version | `1.7.10` |
-| Latest Release Notes | [v1.7.16](.aiwf/docs/releases/v1.7.16.md) |
+| Latest Release Notes | [v1.7.17.post4](.aiwf/docs/releases/v1.7.17.post4.md) |
 | GitHub Releases | [jackden/aiwf releases](https://github.com/jackden/aiwf/releases) |
+
+This tree pairs Core `1.7.17.post4` with adapter `0.3.2`. The `0.2.1`
+adapter in the [post1 candidate notes](.aiwf/docs/releases/v1.7.17.post1.md)
+was the pairing recorded for that earlier candidate.
 
 ## Documentation
 
 - [Installation Guide](.aiwf/docs/adoption_guide.md)
+- [MCP setup and first task (繁體中文)](.aiwf/docs/examples/mcp_setup.md)
 - [Upgrade Guide](.aiwf/docs/upgrading.md)
 - [CLI Reference](.aiwf/docs/cli_reference.md)
 - [Evidence-linked Guidance](.aiwf/docs/guidance.md)

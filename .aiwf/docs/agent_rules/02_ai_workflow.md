@@ -1,8 +1,17 @@
 # AI Workflow Governance
 
 This rule defines workflow intent and invariants.
-Use `./aiwf` as the repository-local command entrypoint.
+Use the operator-enabled AIWF interface for the bound worktree. The repository-local CLI entrypoint is `./aiwf`.
 Deterministic correctness enforcement is implemented in `.aiwf/bin/ai_workflow.py` and surfaced through `./aiwf`.
+
+## Choosing the workflow interface
+
+- With a configured local MCP server, call `aiwf_context` first. Compare the returned binding ID to the operator-provided ID. Use only the advertised capabilities and mode. In read-write mode, use MCP for normal task discovery, creation, guard, transitions, evidence, checks, index synchronization and finalization.
+- In read-only mode, use the advertised read tools. Use the CLI for a missing operation only when the operator has already authorized that operation in this worktree. Without an MCP installation, use the repository-local CLI under the same authority. An adapter's internal CLI invocation is part of normal MCP operation.
+- Stop on a binding mismatch, denial, workflow blocker or missing human decision. A second interface cannot override that decision. For timeout, cancellation, lost response or uncertain/partial write, wait for the original process to exit, then inspect the canonical task, index, both event logs and closure evidence before deciding whether another action is safe.
+- Keep the existing scoped Guidance lookup at task/session start or resume and before substantive engineering decisions. With MCP use `aiwf_guidance_lookup`; otherwise use the documented helper within the authorized scope. Evaluate each returned note and each selector separately.
+- Use your Host's normal engineering tools to edit task bodies and product code, run tests, and write the supporting evidence text. AIWF owns workflow metadata and event projection. Recording a command describes the evidence. The Host's edit and execution permissions are independent of the MCP server mode.
+- General Agent sessions record Agent review only. Request an authorized operator when real human review or post-finalization correction is required. A Host tool approval has no review authority.
 
 ## Responsibility Split
 

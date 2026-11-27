@@ -8,16 +8,36 @@
 
 ## Package Records
 
-Use Package Records when workflow execution records and related workflow
-evidence need to leave the repository for analysis or engineering handoff:
+For a single-task handoff, run `./aiwf list` in the installed project. Copy
+the complete dated directory for the task you intend to share.
 
 ```bash
-./aiwf package records --output records.zip
+read -r -p 'Paste the task directory to package: ' TASK
 ```
 
-Package Records produces an analysis package with a manifest, inventories,
-copied workflow records, events, optional dataset output, redaction metadata,
-and integrity metadata. It does not export the source repository.
+```bash
+./aiwf package records --task "$TASK" --output records.zip
+```
+
+Without a task, date or other selection filter, the command includes all tasks
+it discovers in the selected records scope. Check the reported task count.
+The ZIP includes selected task documents, events, inventories, a manifest,
+redaction metadata and, by default, derived dataset output.
+
+The manifest also records the paths and exclusion reasons of other tasks
+found during discovery. Their dates, IDs and names can be visible even in
+a single-task ZIP with the `safe` profile. The terminal displays how many
+excluded paths are listed. Inspect `aiwf-records-package/package_manifest.json`,
+especially `excluded_tasks` and the repository metadata. If those names are
+confidential to the recipient, withhold the ZIP and hand off only individually
+reviewed files that the recipient may see.
+
+Before sharing, open `aiwf-records-package/artifact_inventory.tsv` in the ZIP,
+review the selected documents and inspect
+`aiwf-records-package/integrity/redaction_report.json`. A passing built-in
+privacy check covers the scanner's configured rules. A customer name or
+confidential project decision can remain in ordinary task prose. Use the
+contents and the recipient's authorization to decide what to share.
 
 ## Metrics
 - `task_count`: total discovered tasks

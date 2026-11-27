@@ -5,6 +5,9 @@ before the first substantive engineering decision, including in read-only analys
 Before editing repository files:
 - Read `.aiwf/docs/agent_rules/00_root_entrypoint.md` if you have not read it for the current task context.
 - Read `.aiwf/docs/workflow_protocol.md`
+When AIWF MCP is enabled, follow the mode and binding rules in
+`.aiwf/docs/agent_rules/02_ai_workflow.md` for daily workflow operations.
+In CLI mode, use the repository-local entrypoint.
 Use `./aiwf` for:
 - task creation
 - pre-edit guard

@@ -95,3 +95,26 @@ def test_safe_copy_tree_no_symlink_copies_normal_tree(tmp_path: Path):
     safe_paths.safe_copy_tree_no_symlink(source, dest, allowed)
 
     assert (dest / "nested" / "file.txt").read_text(encoding="utf-8") == "public\n"
+
+
+def test_destination_writer_preserves_previous_file_after_interruption(tmp_path: Path):
+    safe_paths = _load_safe_paths()
+    dest = tmp_path / "managed.txt"
+    _write(dest, "previous\n")
+    with pytest.raises(OSError, match="fixture"):
+        with safe_paths.destination_writer(dest, tmp_path) as output:
+            output.write(b"partial content")
+            raise OSError("fixture interruption")
+    assert dest.read_text(encoding="utf-8") == "previous\n"
+    assert list(tmp_path.iterdir()) == [dest]
+
+
+def test_destination_writer_rechecks_changed_leaf_before_commit(tmp_path: Path):
+    safe_paths = _load_safe_paths()
+    dest = tmp_path / "managed.txt"
+    with pytest.raises(safe_paths.SafePathError, match="symlink"):
+        with safe_paths.destination_writer(dest, tmp_path) as output:
+            output.write(b"staged")
+            _symlink_or_skip(dest, tmp_path / "unused")
+    assert dest.is_symlink()
+    assert list(tmp_path.iterdir()) == [dest]

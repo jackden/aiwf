@@ -22,20 +22,24 @@ AIWF no longer provides or owns a general root-level repository snapshot helper.
 - release notes
 - analysis artifacts
 
-## Review Bundle Boundary
+## Package one task for handoff
 
-`.aiwf/bin/package_review_bundle.sh` generates a task-scoped review bundle from AIWF workflow evidence.
-It is not a general repository snapshot tool or a workflow-record analysis package exporter.
+Set `TASK` to the complete dated task directory shown by `./aiwf list`.
+An explicit task path can select either the active records directory or a dated task in the enabled legacy tree. A bare ID must identify one task in the selected dates across both roots. In a mixed handoff, legacy tasks appear under `records/legacy/` in the ZIP. Without a task selector, the export keeps its scope to the active records root.
+
+```bash
+./aiwf package records --task "$TASK" --output records.zip
+```
+
+Inspect the archive inventory, task documents and `package_manifest.json`
+before sharing the ZIP. The manifest can name tasks excluded by the filter.
+The [Reporting Guide](reporting.md#package-records) describes its contents
+and the scope of its built-in privacy checks.
 
 Root-level `scripts/` is project-owned.
 AIWF installation, upgrade, relocation, and packaging operations must not create, overwrite, move, or assume ownership of files under `scripts/` unless the user explicitly requests a project-specific integration.
 
-## Records Analysis Package Design
-
-The design for a future workflow-record analysis package is documented in
-[package_records_design.md](package_records_design.md).
-That design is explicitly separate from review bundles, public tree export,
-dataset export alone, and general repository snapshots.
+## Records package filters
 
 Before package record discovery, the command validates `--from-date` and
 `--to-date` (including the reversed-range case) and validates repeated
@@ -108,3 +112,7 @@ Historical note:
 The v1.7.8.post1 Task 005 staging hash `dad9ada7c639b676b4eb58bfef97e6d0eb3e399c05f02576f4c367eb95055473` is preserved as historical staging evidence.
 It was computed before Git-compatible mode normalization and included local mode `0664` for `requirement.txt`.
 The v1.7.8.post1 tag, GitHub Release, and public commit must not be retagged or rewritten for this evidence-policy correction.
+
+## Replacing a previous package
+
+Choose an output outside the project's workflow records and managed files. With `--force`, AIWF stages the new ZIP or directory before replacing the old output. Directory replacement accepts an empty directory or an existing AIWF records package. To write into another location, choose a new directory name. If a directory swap is interrupted, look beside the output for `.<output-name>-previous-*/package` before retrying.

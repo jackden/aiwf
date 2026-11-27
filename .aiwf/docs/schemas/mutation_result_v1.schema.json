@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AIWF governed mutation result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "operation", "operation_status", "mutation_state", "runtime_exit_code", "target", "diagnostics", "requires_reconciliation", "result"],
+  "properties": {
+    "contract_version": {"const": 1},
+    "operation": {"enum": ["guard", "new-task", "transition", "sync-index", "record", "finalize", "correct-finalized"]},
+    "operation_status": {"enum": ["succeeded", "blocked", "rejected", "failed", "timeout", "unsupported"]},
+    "mutation_state": {"enum": ["not_applied", "applied", "already_applied", "partially_applied", "unknown"]},
+    "requires_reconciliation": {"type": "boolean"},
+    "runtime_exit_code": {"type": ["integer", "null"]},
+    "target": {"type": ["string", "null"]},
+    "result": {"type": ["object", "null"]},
+    "diagnostics": {"type": "array", "items": {
+      "type": "object", "required": ["code", "severity", "message"],
+      "properties": {
+        "code": {"type": "string"}, "severity": {"enum": ["info", "warn", "error"]},
+        "message": {"type": "string"}, "blocker": {"type": "boolean"},
+        "path": {"type": "string"}, "suggested_fix": {"type": "string"}
+      }
+    }}
+  },
+  "allOf": [
+    {"if": {"properties": {"mutation_state": {"enum": ["partially_applied", "unknown"]}}}, "then": {"properties": {"requires_reconciliation": {"const": true}}}},
+    {"if": {"properties": {"operation_status": {"const": "succeeded"}}}, "then": {"properties": {"target": {"type": "string", "minLength": 1}, "runtime_exit_code": {"const": 0}, "mutation_state": {"enum": ["not_applied", "already_applied", "applied"]}, "requires_reconciliation": {"const": false}}}},
+    {"if": {"properties": {"operation_status": {"enum": ["rejected", "unsupported"]}}}, "then": {"properties": {"mutation_state": {"const": "not_applied"}}}},
+    {"if": {"properties": {"operation_status": {"const": "timeout"}}}, "then": {"properties": {"mutation_state": {"enum": ["not_applied", "unknown"]}}}},
+    {"if": {"properties": {"operation_status": {"const": "failed"}}}, "then": {"properties": {"mutation_state": {"enum": ["not_applied", "partially_applied", "unknown"]}}}},
+    {"if": {"properties": {"operation_status": {"const": "blocked"}}}, "then": {"properties": {"mutation_state": {"enum": ["not_applied", "applied"]}}}}
+  ]
+}

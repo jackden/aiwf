@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import BinaryIO, Iterable, Iterator, Sequence
 
 
 class SafePathError(ValueError):
@@ -147,9 +150,111 @@ def safe_walk_files(root: Path, *, allowed_root: Path | None = None) -> Iterable
                 yield child
 
 
-def safe_copy_file_no_symlink(source: Path, dest: Path, allowed_root: Path) -> None:
+def validate_destination(path: Path, root: Path, *, directory: bool = False) -> None:
+    """Check the lexical path, including missing leaves and existing ancestors."""
+    if not path.is_relative_to(root) or ".." in path.relative_to(root).parts:
+        raise SafePathError(f"destination is outside target root: {path}")
+    current = root
+    parts = path.relative_to(root).parts
+    for index in range(len(parts) + 1):
+        if index:
+            current /= parts[index - 1]
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise SafePathError(f"destination contains a symlink or reparse point: {lexical_relative(current, root)}")
+        if index < len(parts) or directory:
+            if not stat.S_ISDIR(info.st_mode):
+                raise SafePathError(f"destination parent must be a directory: {lexical_relative(current, root)}")
+        elif not stat.S_ISREG(info.st_mode):
+            raise SafePathError(f"destination must be a regular file: {lexical_relative(current, root)}")
+
+
+def require_destination_handles() -> None:
+    if not {os.open, os.mkdir, os.rename, os.stat, os.unlink, os.rmdir} <= os.supports_dir_fd or not (
+        hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and hasattr(os, "fchmod")
+    ):
+        raise SafePathError("maintenance writes require no-follow directory handles; use a supported Linux or macOS filesystem")
+
+
+@contextmanager
+def destination_directory(path: Path, root: Path, *, create: bool = False) -> Iterator[int]:
+    """Pin each directory component without following links during maintenance writes."""
+    require_destination_handles()
+    validate_destination(path, root, directory=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(root, flags)
+    try:
+        for part in path.relative_to(root).parts:
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def destination_writer(path: Path, root: Path, *, mode: int | None = None) -> Iterator[BinaryIO]:
+    """Stage bytes beside the destination and replace the leaf without following it."""
+    validate_destination(path, root)
+    with destination_directory(path.parent, root, create=True) as parent:
+        # Retain the existing file's write-permission requirement even though
+        # committing a staged replacement uses the parent directory's permission.
+        try:
+            existing = os.open(path.name, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                info = os.fstat(existing)
+                if not stat.S_ISREG(info.st_mode):
+                    raise SafePathError(f"destination must be a regular file: {lexical_relative(path, root)}")
+                if mode is None:
+                    mode = stat.S_IMODE(info.st_mode)
+            finally:
+                os.close(existing)
+        staging = f".aiwf-copy-{uuid.uuid4().hex}"
+        fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 if mode is None else mode, dir_fd=parent)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                yield output
+                if mode is not None:
+                    os.fchmod(output.fileno(), mode)
+            validate_destination(path, root)
+            if not os.path.samestat(os.fstat(parent), path.parent.stat()):
+                raise SafePathError(f"destination parent changed: {lexical_relative(path.parent, root)}")
+            os.replace(staging, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        finally:
+            try:
+                os.unlink(staging, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+
+
+def safe_copy_file_no_symlink(source: Path, dest: Path, allowed_root: Path, dest_root: Path | None = None) -> None:
     safe_resolve_under(source, allowed_root)
     reject_symlink(source, root=allowed_root)
+    if dest_root is not None:
+        with source.open("rb") as input_file:
+            info = os.fstat(input_file.fileno())
+            with destination_writer(dest, dest_root, mode=stat.S_IMODE(info.st_mode)) as output:
+                shutil.copyfileobj(input_file, output)
+                output.flush()
+                if os.utime in os.supports_fd:
+                    os.utime(output.fileno(), ns=(info.st_atime_ns, info.st_mtime_ns))
+        return
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, dest)
 

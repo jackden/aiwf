@@ -8,7 +8,15 @@ If the repository already has AIWF files and workflow evidence, use [upgrading.m
 ## Preconditions
 
 - Run the commands from the repository root.
-- Use Python 3.10 or newer.
+- Use Bash and Python 3.10 or newer for the commands below.
+- Install from macOS or Linux. On native Windows, omit `--yes` to preview
+  the install. Writing package files requires a platform that can open
+  destination directories without following symbolic links.
+- Keep the working copy on supported local storage if you plan to create tasks
+  or record evidence. Core qualifies APFS/HFS on macOS and specific local
+  filesystems on Linux. Native Windows lacks a supported writer backend.
+  Some text observations remain available with a warning on unsupported
+  storage. [Storage and locking requirements](cli_reference.md#concurrent-workflow-operations-and-recovery)
 - Git is optional for the CLI itself, but you will usually want a git repository if you plan to commit the installed files and future workflow records.
 - An existing `AGENTS.md` is supported.
 - Back up local work before installing AIWF into a repository that already contains edits.
@@ -74,6 +82,14 @@ or silently become upgrade.
 If `AGENTS.md` already exists, `agents install` preserves everything outside the managed block.
 If `AGENTS.md` does not exist, `agents install` creates the file with the managed block in place.
 
+## Connect an MCP client
+
+To use AIWF in Codex CLI, GitHub Copilot CLI or VS Code, install the optional
+adapter in its own Python environment using a wheel or the AIWF source package.
+Point the client at the project where you installed Core. The walkthrough is
+included in this project's `.aiwf/docs/examples/` directory and shows how to
+verify the connection and create a first task. [MCP setup walkthrough (繁體中文)](examples/mcp_setup.md)
+
 ## Root AGENTS.md Integration
 
 - `./aiwf agents print-block` prints the managed block text from `.aiwf/templates/AGENTS.block.md`.
@@ -88,7 +104,13 @@ If the template file is missing, the `agents` commands cannot render or validate
 
 - `./aiwf --help` opens the repo-local CLI.
 - `./aiwf agents check --path AGENTS.md` confirms the root managed block.
-- `./aiwf new-task aiwf_install_smoke` creates the first task.
+- `./aiwf query context` checks structured query support on this working copy.
+  If it reports `AIWF-LOCK-UNSUPPORTED`, review the storage requirements
+  before creating a task. For the current process's root write permission,
+  inspect `result.mutation_root_writable` in `./aiwf query context --full-workflow`.
+- Use the [worked example](examples/basic_lifecycle.md) to create the first task,
+  test the installed managed block and record the result. If the task already
+  exists, resume using the dated path printed by `./aiwf list`.
 - `./aiwf doctor --path <generated_task_path>` is a useful task-level sanity check once you have a real task path.
 - `./aiwf install --target .` is a read-only preflight when invoked from a source package.
 - `git status --short` should not show copied generated state that you did not intend to commit.
@@ -116,5 +138,5 @@ Existing project-owned files under root `scripts/` should remain unchanged durin
 | `./aiwf` says bootstrap mode only supports upgrade commands | The canonical runtime is missing and the command is not being run from a source package | Use `/path/to/aiwf-package/aiwf install --target . --yes`, or use `upgrade` for an existing installation |
 | `AIWF-AGENTS-001` or `AGENTS.md file not found` | Root `AGENTS.md` has not been created yet | Run `./aiwf agents install --path AGENTS.md --yes` from the repo root |
 | `AIWF-AGENTS-OUTDATED` | The managed block drifted from `.aiwf/templates/AGENTS.block.md` | Re-run `./aiwf agents install --path AGENTS.md --yes` |
-| `./aiwf upgrade --check` reports missing `aiwf` or `.aiwf/bin/ai_workflow.py` | Only part of the package was copied | Copy the missing package paths from the source tree |
+| The target launcher is missing or its Runtime cannot import a dependency | Only part of the package is present | Use the [source-side recovery procedure](upgrading.md#recover-a-target-that-cannot-start) with a complete package |
 | Copied files appear under `git status` but you did not mean to commit them | Generated state or backup artifacts were brought over from another repository | Remove the generated files from the commit set and keep only the installed package files |

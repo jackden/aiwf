@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiwf-mcp"
+dynamic = ["version"]
+description = "Optional bound-worktree stdio adapter for AIWF queries and workflow operations"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["mcp==2.3.0", "anyio>=4.9", "jsonschema>=4.20,<5", "referencing>=0.28"]
+
+[project.optional-dependencies]
+guidance = ["PyYAML==6.0.3"]
+
+[project.scripts]
+aiwf-mcp = "aiwf_mcp.server:main"
+aiwf-mcp-operator = "aiwf_mcp.operator:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "aiwf_mcp.__version__"}
+
+[tool.setuptools.data-files]
+"share/aiwf-mcp/examples" = ["examples/codex.toml", "examples/copilot.mcp.json", "examples/vscode.mcp.json"]

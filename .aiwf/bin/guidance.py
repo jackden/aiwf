@@ -15,6 +15,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 import ai_workflow
+from lib import workflow_lock
 from lib.package_core import compute_sha256
 from safe_paths import reject_symlink_components
 
@@ -25,6 +26,8 @@ except ImportError:
 
 
 GUIDANCE_DIR = Path(ai_workflow.GUIDANCE_NOTES_PATH)
+GUIDANCE_QUERY_CONTRACT_VERSION = 1
+GUIDANCE_SCOPE_METADATA_VERSION = 1
 LEGACY_CORRECTION = "POST_FINALIZATION_CORRECTION.md"
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 SHA256 = re.compile(r"[a-f0-9]{64}")
@@ -340,20 +343,20 @@ def show_note(note: Note) -> None:
     print("\n" + note.body.rstrip())
 
 
-def run(root: Path, args: argparse.Namespace) -> int:
+def evaluate(root: Path, args: argparse.Namespace) -> tuple[list, list[str]]:
     if not root.is_dir():
         raise ValueError(f"source root is not a directory: {root}")
     config = root / ".aiwf/config.yaml"
     reject_symlink_components(config, root)
     if config.exists():
         require_regular_file(root, config)
-    records_root = relative_path(ai_workflow.load_aiwf_config(root).layout.record_root, "records root")
-    print(f"Source root: {root}")
-    print(f"Guidance directory: {GUIDANCE_DIR.as_posix()}")
+    layout = (ai_workflow._query_layout(root) if getattr(args, "format", None) == "json"
+              else ai_workflow.load_aiwf_config(root).layout)
+    records_root = relative_path(layout.record_root, "records root")
     entries = directory_entries(root, root / GUIDANCE_DIR)
     notes = []
     ids = Counter()
-    invalid = False
+    errors = []
     for path in entries:
         if path.suffix != ".md":
             continue
@@ -363,25 +366,69 @@ def run(root: Path, args: argparse.Namespace) -> int:
             ids[note_id] += 1
             notes.append(read_note(metadata, body, records_root))
         except (OSError, ValueError, yaml.YAMLError, RecursionError) as error:
-            invalid = True
-            print(f"INVALID {path.relative_to(root).as_posix()}: {error}")
+            errors.append(f"INVALID {path.relative_to(root).as_posix()}: {error}")
 
     for note_id, count in sorted(ids.items()):
         if count > 1:
-            invalid = True
-            print(f"INVALID {note_id}: duplicate guidance id")
+            errors.append(f"INVALID {note_id}: duplicate guidance id")
 
-    matched = 0
-    review_needed = False
+    matched = []
     snapshots = {}
     for note in sorted(notes, key=lambda item: item.id):
         if ids[note.id] > 1 or (args.id and note.id != args.id) or (args.scope and args.scope not in note.scope):
             continue
         if args.command == "show" and not args.id and note.status != "active":
             continue
-        matched += 1
-        issues = check_sources(root, note, snapshots)
-        review_needed |= bool(issues)
+        matched.append((note, check_sources(root, note, snapshots)))
+    return matched, errors
+
+
+def structured_note(note: Note, issues: list[str], *, explicit_id: bool, metadata_only: bool, root: Path) -> dict:
+    eligible = note.status == "active" and not issues
+    visible = eligible or explicit_id
+    sources = []
+    if visible:
+        for source in note.sources:
+            corrections = None
+            if source.corrections is not None:
+                corrections = [
+                    {"path": path.as_posix(), "sha256": digest}
+                    for path, digest in sorted(source.corrections.items())
+                ]
+            sources.append({
+                "task": source.task.as_posix(), "artifact": source.artifact.as_posix(),
+                "locator": source.locator, "sha256": source.sha256, "reviewed_corrections": corrections,
+            })
+    return {
+        "id": note.id, "title": note.title, "status": note.status,
+        "source_state": "review_needed" if issues else "current", "eligible": eligible,
+        "issues": [message.replace(str(root) + "/", "") for message in issues],
+        "scope": note.scope if visible else [], "review_ref": note.review_ref if visible else None,
+        "sources": sources, "body": note.body if visible and not metadata_only else None,
+    }
+
+
+def run(root: Path, args: argparse.Namespace) -> int:
+    structured = getattr(args, "format", None) == "json"
+    if structured and not (args.id or args.scope):
+        return ai_workflow.emit_query_result("guidance", 2, None, code="AIWF-GUIDANCE-SELECTOR", message="Supply one scope or ID.")
+    matched, errors = evaluate(root, args)
+    rc = int(any(issues for _, issues in matched))
+    if structured:
+        if errors or (args.id and not matched):
+            return ai_workflow.emit_query_result("guidance", 2, None, code="AIWF-GUIDANCE-QUERY",
+                                                 message="Invalid guidance collection or unknown note ID.")
+        result = {"selector": {"id": args.id} if args.id else {"scope": args.scope},
+                  "notes": [structured_note(note, issues, explicit_id=bool(args.id),
+                                            metadata_only=args.metadata_only, root=root)
+                            for note, issues in matched]}
+        return ai_workflow.emit_query_result("guidance", rc, result)
+
+    print(f"Source root: {root}")
+    print(f"Guidance directory: {GUIDANCE_DIR.as_posix()}")
+    for message in errors:
+        print(message)
+    for note, issues in matched:
         summary = "REVIEW NEEDED" if issues else "sources match"
         print(f"\n{note.id} | {note.title} | {note.status} | {summary}")
         for issue in issues:
@@ -398,7 +445,7 @@ def run(root: Path, args: argparse.Namespace) -> int:
             print(f"No usable guidance entry found for ID {args.id}.")
             return 2
         print("No matching guidance entries.")
-    return 2 if invalid else int(review_needed)
+    return 2 if errors else rc
 
 
 def nonblank_selector(value: str) -> str:
@@ -407,8 +454,18 @@ def nonblank_selector(value: str) -> str:
     return value
 
 
+class _StructuredArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ValueError(message)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    tokens = sys.argv[1:] if argv is None else argv
+    json_requested = "--format=json" in tokens or any(
+        first == "--format" and second == "json" for first, second in zip(tokens, tokens[1:])
+    )
+    parser_type = _StructuredArgumentParser if json_requested else argparse.ArgumentParser
+    parser = parser_type(description=__doc__)
     parser.add_argument("--repo-root", type=Path, help="local project root, defaults to AIWF root discovery")
     commands = parser.add_subparsers(dest="command", required=True)
     for name, help_text in (
@@ -416,21 +473,45 @@ def main(argv: list[str] | None = None) -> int:
         ("show", "show current references or explicitly inspect an entry by ID"),
     ):
         command = commands.add_parser(name, help=help_text)
+        if name == "show":
+            command.add_argument("--format", choices=["text", "json"], default="text")
+            command.add_argument("--metadata-only", action="store_true",
+                                 help="omit note bodies from a structured scope lookup")
         selector = command.add_mutually_exclusive_group()
         selector.add_argument("--id", type=nonblank_selector, help="exact guidance ID")
         selector.add_argument("--scope", type=nonblank_selector, help="exact scope tag")
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(tokens)
+        if getattr(args, "metadata_only", False) and (args.format != "json" or not args.scope):
+            parser.error("--metadata-only requires --format json and --scope")
+    except ValueError:
+        return ai_workflow.emit_query_result("guidance", 2, None, code="AIWF-GUIDANCE-SELECTOR",
+                                             message="Invalid structured guidance arguments.")
+    structured = getattr(args, "format", None) == "json"
     if yaml is None:
+        if structured:
+            return ai_workflow.emit_query_result("guidance", 2, None, code="AIWF-GUIDANCE-UNAVAILABLE",
+                                                 message="Guidance requires PyYAML.")
         print("ERROR: Guidance requires PyYAML. Install it in the Python environment used for this helper.", file=sys.stderr)
         return 2
     try:
         root = args.repo_root.resolve(strict=True) if args.repo_root else ai_workflow.find_repo_root(Path.cwd())
-        return run(root, args)
-    except (OSError, ValueError) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+        with workflow_lock.workflow_lock(root, writer=False, operation="guidance",
+                                         allow_unlocked_observation=not structured):
+            return run(root, args)
+    except workflow_lock.WorkflowLockError as error:
+        if structured:
+            return ai_workflow.emit_query_result("guidance", 2, None, code=error.code, message=error.message)
+        print(f"ERROR: {error.code}: {error.message}", file=sys.stderr)
         return 2
-    except SystemExit as error:
-        print(error, file=sys.stderr)
+    except (OSError, ValueError, SystemExit) as error:
+        if structured:
+            return ai_workflow.emit_query_result("guidance", 2, None, code="AIWF-GUIDANCE-QUERY",
+                                                 message="Could not read the bound guidance collection.")
+        if isinstance(error, SystemExit):
+            print(error, file=sys.stderr)
+            return 2
+        print(f"ERROR: {error}", file=sys.stderr)
         return 2
 
 

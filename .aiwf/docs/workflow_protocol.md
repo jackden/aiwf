@@ -2,12 +2,24 @@
 
 This document is the canonical protocol semantics reference for repository-native AI workflow governance.
 
-## Version Identity Policy (v1.7.16)
+## Version Identity Policy (v1.7.17.post4)
 
 Current version state:
-- release version: `1.7.16`
-- tool version: `1.7.16`
+- release version: `1.7.17.post4`
+- tool version: `1.7.17.post4`
 - workflow protocol version: `1.7.10`
+
+Version 1.7.17.post4 verifies the saved closure manifest for inspection, checks workflow write destinations before changing evidence, and preserves upgrade and export evidence. See the [release notes](releases/v1.7.17.post4.md).
+
+Version 1.7.17.post2 updates the user-facing CLI, review prompts, package
+summaries and adoption guides. See the [candidate notes](releases/v1.7.17.post2.md).
+
+Version 1.7.17.post1 corrects MCP interoperability and installation repair.
+See the [candidate notes](releases/v1.7.17.post1.md).
+
+Version 1.7.17 adds an optional local MCP adapter and machine-readable query
+and mutation results. Both interfaces use the installed Runtime's phase,
+evidence and closure decisions. See [v1.7.17 release notes](releases/v1.7.17.md).
 
 Version 1.7.16 ships the optional Evidence-linked Guidance helper. It reads
 project-owned notes and evidence outside the workflow completion path.

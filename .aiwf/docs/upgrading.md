@@ -16,8 +16,9 @@ The source repository used with `./aiwf upgrade --source <path>` must contain:
 
 At minimum, `upgrade --check` validates that the source package contains `aiwf`,
 `.aiwf/bin/ai_workflow.py`, `.aiwf/bin/safe_paths.py`, `.aiwf/bin/lib/`,
-`.aiwf/bin/lib/package_core.py`, `.aiwf/docs/`, and
-`.aiwf/templates/AGENTS.block.md`.
+`.aiwf/bin/lib/package_core.py`, `.aiwf/bin/lib/workflow_lock.py`,
+`.aiwf/docs/`, and `.aiwf/templates/AGENTS.block.md`. It also checks for the
+query and mutation result schemas declared by the source Runtime.
 
 The runtime dependency set must include `.aiwf/bin/safe_paths.py` and
 `.aiwf/bin/lib/package_core.py`.
@@ -33,21 +34,63 @@ GitHub ZIP downloads and git clones are both supported as source packages when
 | No `aiwf` wrapper and no `.aiwf/` tree | First install |
 | Root `aiwf` exists and `.aiwf/` exists | Upgrade |
 | Legacy `docs/ai_*` layout exists | Upgrade / migration path |
-| Partial or inconsistent layout | Run `./aiwf upgrade --check --source <source_repo>` and review blockers before `--apply` |
+| Partial or inconsistent layout | If the target starts, run `./aiwf upgrade --check --source <source_repo>`. If its launcher or a Runtime import fails, use [source-side recovery](#recover-a-target-that-cannot-start). |
 
 ## Safe Upgrade Order
 
-The current bootstrap-capable flow is:
+Stop workflow writers before upgrading. When upgrading from v1.7.16 or another
+older installer, run the new source package's launcher. Its destination checks
+and file comparisons take effect on the **first** attempt. An already-running
+old installer uses its own copy logic until that command exits.
 
 ```bash
-cp /path/to/new_aiwf_repo/aiwf ./aiwf
-chmod +x ./aiwf
-./aiwf upgrade --check --source /path/to/new_aiwf_repo
-./aiwf upgrade --dry-run --source /path/to/new_aiwf_repo
-./aiwf upgrade --apply --source /path/to/new_aiwf_repo
+SOURCE=/absolute/path/to/complete-aiwf-source
+TARGET=/absolute/path/to/your-project
+cd "$SOURCE"
+./aiwf --repo-root "$TARGET" upgrade --check --source "$SOURCE"
+./aiwf --repo-root "$TARGET" upgrade --dry-run --source "$SOURCE"
+./aiwf --repo-root "$TARGET" upgrade --apply --source "$SOURCE"
 ```
 
-This bootstrap sequence applies to v1.7.16.
+Review the check and dry-run output before applying. After an interrupted apply,
+correct the reported filesystem problem and repeat the check from the same
+complete source. A matching version alone does not establish that every
+managed file was installed. Run the check again after repair.
+
+Install, upgrade and relocation writes require directory handles that can open
+each parent without following symbolic links (supported on Linux and macOS).
+Native Windows supports install preview, upgrade checks and dry runs, and
+relocation preview. An upgrade whose files already match can report a no-op.
+For an upgrade that needs to write files, use a supported system with the
+target and the complete source accessible there and all workflow writers stopped.
+
+## Recover a target that cannot start
+
+A partly installed target can raise `ImportError` before its local
+`upgrade --check` starts. A missing launcher or a launcher that lost its
+execute permission also prevents startup. Use the trusted, complete **source**
+package to drive the repair.
+Choose absolute directories and keep workflow writers stopped.
+
+```bash
+SOURCE=/absolute/path/to/complete-aiwf-source
+TARGET=/absolute/path/to/project-to-repair
+cd "$SOURCE" && ./aiwf --repo-root "$TARGET" upgrade --check --source "$SOURCE"
+```
+
+Confirm the target and the listed updates, preserved paths, relocations and
+blockers. From the same source directory, review the dry run before applying.
+
+```bash
+./aiwf --repo-root "$TARGET" upgrade --dry-run --source "$SOURCE"
+```
+
+```bash
+./aiwf --repo-root "$TARGET" upgrade --apply --source "$SOURCE"
+```
+
+Run `cd "$TARGET" && ./aiwf upgrade --check --source "$SOURCE"` to verify
+that the target now launches and reports `repair_required: no`.
 
 ## Upgrade Modes
 
@@ -58,7 +101,9 @@ This bootstrap sequence applies to v1.7.16.
 | `--apply` | Yes | The validated plan is executed and written to disk | Installed files, preserved paths, relocated legacy paths, and a migration report path | The dry-run output does not match your expectations | `0` on success or no-op, `2` on blockers or invalid source |
 
 `--no-relocate` skips legacy layout relocation and leaves the old layout in place.
-Use it only when you intentionally want to preserve the legacy layout.
+A v1 project with a custom `layout.records_root` keeps that directory as its v2 `record_root`. Compare the current and target records roots in the preview and run `./aiwf list` after upgrading.
+
+During apply, the installer records the original plan as `*_upgrade.pending` under `.aiwf/migrations/`. An interrupted report write keeps the upgrade open even after the runtime files match. Restore access to the directory, then repeat check and apply from the same source bytes with the same migration options. The finished `*_upgrade.md` records the verified result.
 
 Relocation is fail-closed when both a legacy source and its canonical destination
 exist. AIWF reports `AIWF-RELOCATE-CONFLICT-001`, returns `2`, and does not
@@ -76,13 +121,18 @@ The upgrade command preserves:
 - `.aiwf/config.yaml`
 
 Preserved means the source package must not overwrite those paths in the target repository.
+For an existing v2 layout, custom record and event paths, comments and settings
+in `.aiwf/config.yaml` are retained byte for byte. Source-only internal docs,
+private knowledge and release helpers are excluded from both install and upgrade.
+If an older installer already rewrote a custom configuration, restore it from
+your project history or backup before resuming workflow operations.
 
 ## Package Records Upgrade Impact
 
 Package Records is an optional capability exposed through:
 
 ```bash
-./aiwf package records --output records.zip
+./aiwf package records --task "$TASK" --output records.zip
 ```
 
 No migration is required to use existing AIWF task creation, validation, review,
@@ -90,9 +140,9 @@ or finalize workflows. Package Records does not change workflow protocol
 semantics, task front matter schema, event schema, finalize behavior, or
 upgrade relocation behavior.
 
-Use Package Records when you need to hand off workflow execution records and
-related workflow evidence for analysis. It does not export the source
-repository.
+Set `TASK` to the full dated task directory before using the example.
+See the [Reporting Guide](reporting.md#package-records) for selection and
+the contents to inspect before sharing.
 
 AIWF v1.7.9 introduces `review_agent.md` as the canonical AI/agent review
 artifact for new task records. Existing records that contain only
@@ -151,6 +201,9 @@ AIWF upgrade and relocation must not create, overwrite, move, or assume ownershi
 Legacy root `docs/` migration is disabled by default.
 When the target repository still contains older AIWF-owned `docs/ai_*` content, `upgrade --check` and `upgrade --dry-run` report relocation only if `--migrate-legacy-docs` is used after reviewing ownership.
 `upgrade --apply --migrate-legacy-docs` moves those legacy AIWF paths into the committed v2 layout unless `--no-relocate` is set.
+For an existing v2 configuration, migration uses its configured documentation
+and record directories. Moves must stay within the target's `.aiwf/` tree
+and on one filesystem. Review both locations in the dry run.
 
 Upgrade with legacy migration uses the same conflict preflight as relocation. A
 conflict aborts before runtime, config, docs, event, or report mutation, and no
@@ -190,12 +243,17 @@ If the target repository is already on the same tool version but is missing
 After `upgrade --apply`, validate the repository with:
 
 ```bash
-./aiwf --help >/tmp/aiwf_help.txt
+./aiwf --help
 ./aiwf upgrade --check --source /path/to/new_aiwf_repo
 ./aiwf upgrade --dry-run --source /path/to/new_aiwf_repo
 ./aiwf agents check --path AGENTS.md
-./aiwf check --path <task_path> --finalize-ready
+./aiwf query context
 ```
+
+If the repository already has tasks, run `./aiwf list` and use
+`./aiwf check --path "$TASK"` on a known dated task path. Use
+`--finalize-ready` when evaluating that task for closure. An open task
+awaiting validation or human review can legitimately report closure blockers.
 
 Recommended spot checks:
 
@@ -205,7 +263,9 @@ Recommended spot checks:
 - confirm `.aiwf/docs/` exists in the upgraded repository
 - confirm `.aiwf/templates/AGENTS.block.md` exists in the upgraded repository
 - confirm `./aiwf agents check --path AGENTS.md` does not fail because the managed block template is missing
-- confirm `.aiwf/records/ai_YYYYMMDD/` is still the active records root
+- confirm the target's reported records root matches the one in your v2
+  configuration (`.aiwf/records` by default), then use `./aiwf list` to
+  check that your dated tasks are visible
 - confirm project-level `docs/`, `tools/`, and `scripts/` were not modified unless you explicitly chose a legacy AIWF docs migration
 - confirm existing project-owned files under root `scripts/` remain unchanged
 - confirm no copied generated state was accidentally staged for commit
@@ -215,7 +275,8 @@ Recommended spot checks:
 | Symptom | Cause | Recommended correction |
 |---|---|---|
 | `upgrade --check` reports a missing required source package path | Only part of the new package was copied into the source repo | Use a source package that contains `aiwf`, `.aiwf/bin/**`, `.aiwf/docs/**`, and `.aiwf/templates/**`, then rerun `--check` |
-| `upgrade --check` reports `repair_required: yes` for the same tool version | The target repo is missing runtime dependencies or managed templates | Run `./aiwf upgrade --apply --source <source_repo>` to reinstall the missing AIWF-owned package paths |
+| Target `./aiwf` is missing or raises an import error before showing its plan | Its own Runtime cannot start | Run the [source-side recovery procedure](#recover-a-target-that-cannot-start) |
+| `upgrade --check` reports `repair_required: yes` for the same tool version | One or more managed package files are missing, incomplete or differ from the complete source | Review the listed paths and use the source-side apply command above, then repeat the check |
 | `upgrade --check` or `--dry-run` reports `relocation_required: yes` | The target repo still has legacy `docs/ai_*` paths | Review the relocation plan, then run `--apply` or intentionally use `--no-relocate` |
 | `upgrade --check` warns that `tools/ai_workflow.py` exists | An older project-owned legacy file is still present | Keep it if callers depend on it, or remove it manually after confirming it is unused |
 | `upgrade --check` or `--dry-run` reports `AIWF-RELOCATE-CONFLICT-001` | A legacy source and canonical destination both exist | Review both paths, resolve the duplicate explicitly, then rerun the command before `--apply` |

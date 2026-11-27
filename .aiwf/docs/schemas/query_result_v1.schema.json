@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AIWF read-only query result v1",
+  "type": "object",
+  "required": ["contract_version", "operation", "execution", "exit_code", "result", "error"],
+  "properties": {
+    "contract_version": {"const": 1},
+    "operation": {"enum": ["context", "inspect", "check", "diagnostics", "guidance", "list"]},
+    "execution": {"enum": ["ok", "error"]},
+    "exit_code": {"enum": [0,1,2]},
+    "result": {"type": ["object", "null"]},
+    "error": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/error"}]}
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"execution": {"const": "error"}}},
+      "then": {
+        "properties": {"result": {"type": "null"}, "error": {"$ref": "#/$defs/error"}, "exit_code": {"const": 2}}
+      },
+      "else": {"properties": {"error": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"operation": {"const": "context"}, "execution": {"const": "ok"}}},
+      "then": {"properties": {"result": {"$ref": "#/$defs/context"}, "exit_code": {"enum": [0]}}}
+    },
+    {
+      "if": {"properties": {"operation": {"const": "list"}, "execution": {"const": "ok"}}},
+      "then": {"properties": {"result": {"$ref": "#/$defs/taskList"}, "exit_code": {"const": 0}}}
+    },
+    {
+      "if": {"properties": {"operation": {"const": "inspect"}, "execution": {"const": "ok"}}},
+      "then": {"properties": {"result": {"$ref": "#/$defs/inspect"}, "exit_code": {"enum": [0]}}}
+    },
+    {
+      "if": {"properties": {"operation": {"const": "check"}, "execution": {"const": "ok"}}},
+      "then": {"properties": {"result": {"$ref": "#/$defs/check"}, "exit_code": {"enum": [0,2]}}}
+    },
+    {
+      "if": {"properties": {"operation": {"const": "diagnostics"}, "execution": {"const": "ok"}}},
+      "then": {"properties": {"result": {"$ref": "#/$defs/diagnostics"}, "exit_code": {"enum": [0,2]}}}
+    },
+    {
+      "if": {"properties": {"operation": {"const": "guidance"}, "execution": {"const": "ok"}}},
+      "then": {"properties": {"result": {"$ref": "#/$defs/guidance"}, "exit_code": {"enum": [0,1]}}}
+    },
+    {
+      "if": {
+        "properties": {"execution": {"const": "ok"}, "operation": {"const": "check"}, "exit_code": {"const": 0}}
+      },
+      "then": {"properties": {"result": {"properties": {"workflow_result": {"const": "PASS"}}}}}
+    },
+    {
+      "if": {
+        "properties": {"execution": {"const": "ok"}, "operation": {"const": "check"}, "exit_code": {"const": 2}}
+      },
+      "then": {"properties": {"result": {"properties": {"workflow_result": {"const": "BLOCKED"}}}}}
+    }
+  ],
+  "$defs": {
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {"code": {"type": "string"}, "message": {"type": "string"}},
+      "additionalProperties": false
+    },
+    "diagnostic": {
+      "type": "object",
+      "required": ["code", "severity", "blocker", "message", "path", "suggested_fix"],
+      "properties": {
+        "code": {"type": "string"},
+        "severity": {"enum": ["info", "warn", "error"]},
+        "blocker": {"type": "boolean"},
+        "message": {"type": "string"},
+        "path": {"type": "string"},
+        "suggested_fix": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "correction": {
+      "type": "object",
+      "required": ["id", "type", "authority", "current_effective_state", "path"],
+      "properties": {
+        "id": {"type": "string"},
+        "type": {"type": "string"},
+        "authority": {"type": "string"},
+        "current_effective_state": {"type": "string"},
+        "path": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "context": {
+      "type": "object",
+      "required": ["tool_version", "protocol_version", "records_root", "capabilities"],
+      "properties": {
+        "tool_version": {"type": "string"},
+        "protocol_version": {"type": "string"},
+        "records_root": {"type": "string"},
+        "readable_records_roots": {
+          "type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}
+        },
+        "mutation_contract_version": {"const": 1},
+        "mutation_root_writable": {"type": "boolean"},
+        "mutation_operations": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "capabilities": {
+          "type": "object",
+          "required": ["inspect", "check", "diagnostics", "guidance", "write_operations"],
+          "properties": {
+            "list": {"type": "boolean"},
+            "finalize_preview": {"type": "boolean"},
+            "inspect": {"type": "boolean"},
+            "check": {"type": "boolean"},
+            "diagnostics": {"type": "boolean"},
+            "guidance": {"type": "boolean"},
+            "write_operations": {"const": false}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "taskList": {
+      "type": "object", "additionalProperties": false,
+      "required": ["tasks", "limit", "truncated"],
+      "properties": {
+        "tasks": {"type": "array", "maxItems": 100, "items": {
+          "type": "object",
+          "required": ["task_path", "task_id", "task_name", "title", "status", "review_status", "workflow_phase"],
+          "additionalProperties": {"type": "string"}
+        }},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "inspect": {
+      "type": "object",
+      "required": [
+        "task_path",
+        "status",
+        "workflow_phase",
+        "closure_preserved",
+        "correction_count",
+        "latest_correction"
+      ],
+      "properties": {
+        "task_path": {"type": "string"},
+        "status": {"type": "string"},
+        "workflow_phase": {"type": "string"},
+        "closure_preserved": {"type": "boolean"},
+        "correction_count": {"type": "integer", "minimum": 0},
+        "latest_correction": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/correction"}]}
+      },
+      "additionalProperties": false
+    },
+    "check": {
+      "type": "object",
+      "required": ["task_path", "mode", "workflow_result", "diagnostics"],
+      "allOf": [
+        {"if": {"properties": {"mode": {"const": "finalize_preview"}}},
+         "then": {"required": ["already_finalized", "projected_metadata"]},
+         "else": {"not": {"anyOf": [{"required": ["already_finalized"]}, {"required": ["projected_metadata"]}]}}}
+      ],
+      "properties": {
+        "task_path": {"type": "string"},
+        "already_finalized": {"type": "boolean"},
+        "projected_metadata": {"type": ["object", "null"], "additionalProperties": {"type": "string"}},
+        "mode": {"enum": ["standard", "finalize_readiness", "finalize_preview"]},
+        "workflow_result": {"enum": ["PASS", "BLOCKED"]},
+        "diagnostics": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}}
+      },
+      "additionalProperties": false
+    },
+    "diagnostics": {
+      "type": "object",
+      "required": ["task_path", "diagnostics", "derived_evidence"],
+      "properties": {
+        "task_path": {"type": "string"},
+        "diagnostics": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}},
+        "derived_evidence": {
+          "type": "object",
+          "required": ["derived_status", "validation", "review", "authority", "closure", "projection", "activity"],
+          "properties": {
+            "derived_status": {"type": "string"},
+            "validation": {"type": "object"},
+            "review": {"type": "object"},
+            "authority": {"type": "object"},
+            "closure": {"type": "object"},
+            "projection": {"type": "object"},
+            "activity": {"type": "object"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "guidance": {
+      "type": "object",
+      "required": ["selector", "notes"],
+      "properties": {
+        "selector": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["scope"],
+              "properties": {"scope": {"type": "string"}},
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["id"],
+              "properties": {"id": {"type": "string"}},
+              "additionalProperties": false
+            }
+          ]
+        },
+        "notes": {"type": "array", "items": {"$ref": "#/$defs/note"}}
+      },
+      "additionalProperties": false
+    },
+    "note": {
+      "type": "object",
+      "required": [
+        "id",
+        "title",
+        "status",
+        "source_state",
+        "eligible",
+        "issues",
+        "body",
+        "scope",
+        "review_ref",
+        "sources"
+      ],
+      "properties": {
+        "id": {"type": "string"},
+        "title": {"type": "string"},
+        "status": {"enum": ["active", "draft", "withdrawn"]},
+        "source_state": {"enum": ["current", "review_needed"]},
+        "eligible": {"type": "boolean"},
+        "issues": {"type": "array", "items": {"type": "string"}},
+        "body": {"type": ["string", "null"]},
+        "scope": {"type": "array", "items": {"type": "string"}},
+        "review_ref": {"type": ["string", "null"]},
+        "sources": {"type": "array", "items": {"$ref": "#/$defs/source"}}
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "required": ["task", "artifact", "locator", "sha256", "reviewed_corrections"],
+      "properties": {
+        "task": {"type": "string"},
+        "artifact": {"type": "string"},
+        "locator": {"type": "string"},
+        "sha256": {"type": "string"},
+        "reviewed_corrections": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["path", "sha256"],
+                "properties": {"path": {"type": "string"}, "sha256": {"type": "string"}},
+                "additionalProperties": false
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

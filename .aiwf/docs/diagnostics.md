@@ -14,13 +14,13 @@
 | `AIWF-CORRECTION-008` | error | Deterministic correction ID collides with an existing artifact. | A concurrent/manual artifact occupies the next correction ID. | Resolve the collision and retry after review. |
 | `AIWF-INSPECT-001` | error | `inspect` requires a task-specific directory. | A date root or unsupported path was supplied. | Use `.aiwf/records/ai_YYYYMMDD/NNN_task_name`. |
 | `AIWF-PATH-019` | error | Post-finalize event pollution detected in event chain. | `.aiwf/events/events.jsonl` contains evidence-changing events after closure. | Inspect `.aiwf/events/events.jsonl`; treat as closure contamination and continue in follow-up task. |
-| `AIWF-PATH-013` | error | Metadata is finalized but no `finalize_success` event exists. | Task metadata was manually changed to finalized, or finalize evidence was lost/missing. | Re-run `finalize` through `ai_workflow.py` when possible, or repair through a controlled follow-up/migration path. |
+| `AIWF-PATH-013` | error | Metadata is finalized but no `finalize_success` event exists. | Metadata and closure evidence disagree. | Preserve the task and ask the maintainer to investigate both event logs and the closure records through a follow-up. |
 | `AIWF-PATH-015` | error | Finalized artifact changed after finalize. | Required task artifacts drifted from `finalize_success.artifact_manifest` after closure. | Revert post-finalize edits, or use a controlled amend/reopen command if supported. Do not manually edit finalized task artifacts. |
 | `AIWF-FINALIZED-001` | warn | Finalized task file was modified after `finalized_at`. | One or more task markdown files have mtime later than the recorded closure time. | Review post-finalize edits. If new work is needed, open a follow-up task rather than appending evidence to the closed task. |
-| `INDEX_STATUS_STALE` | error | Parent index projection status does not match task metadata status. | `index.md` not synchronized after metadata mutations. | Run `sync-index --path <task_dir>` or finalize again after fixing metadata state. |
-| `INDEX_STATUS_INVALID_DONE` | error | Index status `done` is inconsistent with task metadata/finalized semantics. | Manual index edits or broken projection state. | Repair metadata/index consistency, then run `sync-index` and `check`. |
+| `INDEX_STATUS_STALE` | error | Parent index projection status does not match task metadata status. | `index.md` is out of date. | Run `./aiwf sync-index --path "$TASK"`, then rerun the check. |
+| `INDEX_STATUS_INVALID_DONE` | error | Index status `done` disagrees with the task's closure state. | Manual index edits or broken projection state. | Verify task metadata and closure evidence first. For an index-only mismatch, run `./aiwf sync-index --path "$TASK"`. For damaged task state, follow the recovery guidance below. |
 | `AIWF-REVIEW-002` | error | Review state is incompatible with completion criteria. | Review result is fail/pending/unknown while trying to finalize. | Complete review-fix-revalidation loop; record review pass or explicit allowed state. |
-| `AIWF-META-007` | error | Metadata is invalid for expected schema/invariants. | Missing or malformed required metadata fields. | Fix task front matter fields and re-run `check`. |
+| `AIWF-META-007` | error | Metadata is invalid for expected schema/invariants. | Missing or malformed required metadata fields. | For new input, correct the command arguments. For an existing task, follow [task metadata recovery](#task-metadata-recovery). |
 | `AIWF-META-009` | error | A metadata list field contains an invalid item. | A list field such as `related_tasks`, `blocked_by`, `supersedes`, or `tags` contains a non-canonical item. | Use canonical metadata item format. |
 | `AIWF-META-010` | error | A task reference field does not use canonical task id format. | A task reference field such as `parent_task` contains a non-canonical value. | Use canonical task id format `NNN`, for example `014`. |
 | `AIWF-META-011` | error | `related_files` contains an unsafe or invalid repo-relative path. | `related_files` contains an absolute path or parent traversal such as `/etc/passwd` or `../secret.txt`. | Use a repo-relative path such as `examples/test_raw_disk.py`. |
@@ -53,16 +53,16 @@
 | `AIWF-PATH-022` | error | Default template residue remains in a required section. | A generated section such as Background, Problem, Goal, or review summary was never rewritten for the current task. | Replace default template text with task-specific closure evidence before finalize. |
 | `AIWF-PATH-023` | error | Acceptance Criteria exist but no item has a closure decision. | The AC section is present, but every checkbox item is still unresolved. | Give each AC item a closure state such as passed, deferred, or not applicable before finalize. |
 | `AIWF-PATH-024` | error | Acceptance Criteria still contain unresolved or blocking states. | One or more AC items remain unchecked, failed, or blocked even though the task is being prepared for closure. | Resolve the item, or mark it deferred/not applicable with rationale before finalize. |
-| `AIWF-PATH-025` | error | Latest review decision authority does not satisfy the task's required authority. | A human-required task has only an `ai-agent` final decision, or the inverse. | Record a fresh final review with the required `--decision-authority`; `recorded_by` may be the agent that writes the evidence. |
-| `AIWF-PATH-026` | error | Latest final review lacks structured authority evidence. | A new or active legacy task has no decision authority or recording actor in the final review event. | Record a fresh review with structured authority fields. This is workflow evidence, not identity proof. |
-| `AIWF-PATH-027` | error | Review event authority snapshot disagrees with task metadata. | The event's required authority differs from the current task policy. | Align the policy and record a fresh review; historical events are not rewritten. |
+| `AIWF-PATH-025` | error | The recorded reviewer lacks the authority this task requires for closure. | A human-required task has only an agent decision, or the inverse. | Send the work and evidence to the required reviewer. For human review, wait for their actual decision and have the authorized operator record it. |
+| `AIWF-PATH-026` | error | Latest final review lacks structured authority evidence. | A new or active legacy task has no decision authority or recording actor in the final review event. | Confirm the actual review decision and who made it. Have the authorized recorder enter that evidence. If the decision is unknown, request review. |
+| `AIWF-PATH-027` | error | Review event authority snapshot disagrees with task metadata. | The event's required authority differs from the current task policy. | Ask the maintainer to verify the policy and event history. Preserve past evidence and obtain a decision under the verified policy. |
 | `AIWF-REVIEW-AUTHORITY-001` | error | A v1.7 review record omitted explicit decision authority. | `record --kind review` supplied a result without `--decision-authority`. | Supply `human`, `ai-agent`, or `not_required` as appropriate. |
 | `AIWF-REVIEW-AUTHORITY-002` | error | Review evidence has no non-empty recording actor. | `--recorded-by` and `AIWF_ACTOR` are both empty. | Supply a non-empty `--recorded-by` or configure `AIWF_ACTOR`. |
 | `AIWF-REVIEW-AUTHORITY-003` | error | Review decision authority is invalid for the result. | An unsupported authority or `not_required` was paired with `pass`/`fail`. | Use `human`/`ai-agent` for final decisions, or `not_required` only with that result. |
 | `AIWF-DERIVED-REVIEW-001` | warn | Derived evidence found failed reviews without a later fix. | A review correction loop is incomplete. | Inspect the review/fix sequence; this warning does not create a finalize gate. |
 | `AIWF-DERIVED-REVIEW-002` | warn | Derived evidence found fixes without a later validation pass. | A fix has no fresh validation event. | Record validation after the fix; this warning does not create a new policy gate. |
 | `AIWF-DERIVED-REVIEW-003` | warn | Derived evidence found failed reviews without a later fresh final review. | A correction loop has no fresh closure decision. | Inspect the review sequence; the warning is observational. |
-| `AIWF-DERIVED-REVIEW-004` | warn | Latest final review status disagrees with metadata `review_status`. | Event evidence and task metadata do not describe the same current review state. | Align task metadata with the latest review evidence; this warning does not create a finalize gate. |
+| `AIWF-DERIVED-REVIEW-004` | warn | Latest final review status disagrees with metadata `review_status`. | Event evidence and task metadata do not describe the same current review state. | Inspect the review history and task state with the maintainer. This warning adds no finalize gate. |
 | `AIWF-DERIVED-VALIDATION-001` | warn | Derived evidence found validation failures without later passes. | Validation failure evidence remains unresolved in the event sequence. | Review the existing workflow policy; AIWF does not infer failure disposition or block finalize here. |
 | `AIWF-DERIVED-AUTHORITY-001` | warn | Derived authority evidence is missing or inconsistent. | Structured event authority does not match the task policy. | Inspect authority evidence; this warning is not a second finalize gate. |
 | `AIWF-DERIVED-PROJECTION-001` | warn | Task-local events are missing from the global projection. | The two append-only event views differ. | Inspect both logs; AIWF does not rewrite historical events automatically. |
@@ -72,6 +72,21 @@
 | `AIWF-DERIVED-SCHEMA-001` | warn | Derived event evidence contains an unsupported schema. | A task/global event uses an unknown event schema version. | Review compatibility; known legacy v0.1/v0.2 events remain readable. |
 | `AIWF-AGENTS-PATH-001` | error | The resolved AGENTS path is outside the repository boundary. | An absolute outside path, `..` traversal, or repository-local symlink resolves outside the repository. | Use a repository-relative path that resolves within the current repository. The `--yes` option cannot bypass this check. |
 | `AIWF-RELOCATE-CONFLICT-001` | error | A legacy source and its canonical destination both exist. | Relocation or upgrade legacy-docs migration found an ambiguous duplicate path. | Review both paths and resolve the conflict explicitly. AIWF will not overwrite, merge, or delete either path automatically. |
+
+## Task metadata recovery
+
+- **Rejected creation.** Correct the named argument and rerun `./aiwf new-task`.
+  Use `./aiwf new-task --help` for supported inputs. For a duplicate name,
+  use the existing dated task path to resume.
+- **An existing open task.** Inspect its state and compare the last valid
+  revision, task-local events and daily index. For a stale index with valid
+  task metadata, use `./aiwf sync-index --path "$TASK"`. For damaged metadata,
+  preserve the evidence and have the maintainer reconcile the task with a
+  verified prior revision or an authorized recovery procedure. Keep the YAML
+  header tool-owned.
+- **A finalized task.** Use `./aiwf inspect --path "$TASK"`. Preserve the
+  closure evidence. Use a follow-up task to investigate drift or a
+  human-authorized additive correction for a new fact about the closed work.
 
 ## Deterministic Input Exit Codes
 

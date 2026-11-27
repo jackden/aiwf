@@ -145,6 +145,21 @@ def test_aiwf_entrypoint_exists():
     assert ENTRYPOINT.is_file()
 
 
+def test_nested_source_uses_its_own_runtime_and_venv(tmp_path: Path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    source = _make_fake_repo(tmp_path)
+    marker = tmp_path / "interpreter.log"
+    _write_python_shim(source / ".venv/bin/python", marker, "source")
+    outer = tmp_path / ".aiwf/bin/ai_workflow.py"
+    outer.parent.mkdir(parents=True)
+    outer.write_text("raise SystemExit('enclosing Git runtime selected')\n", encoding="utf-8")
+    for args in (["--repo-root", str(tmp_path), "upgrade", "--check", "--source", str(source)],
+                 ["install", "--target", str(tmp_path / "project")], ["--help"]):
+        result = _run_in_repo(source, *args, env={"AIWF_PYTHON": ""})
+        assert result.returncode == 0, result.stderr
+    assert set(marker.read_text().splitlines()) == {"source"}
+
+
 def test_aiwf_entrypoint_is_executable():
     assert os.access(ENTRYPOINT, os.X_OK)
 
@@ -296,4 +311,6 @@ def test_aiwf_entrypoint_bootstrap_rejects_non_upgrade_command_when_runtime_miss
 
     result = _run_in_repo(repo, "report", "--path", ".aiwf/docs", "--format", "json", env={"AIWF_PYTHON": sys.executable})
     assert result.returncode != 0
-    assert "bootstrap mode only supports upgrade commands" in result.stderr
+    assert "install from a complete source package" in result.stderr
+    assert "aiwf install --target ." in result.stdout
+    assert "./aiwf upgrade --check" in result.stdout

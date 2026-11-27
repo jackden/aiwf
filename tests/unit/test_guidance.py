@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -123,6 +124,45 @@ def test_current_output_and_scope_are_read_only(project):
     assert "Check applicability and authorization" in current.stdout
     assert "GUIDE-EXAMPLE-001" not in other.stdout
     assert inventory(root) == before
+
+
+def test_structured_guidance_preserves_scope_and_id_semantics(project):
+    root, metadata = project
+    stale = dict(metadata, id="GUIDE-STALE", sources=[dict(metadata["sources"][0], sha256="0" * 64)])
+    write_note(root, stale, name="stale")
+    write_note(root, dict(metadata, id="GUIDE-DRAFT", status="draft"), name="draft")
+    before = inventory(root)
+
+    def query(*selector):
+        result = run_helper(root, "show", "--format", "json", *selector)
+        data = json.loads(result.stdout)
+        assert result.returncode == data["exit_code"]
+        return data
+
+    empty = query("--scope", "validation")
+    assert empty["exit_code"] == 0 and empty["result"]["notes"] == []
+    scoped = query("--scope", "regression")
+    assert scoped["exit_code"] == 1 and scoped["execution"] == "ok"
+    active, stale_note = scoped["result"]["notes"]
+    assert active["id"] == metadata["id"] and active["eligible"] and active["body"].strip() == NOTE_BODY.strip()
+    assert active["sources"][0]["artifact"] == "evidence/result.log"
+    assert stale_note["source_state"] == "review_needed" and not stale_note["eligible"]
+    assert stale_note["body"] is None and stale_note["sources"] == []
+    explicit = query("--id", "GUIDE-DRAFT")
+    assert explicit["exit_code"] == 0
+    draft = explicit["result"]["notes"][0]
+    assert draft["status"] == "draft" and not draft["eligible"] and draft["body"]
+    stale_id = query("--id", "GUIDE-STALE")["result"]["notes"][0]
+    assert stale_id["body"] and not stale_id["eligible"]
+    for invalid in [("--scope", ""), ("--id", "missing"), (), ("--scope", "regression", "--id", "X")]:
+        data = query(*invalid)
+        assert data["execution"] == "error" and data["result"] is None and data["exit_code"] == 2
+    assert inventory(root) == before
+
+    write_file(root, ".aiwf/guidance/unrelated.md", "invalid")
+    mixed = query("--scope", "regression")
+    assert mixed["execution"] == "error" and mixed["result"] is None and mixed["exit_code"] == 2
+    assert metadata["id"] not in str(mixed)
 
 
 @pytest.mark.parametrize("command", ["show", "check"])

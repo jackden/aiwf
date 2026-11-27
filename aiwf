@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+launcher_dir=.
+if [[ "$0" == */* ]]; then
+  launcher_dir="${0%/*}"
+fi
+launcher_root="$(cd -- "$launcher_dir" && pwd -P)"
+# A downloaded package or a target project may sit inside another Git worktree.
+# Source-driven maintenance uses the selected launcher's own interpreter and Runtime.
+case "${1:-}" in
+  install|--repo-root|--repo-root=*) repo_root="$launcher_root" ;;
+  *)
+    case "$(pwd -P)/" in
+      "$launcher_root/"*) repo_root="$launcher_root" ;;
+    esac ;;
+esac
 
 is_windowsapps_python() {
   case "${1:-}" in
@@ -112,10 +126,12 @@ bootstrap_help() {
   cat <<'EOF'
 AIWF bootstrap mode
 
-The canonical runtime .aiwf/bin/ai_workflow.py is missing.
-Only upgrade commands are available in bootstrap mode.
+This project has no installed runtime at .aiwf/bin/ai_workflow.py.
+For a new project, run the launcher from a complete source package:
+  /path/to/aiwf-package/aiwf install --target .
+  /path/to/aiwf-package/aiwf install --target . --yes
 
-Usage:
+To repair an existing project using its local launcher:
   ./aiwf upgrade --check --source /path/to/new_aiwf_repo
   ./aiwf upgrade --dry-run --source /path/to/new_aiwf_repo
   ./aiwf upgrade --apply --source /path/to/new_aiwf_repo
@@ -154,12 +170,8 @@ if [ -f "$runtime_path" ]; then
 fi
 
 if [ "${1:-}" = "install" ]; then
-  source_root="$(cd "$(dirname "$0")" && pwd)"
-  if [ ! -f "$source_root/.aiwf/bin/ai_workflow.py" ]; then
-    echo "ERROR: source-driven install package is missing .aiwf/bin/ai_workflow.py" >&2
-    exit 2
-  fi
-  exec "$python_bin" "$source_root/.aiwf/bin/ai_workflow.py" "$@"
+  echo "ERROR: source-driven install package is missing .aiwf/bin/ai_workflow.py" >&2
+  exit 2
 fi
 
 if bootstrap_help_requested "${1:-}"; then
@@ -206,5 +218,5 @@ if [ "${1:-}" = "upgrade" ]; then
 fi
 
 bootstrap_help
-echo "ERROR: bootstrap mode only supports upgrade commands." >&2
+echo "ERROR: choose install from a complete source package or upgrade an existing project." >&2
 exit 2

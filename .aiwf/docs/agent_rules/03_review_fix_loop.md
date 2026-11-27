@@ -39,37 +39,25 @@ Deterministic completion gating is enforced by `./aiwf finalize`.
 - `AIWF-FINALIZED-002` is expected closure enforcement in this flow.
 - `AIWF-PATH-019` indicates post-finalize event-chain contamination and should be handled via follow-up workflow.
 
-## Standard Command Flow (v1.7.15)
+## Record a review and handle findings
 
-```bash
-./aiwf transition --path <task> --to validation
-./aiwf record --path <task> --kind validation --result pass --command "pytest"
-./aiwf transition --path <task> --to review
-./aiwf record --path <task> --kind review --result pass --reviewer human \
-  --decision-authority human --recorded-by codex --summary "review passed"
-./aiwf check --path <task> --finalize-ready
-./aiwf finalize --path <task>
-```
+Use the full dated task path returned by `new-task` or `list`. Run the
+project's actual validation before recording its result. The
+[worked example](../examples/basic_lifecycle.md) includes a runnable test
+and separate instructions for the human operator.
 
-Review fail / fix / re-validation flow:
+1. An agent reviews the implementation and validation evidence and records its
+   own assessment with `--decision-authority ai-agent` and its actual recorder
+   identity. Capture the review scope and findings in `review_agent.md`.
+2. After a blocking finding, make the approved fix, record it with
+   `record --kind fix`, rerun the relevant test and log the observed result.
+   Request a fresh review of the revised work.
+3. For a human-required task, send the work and evidence to the assigned
+   reviewer. Keep the task open until that person responds. The authorized
+   operator records the actual decision and the identity of its recorder.
+4. With the evidence documents complete, use
+   `./aiwf check --path "$TASK" --finalize-ready`. Run
+   `./aiwf finalize --path "$TASK"` only after readiness passes.
 
-```bash
-./aiwf record --path <task> --kind review --result fail --reviewer codex \
-  --decision-authority ai-agent --recorded-by codex --summary "..."
-./aiwf transition --path <task> --to implementation
-./aiwf record --path <task> --kind fix --summary "..."
-./aiwf transition --path <task> --to validation
-./aiwf record --path <task> --kind validation --result pass --command "pytest"
-./aiwf transition --path <task> --to review
-./aiwf record --path <task> --kind review --result pass --reviewer human \
-  --decision-authority human --recorded-by codex --summary "..."
-./aiwf check --path <task> --finalize-ready
-./aiwf finalize --path <task>
-```
-
-Note:
-- Validation/review transitions are recommended for clarity.
-- v1.7.15 requires structured review decision authority on new review events;
-  `recorded_by` is the recording actor and may differ from the decision authority.
-- AIWF does not enforce strict phase-gated finalize (`workflow_phase == review`
-  is not a finalize prerequisite); no new phase was introduced.
+Transitions into validation and review make the sequence easier to follow.
+Closure uses the recorded evidence, review authority and readiness checks.

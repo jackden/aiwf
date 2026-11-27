@@ -169,6 +169,16 @@ The helper checks note structure and uniqueness across the collection before
 applying valid selectors. Query results and failures are independent of Task,
 pre-edit Guard, and Finalize decisions.
 
+For structured output use `show --format json` with one explicit `--scope`
+or `--id`. Query each scope separately. Add `--metadata-only` to a structured
+scope lookup to return `body: null` for every match while retaining its
+source state, eligibility and reasons for withholding it. An explicit ID
+may expose the body of an ineligible note for review. Status 1 can include
+both current and withheld notes. Status 2 discards all candidates from that
+query, including any matches encountered before the error. Consumers must
+still assess an eligible note's applicability and review coverage. See the
+[query result schema](schemas/query_result_v1.schema.json).
+
 Guidance is advisory. Current authorization and domain checks govern any
 action. Queries leave task records, events, manifests, and notes intact.
 Installing or upgrading the helper preserves the project-owned note directory.

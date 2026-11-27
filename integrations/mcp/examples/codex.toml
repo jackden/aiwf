@@ -1,0 +1,3 @@
+[mcp_servers.aiwf]
+command = "/absolute/path/to/adapter-venv/bin/aiwf-mcp"
+args = ["--repo-root", "/absolute/path/to/trusted-project", "--binding-id", "project-a"]

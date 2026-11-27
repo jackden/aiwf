@@ -45,12 +45,16 @@ Safety:
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
+from contextvars import ContextVar
 import csv
 import datetime as dt
 import hashlib
 import io
+import importlib.util
 import json
 import os
+import shlex
 import shutil
 import re
 import subprocess
@@ -59,22 +63,29 @@ import stat
 import tempfile
 import zipfile
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 AIWF_BIN_DIR = Path(__file__).resolve().parent
+# A first read-only invocation from a fresh checkout must not create local caches.
+if __name__ == "__main__":
+    sys.dont_write_bytecode = True
 if str(AIWF_BIN_DIR) not in sys.path:
     sys.path.insert(0, str(AIWF_BIN_DIR))
 
 from safe_paths import (  # noqa: E402
     SafePathError,
+    destination_directory,
+    destination_writer,
     find_symlink_component,
     find_tree_symlink,
     lexical_relative,
+    reject_symlink_components,
+    require_destination_handles,
     safe_copy_file_no_symlink,
-    safe_copy_tree_no_symlink,
     safe_walk_files,
+    validate_destination,
 )
 
 from lib.package_core import (  # noqa: E402
@@ -89,6 +100,7 @@ from lib.package_core import (  # noqa: E402
     stable_sort,
     stable_tsv_dump,
 )
+from lib import workflow_lock  # noqa: E402
 
 AI_DATE_RE = re.compile(r"^ai_(\d{8})$")
 TASK_DIR_RE = re.compile(r"^\d{3}_[a-z0-9][a-z0-9_]*$")
@@ -107,7 +119,11 @@ SCHEMA_V17 = "ai-workflow-v1.7"
 CURRENT_SCHEMA_VERSION = SCHEMA_V17
 SUPPORTED_SCHEMA_VERSIONS = {SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16, SCHEMA_V17}
 WORKFLOW_PROTOCOL_VERSION = "1.7.10"
-AIWF_TOOL_VERSION = "1.7.16"
+AIWF_TOOL_VERSION = "1.7.17.post4"
+MCP_SETUP_HINT = "To connect an MCP client, see .aiwf/docs/examples/mcp_setup.md"
+QUERY_CONTRACT_VERSION = 1
+MUTATION_CONTRACT_VERSION = 1
+MUTATION_OPERATIONS = ("new-task", "guard", "transition", "sync-index", "record", "finalize", "correct-finalized")
 AIWF_EVENT_SCHEMA_VERSION = "aiwf-event-v0.4"
 AIWF_EVIDENCE_EVENT_SCHEMA_VERSION = "aiwf-event-v0.4"
 KNOWN_EVENT_SCHEMA_VERSIONS = {"legacy", "aiwf-event-v0.1", "aiwf-event-v0.2", "aiwf-event-v0.3", AIWF_EVIDENCE_EVENT_SCHEMA_VERSION}
@@ -168,6 +184,13 @@ ALLOWED_PHASE_TRANSITIONS = {
 ALLOWED_RECORD_KIND = {"validation", "review", "fix", "safety_ack"}
 VALIDATION_RECORD_RESULTS = {"pass", "fail", "not_run"}
 REVIEW_RECORD_RESULTS = {"pass", "fail", "not_required"}
+RECORD_INPUT_HELP = {
+    "validation": "Supply --result with one of: " + ", ".join(sorted(VALIDATION_RECORD_RESULTS)) + ".",
+    "review": "Supply --result with one of: " + ", ".join(sorted(REVIEW_RECORD_RESULTS))
+              + ". A v1.7 review also requires --decision-authority.",
+    "fix": "Supply --summary with the fix details.",
+    "safety_ack": "Supply --summary with the safety acknowledgement.",
+}
 FINAL_REVIEW_RESULTS = {"pass", "not_required"}
 TASK_METADATA_SCHEMA: dict[str, dict[str, Any]] = {
     "schema_version": {"type": "string", "required_in": SUPPORTED_SCHEMA_VERSIONS, "enum": SUPPORTED_SCHEMA_VERSIONS, "default": CURRENT_SCHEMA_VERSION},
@@ -611,6 +634,12 @@ class AIWFLayoutConfig:
     def records_root(self) -> str:
         return self.record_root
 
+    @property
+    def readable_records_roots(self) -> tuple[str, ...]:
+        if self.legacy_enabled and self.record_root != "docs":
+            return self.record_root, "docs"
+        return (self.record_root,)
+
 
 @dataclass(frozen=True)
 class AIWFConfig:
@@ -726,18 +755,23 @@ class DatasetOutputBoundaryError(ValueError):
         self.records_root = records_root
 
 
+METADATA_REPAIR_GUIDANCE = (
+    "Compare the tool-owned metadata with the task history and ask the maintainer to recover the record. "
+    "For a finalized task, preserve its evidence and open a follow-up."
+)
+
 DIAGNOSTICS: dict[str, dict[str, str]] = {
-    "AIWF-META-001": {"severity": "error", "message": "Front matter exists but metadata cannot be parsed.", "suggested_fix": "Use valid YAML front matter with key: value pairs and close it with ---."},
-    "AIWF-META-LEGACY-001": {"severity": "warn", "message": "Legacy task without metadata front matter.", "suggested_fix": "Keep as legacy, or add metadata front matter if this task is migrated."},
-    "AIWF-META-002": {"severity": "error", "message": "Missing metadata field: {field}.", "suggested_fix": "Add `{field}` to task.md front matter."},
-    "AIWF-META-003": {"severity": "error", "message": "Unsupported schema_version: {schema_version}.", "suggested_fix": "Use one of: legacy, ai-workflow-v1.2, ai-workflow-v1.3, ai-workflow-v1.4, ai-workflow-v1.5, ai-workflow-v1.6, ai-workflow-v1.7."},
-    "AIWF-META-004": {"severity": "error", "message": "Invalid format for field {field}: {value}.", "suggested_fix": "Update `{field}` to match required format."},
-    "AIWF-META-005": {"severity": "error", "message": "task_id mismatch: expected {expected}.", "suggested_fix": "Set `task_id: \"{expected}\"` to match the directory prefix."},
-    "AIWF-META-006": {"severity": "error", "message": "task_name mismatch: expected {expected}.", "suggested_fix": "Set `task_name: \"{expected}\"` to match the directory suffix."},
+    "AIWF-META-001": {"severity": "error", "message": "Front matter exists but metadata cannot be parsed.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
+    "AIWF-META-LEGACY-001": {"severity": "warn", "message": "Legacy task without metadata front matter.", "suggested_fix": "This historical record remains readable. Use ./aiwf new-task for new work."},
+    "AIWF-META-002": {"severity": "error", "message": "Missing metadata field: {field}.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
+    "AIWF-META-003": {"severity": "error", "message": "Unsupported schema_version: {schema_version}.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
+    "AIWF-META-004": {"severity": "error", "message": "Invalid format for field {field}: {value}.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
+    "AIWF-META-005": {"severity": "error", "message": "task_id mismatch: expected {expected}.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
+    "AIWF-META-006": {"severity": "error", "message": "task_name mismatch: expected {expected}.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
     "AIWF-META-007": {"severity": "error", "message": "Invalid value for field {field}: {value}.", "suggested_fix": "Use one of: {allowed}."},
-    "AIWF-META-008": {"severity": "error", "message": "status done requires review_status to be pass or not_required.", "suggested_fix": "Set review_status to pass/not_required, then run finalize."},
-    "AIWF-META-009": {"severity": "error", "message": "Invalid metadata list item for field {field}: {value}.", "suggested_fix": "Use canonical item format for this metadata field."},
-    "AIWF-META-010": {"severity": "error", "message": "Invalid task reference for field {field}: {value}.", "suggested_fix": "Use canonical task id format, for example: 014."},
+    "AIWF-META-008": {"severity": "error", "message": "status done requires review_status to be pass or not_required.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
+    "AIWF-META-009": {"severity": "error", "message": "Invalid metadata list item for field {field}: {value}.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
+    "AIWF-META-010": {"severity": "error", "message": "Invalid task reference for field {field}: {value}.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
     "AIWF-META-011": {"severity": "error", "message": "Invalid repo-relative path for field {field}: {value}.", "suggested_fix": "Use a repo-relative path without absolute path or '..'."},
     "AIWF-META-TAG-001": {"severity": "error", "message": "Invalid tag input for field {field}: {value}.", "suggested_fix": "Use a lowercase tag beginning with a letter or digit and containing only a-z, 0-9, underscore, or hyphen."},
     "AIWF-DATE-001": {"severity": "error", "message": "new-task date {date} does not match today {today}.", "suggested_fix": "Omit --date for normal new tasks, or use --allow-non-today-date for explicit historical/recovery work."},
@@ -755,10 +789,10 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-NEW-TASK-001": {"severity": "error", "message": "new-task is create-only; --update-existing is not supported. No files were written.", "suggested_fix": "Use the existing task path with path-based commands, or create a distinctly named follow-up task."},
     "AIWF-TASK-NAME-001": {"severity": "error", "message": "Duplicate normalized task name `{task_name}` exists within the same AI record date: {matches}.", "suggested_fix": "Preserve one canonical task and resolve the accidental duplicate before continuing. Use a distinct name for intentional follow-up work."},
     "AIWF-META-REF-001": {"severity": "error", "message": "Invalid task reference input for field {field}: {value}.", "suggested_fix": "Use a task id such as 014, or a task directory name such as 014_task_name."},
-    "AIWF-PHASE-001": {"severity": "error", "message": "status done requires workflow_phase finalized.", "suggested_fix": "Do not set status done manually; run `ai_workflow.py finalize --path <task_dir>`."},
+    "AIWF-PHASE-001": {"severity": "error", "message": "status done requires workflow_phase finalized.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
     "AIWF-PHASE-002": {"severity": "error", "message": "Illegal phase transition: {from_phase} -> {to_phase}.", "suggested_fix": "Use an allowed transition from the current phase."},
     "AIWF-PHASE-004": {"severity": "error", "message": "Phase transition attempted after finalized.", "suggested_fix": "Do not transition finalized tasks."},
-    "AIWF-BLOCK-001": {"severity": "error", "message": "status blocked requires blocked_by or blocked_reason.", "suggested_fix": "Add blocked_by task id(s) or provide a non-empty blocked_reason."},
+    "AIWF-BLOCK-001": {"severity": "error", "message": "status blocked requires blocked_by or blocked_reason.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
     "AIWF-META-OK": {"severity": "info", "message": "Metadata validated for schema {schema_version}.", "suggested_fix": ""},
     "AIWF-FILE-001": {"severity": "error", "message": "Missing required file: {filename}.", "suggested_fix": "Create `{filename}` in the task directory before finalize."},
     "AIWF-FILE-002": {"severity": "warn", "message": "Missing v1.1 file: {filename}.", "suggested_fix": "Create `{filename}` via ai_workflow new-task/backfill templates."},
@@ -771,8 +805,9 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-GUARD-PASS": {"severity": "info", "message": "task is open for pre-edit work", "suggested_fix": ""},
     "AIWF-GUARD-001": {"severity": "error", "message": "task path does not exist", "suggested_fix": "Provide a valid .aiwf/records/ai_YYYYMMDD/NNN_task_name path."},
     "AIWF-GUARD-002": {"severity": "error", "message": "required AIWF artifact missing", "suggested_fix": "Create the missing task artifacts before beginning pre-edit work."},
-    "AIWF-GUARD-003": {"severity": "error", "message": "task metadata cannot be parsed", "suggested_fix": "Fix task.md front matter so metadata can be parsed."},
+    "AIWF-GUARD-003": {"severity": "error", "message": "task metadata cannot be parsed", "suggested_fix": METADATA_REPAIR_GUIDANCE},
     "AIWF-GUARD-004": {"severity": "error", "message": "task is closed and cannot be used for pre-edit work", "suggested_fix": "Use an open task or create a follow-up task before editing."},
+    "AIWF-GUARD-005": {"severity": "error", "message": "task belongs to a read-only records root", "suggested_fix": "Use an open task in the configured records root, or migrate the legacy record before editing."},
     "AIWF-GUARD-900": {"severity": "error", "message": "invalid guard invocation", "suggested_fix": "Run: ./aiwf guard --pre-edit --path <task_path>"},
     "AIWF-SECTION-001": {"severity": "error", "message": "{filename} missing required section: {section}.", "suggested_fix": "Add section header `{section}` to `{filename}`."},
     "AIWF-SECTION-OK": {"severity": "info", "message": "{filename} contains required section: {section}.", "suggested_fix": ""},
@@ -783,28 +818,29 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-CLI-PATH-001": {"severity": "error", "message": "Requested command path does not exist.", "suggested_fix": "Provide an existing repository-local path supported by this command."},
     "AIWF-CLI-PATH-002": {"severity": "error", "message": "Requested command path resolves outside the repository boundary.", "suggested_fix": "Use a repository-relative path that resolves within the current repository."},
     "AIWF-BACKFILL-PATH-001": {"severity": "error", "message": "Backfill target must be a directory.", "suggested_fix": "Provide an existing directory path supported by backfill."},
-    "AIWF-REVIEW-002": {"severity": "error", "message": "Finalize requires review_status to be pass or not_required.", "suggested_fix": "Set review_status to pass/not_required before finalize."},
-    "AIWF-PATH-010": {"severity": "error", "message": "Missing validation pass before finalize.", "suggested_fix": "Record validation pass evidence before finalize."},
+    "AIWF-REVIEW-002": {"severity": "error", "message": "Finalize requires review_status to be pass or not_required.", "suggested_fix": "Obtain the required review and record its actual outcome with ./aiwf record before checking readiness again."},
+    "AIWF-PATH-010": {"severity": "error", "message": "Missing validation pass before finalize.", "suggested_fix": "Run the task's validation and record the actual result. Resolve any failure before requesting closure."},
     "AIWF-PATH-011": {"severity": "error", "message": "Review fail without fix.", "suggested_fix": "Record a fix after the latest failed review before finalize."},
-    "AIWF-PATH-012": {"severity": "error", "message": "Fix without re-validation pass.", "suggested_fix": "Record a validation pass after each fix before finalize."},
-    "AIWF-PATH-013": {"severity": "error", "message": "Metadata finalized without finalize_success event.", "suggested_fix": "Finalize via `ai_workflow.py finalize --path <task_dir>` to generate finalize_success."},
-    "AIWF-PATH-014": {"severity": "error", "message": "Latest effective review decision is missing, stale, or not final before finalize.", "suggested_fix": "Record a fresh review decision (pass/not_required) after the latest fail/fix."},
+    "AIWF-PATH-012": {"severity": "error", "message": "Fix without re-validation pass.", "suggested_fix": "Rerun validation after the fix and record the actual result."},
+    "AIWF-INSPECT-002": {"severity": "error", "message": "Task is finalized. Current closure integrity is unknown because the saved manifest or its evidence cannot be verified.", "suggested_fix": "Inspect the task-local event log and run check --finalize-ready."},
+    "AIWF-PATH-013": {"severity": "error", "message": "Metadata finalized without finalize_success event.", "suggested_fix": "Preserve the task and its event logs. Ask the maintainer to investigate the missing closure evidence in a follow-up."},
+    "AIWF-PATH-014": {"severity": "error", "message": "Latest effective review decision is missing, stale, or not final before finalize.", "suggested_fix": "Ask the required reviewer to assess the current evidence, then record their actual decision."},
     "AIWF-PATH-015": {
         "severity": "error",
         "message": "Finalized artifact changed after finalize.",
         "suggested_fix": "Revert post-finalize edits, or use a controlled amend/reopen command if supported. Do not manually edit finalized task artifacts.",
     },
-    "AIWF-PATH-016": {"severity": "error", "message": "Event log malformed or unreadable for v1.6 finalize.", "suggested_fix": "Repair .aiwf/events/events.jsonl malformed lines before finalize."},
-    "AIWF-PATH-017": {"severity": "error", "message": "review not_required missing reason.", "suggested_fix": "Set review_not_required_reason with explicit rationale."},
-    "AIWF-PATH-018": {"severity": "error", "message": "metadata review_status is inconsistent with latest review decision.", "suggested_fix": "Align metadata review_status with the latest review_recorded result."},
-    "AIWF-PATH-019": {"severity": "error", "message": "Post-finalize evidence event detected: {event_type}.", "suggested_fix": "Remove post-finalize evidence events or reopen work in a new task before finalize."},
-    "AIWF-PATH-025": {"severity": "error", "message": "Latest review decision authority `{decision_authority}` does not satisfy required authority `{required_review_authority}`.", "suggested_fix": "Record a fresh final review with `--decision-authority {required_review_authority}`. `recorded_by` may remain the actor that records the decision."},
-    "AIWF-PATH-026": {"severity": "error", "message": "Latest final review is missing structured authority evidence: required_review_authority, decision_authority, and recorded_by must be consistent.", "suggested_fix": "Record a fresh review with explicit structured authority fields; workflow evidence is not cryptographic identity proof."},
-    "AIWF-PATH-027": {"severity": "error", "message": "Review event required authority `{event_required_review_authority}` disagrees with task required authority `{required_review_authority}`.", "suggested_fix": "Record a fresh review after aligning the task authority policy and event evidence."},
+    "AIWF-PATH-016": {"severity": "error", "message": "Event log malformed or unreadable for v1.6 finalize.", "suggested_fix": "Preserve the task-local event log and ask the maintainer to investigate the malformed evidence."},
+    "AIWF-PATH-017": {"severity": "error", "message": "review not_required missing reason.", "suggested_fix": "If the policy permits skipping review, record the actual reason using the review command's --summary option."},
+    "AIWF-PATH-018": {"severity": "error", "message": "metadata review_status is inconsistent with latest review decision.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
+    "AIWF-PATH-019": {"severity": "error", "message": "Post-finalize evidence event detected: {event_type}.", "suggested_fix": "Preserve the finalized task and both event logs. Open a follow-up to investigate the later evidence."},
+    "AIWF-PATH-025": {"severity": "error", "message": "Latest review decision authority `{decision_authority}` does not satisfy required authority `{required_review_authority}`.", "suggested_fix": "Send the task and validation evidence to the required {required_review_authority} reviewer. After they respond, record their decision and check readiness again."},
+    "AIWF-PATH-026": {"severity": "error", "message": "Latest final review is missing structured authority evidence: required_review_authority, decision_authority, and recorded_by must be consistent.", "suggested_fix": "Ask the required reviewer to confirm the decision, then record it with its actual decision authority and recording actor."},
+    "AIWF-PATH-027": {"severity": "error", "message": "Review event required authority `{event_required_review_authority}` disagrees with task required authority `{required_review_authority}`.", "suggested_fix": "Ask the maintainer to reconcile the recorded policy with the task history before obtaining a fresh review."},
     "AIWF-DERIVED-REVIEW-001": {"severity": "warn", "message": "Derived evidence shows {count} failed review decision(s) without a later fix.", "suggested_fix": "Inspect the review/fix event sequence; this diagnostic does not create a finalize gate."},
     "AIWF-DERIVED-REVIEW-002": {"severity": "warn", "message": "Derived evidence shows {count} fix event(s) without a later validation pass.", "suggested_fix": "Run validation after the fix and record the result; this diagnostic does not create a new policy gate."},
     "AIWF-DERIVED-REVIEW-003": {"severity": "warn", "message": "Derived evidence shows {count} failed review decision(s) without a later fresh final review.", "suggested_fix": "Inspect whether the correction loop needs a fresh review decision."},
-    "AIWF-DERIVED-REVIEW-004": {"severity": "warn", "message": "Derived evidence review status `{event_status}` disagrees with metadata review status `{metadata_status}`.", "suggested_fix": "Align task metadata with the latest review evidence; this warning does not create a finalize gate."},
+    "AIWF-DERIVED-REVIEW-004": {"severity": "warn", "message": "Derived evidence review status `{event_status}` disagrees with metadata review status `{metadata_status}`.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
     "AIWF-DERIVED-VALIDATION-001": {"severity": "warn", "message": "Derived evidence shows {count} validation failure(s) without a later validation pass.", "suggested_fix": "Treat the result according to the existing workflow policy; unresolved validation evidence is reported here, not converted into a new finalize gate."},
     "AIWF-DERIVED-AUTHORITY-001": {"severity": "warn", "message": "Derived evidence shows review authority consistency is `{consistency}` for required authority `{required_review_authority}`.", "suggested_fix": "Inspect structured authority evidence; this diagnostic is observational and does not create a finalize gate."},
     "AIWF-DERIVED-PROJECTION-001": {"severity": "warn", "message": "Derived event projection is missing {count} task-local event(s) from the global event log.", "suggested_fix": "Inspect task-local and global event logs; this diagnostic is observational only."},
@@ -817,7 +853,7 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-PATH-022": {"severity": "error", "message": "Default template residue detected in {filename} / {section}.", "suggested_fix": "Replace the generated template text in this required section with task-specific closure evidence before finalize."},
     "AIWF-PATH-023": {"severity": "error", "message": "Acceptance Criteria section exists but no item has a closure decision.", "suggested_fix": "Update each acceptance-criteria item to a closure state such as passed, deferred, or not applicable before finalize."},
     "AIWF-PATH-024": {"severity": "error", "message": "Acceptance Criteria contain unresolved or blocking closure states.", "suggested_fix": "Resolve unchecked/failed/blocked acceptance-criteria items, or mark them deferred/not applicable with rationale before finalize."},
-    "AIWF-REVIEW-AUTHORITY-001": {"severity": "error", "message": "Review result `{result}` requires an explicit decision authority.", "suggested_fix": "Record the review again with `--decision-authority human` or `--decision-authority ai-agent`."},
+    "AIWF-REVIEW-AUTHORITY-001": {"severity": "error", "message": "Review result `{result}` requires an explicit decision authority.", "suggested_fix": "Identify who made this decision and record their actual authority. If a human decision is pending, send the evidence to the assigned reviewer first."},
     "AIWF-REVIEW-AUTHORITY-002": {"severity": "error", "message": "Review evidence requires a non-empty recorded_by actor.", "suggested_fix": "Set `--recorded-by <actor>` or configure a non-empty AIWF_ACTOR value."},
     "AIWF-REVIEW-AUTHORITY-003": {"severity": "error", "message": "Review decision authority is invalid: `{decision_authority}`.", "suggested_fix": "Use `human`, `ai-agent`, or `not_required` only for the matching review result."},
     "AIWF-META-PROFILE-004": {"severity": "warn", "message": "Current profile points to a missing profile file.", "suggested_fix": "Run `./aiwf metadata profile list`, or `./aiwf metadata profile use <existing-profile>`, or create the missing profile."},
@@ -839,7 +875,7 @@ DIAGNOSTICS: dict[str, dict[str, str]] = {
     "AIWF-FINALIZE-OK": {"severity": "info", "message": "finalize completed; metadata updated to done/finalized.", "suggested_fix": ""},
     "INDEX_ENTRY_MISSING": {"severity": "error", "message": "index.md entry missing for task `{task}`.", "suggested_fix": "Run: ./aiwf sync-index --path {task_path}"},
     "INDEX_STATUS_STALE": {"severity": "error", "message": "index.md status stale for task `{task}`: expected `{expected}`, found `{actual}`.", "suggested_fix": "Run: ./aiwf sync-index --path {task_path}"},
-    "INDEX_STATUS_INVALID_DONE": {"severity": "error", "message": "index.md cannot show Done when task finalized_at is null.", "suggested_fix": "Run finalize to set finalized_at, or sync index after correcting metadata."},
+    "INDEX_STATUS_INVALID_DONE": {"severity": "error", "message": "index.md cannot show Done when task finalized_at is null.", "suggested_fix": METADATA_REPAIR_GUIDANCE},
     "AIWF-SYNC-001": {"severity": "error", "message": "sync-index only supports task-specific directory paths.", "suggested_fix": "Use a path like .aiwf/records/ai_YYYYMMDD/NNN_task_name."},
     "AIWF-SYNC-OK": {"severity": "info", "message": "index.md status synchronized from task metadata.", "suggested_fix": ""},
 }
@@ -1335,15 +1371,11 @@ def print_metadata_allowed_values(field: Optional[str] = None) -> int:
 
 
 def _iter_all_task_dirs(root: Path) -> list[Path]:
-    config = load_aiwf_config(root)
-    roots: list[Path] = [get_record_root(root)]
-    if config.layout.legacy_enabled:
-        legacy_root = (root / "docs").resolve()
-        if legacy_root != roots[0]:
-            roots.append(legacy_root)
+    layout = load_aiwf_config(root).layout
     task_dirs: list[Path] = []
     seen: set[str] = set()
-    for records_root in roots:
+    for relative in layout.readable_records_roots:
+        records_root = (root / relative).resolve()
         if not records_root.exists():
             continue
         for ai_dir in sorted(p for p in records_root.iterdir() if p.is_dir() and AI_DATE_RE.match(p.name)):
@@ -1533,6 +1565,8 @@ def make_diagnostic(code: str, path: str, *, blocker: bool = False, severity: Op
     sev = severity or spec["severity"]
     message = spec["message"].format(**fmt) if fmt else spec["message"]
     suggested_fix = spec["suggested_fix"].format(**fmt) if spec["suggested_fix"] else ""
+    if code in {"AIWF-META-007", "AIWF-META-011"} and path.endswith("/task.md"):
+        suggested_fix = METADATA_REPAIR_GUIDANCE
     return Diagnostic(sev, code, path, message, suggested_fix, blocker=blocker)
 
 
@@ -1857,12 +1891,35 @@ def safe_write_path(root: Path, path: Path) -> None:
 
 def write_file(root: Path, path: Path, content: str, update_existing: bool = False) -> WriteResult:
     safe_write_path(root, path)
-    ensure_dir(path.parent)
     if path.exists() and not update_existing:
         return WriteResult(path, "exists")
+    workflow_lock.mark_mutation_started(path)
+    ensure_dir(path.parent)
     action = "updated" if path.exists() else "created"
     path.write_text(content.rstrip() + "\n", encoding="utf-8")
     return WriteResult(path, action)
+
+
+def _preflight_workflow_files(root: Path, *paths: Path) -> None:
+    """Check the complete write set before the first governed file is changed."""
+    for path in paths:
+        try:
+            safe_write_path(root, path)
+        except SystemExit as exc:
+            raise ValueError(f"AIWF-WRITE-DESTINATION: {exc}") from exc
+        validate_destination(path, root)
+        existing = path
+        while not existing.exists():
+            existing = existing.parent
+        permissions = os.W_OK if existing == path else os.W_OK | os.X_OK
+        if not os.access(existing, permissions):
+            raise ValueError(f"AIWF-WRITE-DESTINATION: Cannot write {rel(root, path)}. Check its permissions.")
+
+
+def _preflight_task_update(root: Path, task: Path, *extra: Path) -> None:
+    if task.parent.parent != get_record_root(root):
+        raise ValueError(f"AIWF-WRITE-DESTINATION: {rel(root, task)} is outside the configured writable records root.")
+    _preflight_workflow_files(root, task / "task.md", _task_event_log_path(task), get_event_log_path(root), *extra)
 
 
 def _artifact_group_label(group: Sequence[str]) -> str:
@@ -1928,12 +1985,12 @@ def safe_dataset_output_path(root: Path, path: Path) -> None:
         raise SystemExit("ERROR: refusing to overwrite .aiwf/events/events.jsonl during dataset export")
     if len(rp.parts) >= 3 and rp.parts[0] == ".aiwf" and rp.parts[1] == "docs" and rp.parts[2] == "releases":
         raise SystemExit(f"ERROR: refusing to overwrite release artifact path: {rp}")
-def _default_aiwf_layout_config_text() -> str:
+def _default_aiwf_layout_config_text(record_root: str = ".aiwf/records") -> str:
     return "\n".join(
         [
             "aiwf_layout_version: 2",
             'docs_root: ".aiwf/docs"',
-            'record_root: ".aiwf/records"',
+            f'record_root: "{record_root}"',
             'event_log: ".aiwf/events/events.jsonl"',
             "legacy_enabled: true",
         ]
@@ -1967,18 +2024,23 @@ def _merge_aiwf_config_text(base_text: str, existing_text: Optional[str]) -> str
     return "\n".join(merged_lines) + "\n"
 
 
+def _upgraded_record_root(layout: AIWFLayoutConfig) -> str:
+    # Standard v1 docs/ remains readable through v2 legacy discovery.
+    if layout.aiwf_layout_version == 1 and layout.record_root == "docs":
+        return ".aiwf/records"
+    return layout.record_root
+
+
 def _prepare_aiwf_config(root: Path) -> tuple[str, str]:
-    aiwf_root = get_aiwf_root(root)
-    config_path = aiwf_root / "config.yaml"
-    existing_config_text = config_path.read_text(encoding="utf-8", errors="replace") if config_path.exists() else None
-    config_text = _merge_aiwf_config_text(_default_aiwf_layout_config_text(), existing_config_text)
+    config_path = root / ".aiwf/config.yaml"
     if not config_path.exists():
-        config_action = "created"
-    elif existing_config_text == config_text:
-        config_action = "exists"
-    else:
-        config_action = "updated"
-    return config_text, config_action
+        return _default_aiwf_layout_config_text(), "created"
+    existing = config_path.read_text(encoding="utf-8", errors="replace")
+    layout = load_aiwf_config(root).layout
+    if layout.aiwf_layout_version >= 2:
+        return existing, "exists"
+    defaults = _default_aiwf_layout_config_text(_upgraded_record_root(layout))
+    return _merge_aiwf_config_text(defaults, existing), "updated"
 
 
 def _canonical_runtime_path(root: Path) -> Path:
@@ -1991,10 +2053,15 @@ def _canonical_runtime_exists(root: Path) -> bool:
 
 def _candidate_legacy_docs_relocation_paths(root: Path) -> list[RelocationEntry]:
     legacy_docs_root = root / "docs"
-    destination_docs_root = get_aiwf_root(root) / "docs"
-    destination_records_root = get_aiwf_root(root) / "records"
+    layout = load_aiwf_config(root).layout
+    destination_docs_root = root / (layout.docs_root if layout.aiwf_layout_version >= 2 else ".aiwf/docs")
+    destination_records_root = root / _upgraded_record_root(layout)
+    for destination in (destination_docs_root, destination_records_root):
+        validate_destination(destination, root, directory=True)
 
     def maybe_add(label: str, source: Path, destination: Path, group: str, entries: list[RelocationEntry]) -> None:
+        if source == destination:
+            return
         source_exists = source.exists()
         destination_exists = destination.exists()
         if source_exists or destination_exists:
@@ -2134,7 +2201,39 @@ def _relocation_report_text(root: Path, *, entries: Sequence[dict[str, Any]], co
     return "\n".join(lines) + "\n"
 
 
+def _migration_report_path(root: Path, name: str) -> Path:
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    return root / ".aiwf/migrations" / f"{timestamp}_{name}.md"
+
+
+def _validate_skeleton_destinations(root: Path, report_path: Path) -> None:
+    for name in ("docs", "records", "events", "bin", "migrations"):
+        validate_destination(root / ".aiwf" / name, root, directory=True)
+    for path in (root / ".aiwf/config.yaml", root / ".aiwf/events/events.jsonl", report_path):
+        validate_destination(path, root)
+
+
+def _validate_relocation_entries(root: Path, entries: Sequence[RelocationEntry]) -> None:
+    for entry in entries:
+        if entry.exists:
+            directory = entry.source.is_dir()
+            validate_destination(entry.source, root, directory=directory)
+            if not entry.destination_exists:
+                if not entry.destination.is_relative_to(root / ".aiwf"):
+                    raise SafePathError(f"legacy migration destination is outside .aiwf: {rel(root, entry.destination)}")
+                validate_destination(entry.destination, root, directory=directory)
+                parent = entry.destination.parent
+                while not parent.exists():
+                    parent = parent.parent
+                if entry.source.stat().st_dev != parent.stat().st_dev:
+                    raise SafePathError(f"relocation requires the same filesystem: {entry.label}")
+
+
 def relocate_command(root: Path, dry_run: bool, *, legacy_docs: bool = False) -> int:
+    report_path = _migration_report_path(root, "repo_boundary_relocation")
+    _validate_skeleton_destinations(root, report_path)
+    if legacy_docs:
+        validate_destination(root / "docs", root, directory=True)
     entries = _candidate_legacy_docs_relocation_paths(root) if legacy_docs else []
     conflicts = _relocation_conflict_entries(entries)
     if conflicts:
@@ -2143,12 +2242,9 @@ def relocate_command(root: Path, dry_run: bool, *, legacy_docs: bool = False) ->
         _print_diagnostics(_relocation_conflict_diagnostics(root, conflicts))
         return 2
 
-    aiwf_root = get_aiwf_root(root)
-    config_path = aiwf_root / "config.yaml"
-    config_text, config_action = _prepare_aiwf_config(root)
-
-    event_log_path = aiwf_root / "events" / "events.jsonl"
-    event_log_action = "exists" if event_log_path.exists() else "created"
+    _validate_relocation_entries(root, entries)
+    if not dry_run:
+        require_destination_handles()
 
     action_entries: list[dict[str, Any]] = []
     for entry in entries:
@@ -2163,8 +2259,14 @@ def relocate_command(root: Path, dry_run: bool, *, legacy_docs: bool = False) ->
             if dry_run:
                 action = "would_move"
             else:
-                ensure_dir(entry.destination.parent)
-                shutil.move(str(entry.source), str(entry.destination))
+                with destination_directory(entry.source.parent, root) as source_dir, destination_directory(
+                    entry.destination.parent, root, create=True
+                ) as target_dir:
+                    validate_destination(entry.destination, root, directory=entry.source.is_dir())
+                    if entry.destination.exists():
+                        raise SafePathError(f"relocation destination already exists: {entry.destination}")
+                    os.rename(entry.source.name, entry.destination.name,
+                              src_dir_fd=source_dir, dst_dir_fd=target_dir)
                 action = "moved"
         elif entry.destination_exists:
             action = "already_present"
@@ -2199,22 +2301,12 @@ def relocate_command(root: Path, dry_run: bool, *, legacy_docs: bool = False) ->
             print("- None")
         return 0
 
-    ensure_dir(aiwf_root)
-    ensure_dir(aiwf_root / "docs")
-    ensure_dir(aiwf_root / "records")
-    ensure_dir(aiwf_root / "events")
-    ensure_dir(aiwf_root / "bin")
-    ensure_dir(aiwf_root / "migrations")
-
-    if config_action != "exists":
-        config_path.write_text(config_text, encoding="utf-8")
-    if not event_log_path.exists():
-        event_log_path.write_text("", encoding="utf-8")
-
+    config_path = root / ".aiwf/config.yaml"
+    event_log_path = root / ".aiwf/events/events.jsonl"
+    config_action, event_log_action = _ensure_aiwf_upgrade_skeleton(root)
     report_text = _relocation_report_text(root, entries=action_entries, config_action=config_action, event_log_action=event_log_action, dry_run=False)
-    report_name = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')}_repo_boundary_relocation.md"
-    report_path = aiwf_root / "migrations" / report_name
-    report_path.write_text(report_text, encoding="utf-8")
+    with destination_writer(report_path, root) as output:
+        output.write(report_text.encode("utf-8"))
 
     print("[INFO] AIWF-RELOCATE-OK")
     print(f"{rel(root, report_path)}: migration report written.")
@@ -2244,6 +2336,7 @@ UPGRADE_REQUIRED_SOURCE_PATHS: tuple[tuple[str, str], ...] = (
     (".aiwf/bin/safe_paths.py", "file"),
     (".aiwf/bin/lib", "dir"),
     (".aiwf/bin/lib/package_core.py", "file"),
+    (".aiwf/bin/lib/workflow_lock.py", "file"),
     (".aiwf/docs", "dir"),
     (".aiwf/templates/AGENTS.block.md", "file"),
 )
@@ -2252,14 +2345,6 @@ UPGRADE_SOURCE_TREE_PATHS: tuple[str, ...] = (
     ".aiwf/docs",
     ".aiwf/templates",
 )
-UPGRADE_TARGET_REQUIRED_PATHS: tuple[tuple[str, str], ...] = (
-    ("aiwf", "file"),
-    (".aiwf/bin/ai_workflow.py", "file"),
-    (".aiwf/bin/safe_paths.py", "file"),
-    (".aiwf/bin/lib", "dir"),
-    (".aiwf/bin/lib/package_core.py", "file"),
-    (".aiwf/templates/AGENTS.block.md", "file"),
-)
 UPGRADE_FULL_UPDATE_PLAN: tuple[str, ...] = (
     "aiwf",
     ".aiwf/bin/**",
@@ -2267,7 +2352,6 @@ UPGRADE_FULL_UPDATE_PLAN: tuple[str, ...] = (
     ".aiwf/templates/**",
 )
 GUIDANCE_NOTES_PATH = ".aiwf/guidance"
-OPTIONAL_GUIDANCE_PACKAGE_FILES = (".aiwf/bin/guidance.py", ".aiwf/docs/guidance.md")
 UPGRADE_PRESERVED_PATHS: tuple[str, ...] = (
     ".aiwf/records/**",
     ".aiwf/events/**",
@@ -2330,10 +2414,25 @@ def _install_payload_path_allowed(rel_path: str) -> bool:
     )
 
 
+def _contract_schema_requirements(package_root: Path) -> list[tuple[str, str]]:
+    """Derive the installed schema paths from the Runtime's declared contracts."""
+    runtime = package_root / ".aiwf/bin/ai_workflow.py"
+    if find_symlink_component(runtime, package_root) is not None or not runtime.is_file():
+        return []
+    declarations = re.findall(
+        r"^(QUERY|MUTATION)_CONTRACT_VERSION[ \t]*=[ \t]*([1-9][0-9]*)[ \t]*$",
+        runtime.read_text(encoding="utf-8", errors="replace"), flags=re.MULTILINE,
+    )
+    return [
+        (f".aiwf/docs/schemas/{contract.lower()}_result_v{version}.schema.json", "file")
+        for contract, version in declarations
+    ]
+
+
 def _upgrade_source_requirements(source_root: Path) -> list[tuple[str, Path, str]]:
     return [
         (rel_path, source_root / rel_path, expected_type)
-        for rel_path, expected_type in UPGRADE_REQUIRED_SOURCE_PATHS
+        for rel_path, expected_type in (*UPGRADE_REQUIRED_SOURCE_PATHS, *_contract_schema_requirements(source_root))
     ]
 
 
@@ -2392,15 +2491,29 @@ def _upgrade_validate_source(source_root: Path) -> list[str]:
     return blockers
 
 
-def _upgrade_target_requirement_gaps(root: Path) -> list[str]:
+def _managed_package_files(source_root: Path, source_rel: str) -> Iterable[Path]:
+    for member in safe_walk_files(source_root / source_rel, allowed_root=source_root):
+        relative = member.relative_to(source_root)
+        if not INSTALL_EXCLUDED_NAMES.isdisjoint(relative.parts) or member.suffix in {".pyc", ".pyo"}:
+            continue
+        if any(relative.is_relative_to(excluded) for excluded in INSTALL_EXCLUDED_PATHS):
+            continue
+        yield member
+
+
+def _upgrade_target_content_gaps(root: Path, source_root: Path) -> list[str]:
     gaps: list[str] = []
-    for rel_path, expected_type in UPGRADE_TARGET_REQUIRED_PATHS:
-        path = root / rel_path
-        if expected_type == "dir":
-            if not path.is_dir():
-                gaps.append(rel_path)
-        elif not path.is_file():
-            gaps.append(rel_path)
+    for source_rel, _ in UPGRADE_COPY_SPECS.values():
+        for member in _managed_package_files(source_root, source_rel):
+            relative = member.relative_to(source_root)
+            destination = root / relative
+            reject_symlink_components(destination, root)
+            if (
+                not destination.is_file()
+                or (source_rel == "aiwf" and not os.access(destination, os.X_OK))
+                or compute_sha256(member) != compute_sha256(destination)
+            ):
+                gaps.append(relative.as_posix())
     return gaps
 
 
@@ -2466,43 +2579,45 @@ def _upgrade_source_info(source_root: Path) -> dict[str, Any]:
 
 
 def _ensure_aiwf_upgrade_skeleton(root: Path) -> tuple[str, str]:
-    aiwf_root = get_aiwf_root(root)
-    ensure_dir(aiwf_root)
-    ensure_dir(aiwf_root / "docs")
-    ensure_dir(aiwf_root / "records")
-    ensure_dir(aiwf_root / "events")
-    ensure_dir(aiwf_root / "bin")
-    ensure_dir(aiwf_root / "migrations")
+    aiwf_root = root / ".aiwf"
+    for name in ("docs", "records", "events", "bin", "migrations"):
+        with destination_directory(aiwf_root / name, root, create=True):
+            pass
 
     config_path = aiwf_root / "config.yaml"
     config_text, config_action = _prepare_aiwf_config(root)
     if config_action != "exists":
-        config_path.write_text(config_text, encoding="utf-8")
+        with destination_writer(config_path, root) as output:
+            output.write(config_text.encode("utf-8"))
 
     event_log_path = aiwf_root / "events" / "events.jsonl"
-    event_log_action = "exists" if event_log_path.exists() else "created"
-    if event_log_action != "exists":
-        event_log_path.write_text("", encoding="utf-8")
+    event_log_action = "exists"
+    if not event_log_path.exists():
+        with destination_directory(event_log_path.parent, root) as parent:
+            try:
+                event_fd = os.open(event_log_path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666, dir_fd=parent)
+            except FileExistsError:
+                validate_destination(event_log_path, root)
+            else:
+                os.close(event_fd)
+                event_log_action = "created"
     return config_action, event_log_action
 
 
 def _copy_upgrade_artifacts(source_root: Path, target_root: Path, update_plan: Sequence[str]) -> list[str]:
     copied: list[str] = []
+    files: list[Path] = []
     for plan_item in update_plan:
         source_rel, installed_label = UPGRADE_COPY_SPECS[plan_item]
-        source = source_root / source_rel
-        destination = target_root / source_rel
-        if source.resolve() == destination.resolve():
+        if source_root == target_root:
             continue
-        ensure_dir(destination.parent)
-        try:
-            if source.is_dir():
-                safe_copy_tree_no_symlink(source, destination, source_root)
-            else:
-                safe_copy_file_no_symlink(source, destination, source_root)
-        except SafePathError as exc:
-            raise SystemExit(f"ERROR: {exc}") from exc
+        files.extend(_managed_package_files(source_root, source_rel))
         copied.append(installed_label)
+    # A restarted process must see the new Runtime only after its dependencies.
+    runtime = source_root / ".aiwf/bin/ai_workflow.py"
+    for source in sorted(files, key=lambda path: path == runtime):
+        destination = target_root / source.relative_to(source_root)
+        safe_copy_file_no_symlink(source, destination, source_root, target_root)
     return copied
 
 
@@ -2516,7 +2631,7 @@ def _install_validate_source(source_root: Path) -> list[str]:
         return [f"source package does not exist: {source_root}"]
     if not source_root.is_dir():
         return [f"source package is not a directory: {source_root}"]
-    for rel_path, expected_type in INSTALL_REQUIRED_SOURCE_PATHS:
+    for rel_path, expected_type in (*INSTALL_REQUIRED_SOURCE_PATHS, *_contract_schema_requirements(source_root)):
         path = source_root / rel_path
         symlink_path = find_symlink_component(path, source_root)
         if symlink_path is not None:
@@ -2592,6 +2707,7 @@ def _install_target_required_paths() -> tuple[tuple[str, str], ...]:
         (".aiwf/bin/safe_paths.py", "file"),
         (".aiwf/bin/lib", "dir"),
         (".aiwf/bin/lib/package_core.py", "file"),
+        (".aiwf/bin/lib/workflow_lock.py", "file"),
         (".aiwf/docs", "dir"),
         (".aiwf/templates/AGENTS.block.md", "file"),
         (".aiwf/config.yaml", "file"),
@@ -2601,7 +2717,7 @@ def _install_target_required_paths() -> tuple[tuple[str, str], ...]:
 
 def _install_target_gaps(root: Path) -> list[str]:
     gaps: list[str] = []
-    for rel_path, expected_type in _install_target_required_paths():
+    for rel_path, expected_type in (*_install_target_required_paths(), *_contract_schema_requirements(root)):
         path = root / rel_path
         if expected_type == "dir" and not path.is_dir():
             gaps.append(rel_path)
@@ -2646,6 +2762,9 @@ def _install_preflight(root: Path, source_root: Path) -> tuple[list[str], str, l
     agents_path = root / "AGENTS.md"
     agents_original: Optional[str] = None
     managed_present = False
+    if agents_path.is_symlink():
+        blockers.append(f"AGENTS.md must not be a symlink: {agents_path}")
+        return blockers, "", []
     if agents_path.exists():
         if agents_path.is_symlink() or not agents_path.is_file():
             blockers.append(f"AGENTS.md is not a regular file: {agents_path}")
@@ -2679,22 +2798,9 @@ def _install_preflight(root: Path, source_root: Path) -> tuple[list[str], str, l
         return [str(exc)], "", []
 
     copy_plan: list[tuple[Path, Path]] = []
-    for plan_item, (source_rel, _installed_label) in INSTALL_COPY_SPECS.items():
-        source_path = source_root / source_rel
-        if source_path.is_dir():
-            for source_file in safe_walk_files(source_path, allowed_root=source_root):
-                rel_path = source_file.relative_to(source_root).as_posix()
-                if rel_path in INSTALL_EXCLUDED_PATHS or any(
-                    rel_path.startswith(f"{excluded}/") for excluded in INSTALL_EXCLUDED_PATHS
-                ):
-                    continue
-                if any(part in INSTALL_EXCLUDED_NAMES for part in source_file.relative_to(source_root).parts):
-                    continue
-                if source_file.suffix in {".pyc", ".pyo"}:
-                    continue
-                copy_plan.append((source_file, root / rel_path))
-        else:
-            copy_plan.append((source_path, root / source_rel))
+    for source_rel, _ in INSTALL_COPY_SPECS.values():
+        for member in _managed_package_files(source_root, source_rel):
+            copy_plan.append((member, root / member.relative_to(source_root)))
     for source_path, destination in copy_plan:
         source_rel = source_path.relative_to(source_root).as_posix()
         destination_rel = destination.relative_to(root).as_posix()
@@ -2705,20 +2811,30 @@ def _install_preflight(root: Path, source_root: Path) -> tuple[list[str], str, l
                 "install payload boundary violation: "
                 f"{source_rel} -> {destination_rel} ({ownership} path is not allowlisted)"
             ], "", []
+    try:
+        for _, destination in copy_plan:
+            validate_destination(destination, root)
+        for relative_dir in INSTALL_CREATED_DIRS:
+            validate_destination(root / relative_dir, root, directory=True)
+        validate_destination(agents_path, root)
+    except (OSError, SafePathError) as exc:
+        return [str(exc)], "", []
     return [], agents_text, copy_plan
 
 
 @dataclass
 class _InstallRollback:
+    root: Path
     created_files: list[Path]
     created_dirs: list[Path]
     backups: dict[Path, tuple[bytes, int]]
 
     @classmethod
-    def create(cls) -> "_InstallRollback":
-        return cls([], [], {})
+    def create(cls, root: Path) -> "_InstallRollback":
+        return cls(root, [], [], {})
 
     def ensure_dir(self, path: Path) -> None:
+        validate_destination(path, self.root, directory=True)
         missing: list[Path] = []
         current = path
         while not current.exists():
@@ -2727,10 +2843,12 @@ class _InstallRollback:
         if current.is_symlink() or not current.is_dir():
             raise ValueError(f"installation parent is not a directory: {current}")
         for directory in reversed(missing):
-            directory.mkdir()
+            with destination_directory(directory.parent, self.root) as parent:
+                os.mkdir(directory.name, dir_fd=parent)
             self.created_dirs.append(directory)
 
     def remember_destination(self, path: Path) -> None:
+        validate_destination(path, self.root)
         if not path.exists():
             self.created_files.append(path)
             return
@@ -2743,22 +2861,26 @@ class _InstallRollback:
         failures: list[Path] = []
         for path in reversed(self.created_files):
             try:
-                if path.exists() or path.is_symlink():
-                    path.unlink()
-            except OSError:
+                with destination_directory(path.parent, self.root) as parent:
+                    os.unlink(path.name, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+            except (OSError, SafePathError):
                 failures.append(path)
         for path, (content, mode) in self.backups.items():
             try:
-                path.write_bytes(content)
-                path.chmod(mode)
-            except OSError:
+                with destination_writer(path, self.root, mode=stat.S_IMODE(mode)) as output:
+                    output.write(content)
+            except (OSError, SafePathError):
                 failures.append(path)
         for path in reversed(self.created_dirs):
             try:
-                path.rmdir()
-            except OSError:
-                if path.exists():
-                    failures.append(path)
+                with destination_directory(path.parent, self.root) as parent:
+                    os.rmdir(path.name, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+            except (OSError, SafePathError):
+                failures.append(path)
         return failures
 
 
@@ -2766,13 +2888,16 @@ def _install_post_validation(root: Path, source_root: Path) -> list[str]:
     failures: list[str] = []
     wrapper = root / "aiwf"
     runtime = root / ".aiwf" / "bin" / "ai_workflow.py"
+    source_runtime = source_root / ".aiwf/bin/ai_workflow.py"
+    source_tool = _read_version_constant(source_runtime, "AIWF_TOOL_VERSION")
+    source_protocol = _read_version_constant(source_runtime, "WORKFLOW_PROTOCOL_VERSION")
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
         failures.append("root wrapper executable check failed")
     if not runtime.is_file():
         failures.append("runtime path check failed: .aiwf/bin/ai_workflow.py")
     else:
         result = subprocess.run(
-            [str(wrapper), "--help"],
+            [str(wrapper), "--version"],
             cwd=root,
             text=True,
             capture_output=True,
@@ -2780,14 +2905,13 @@ def _install_post_validation(root: Path, source_root: Path) -> list[str]:
             check=False,
             timeout=30,
         )
-        if result.returncode != 0 or "install" not in result.stdout:
-            failures.append("runtime help check failed")
+        expected_version = f"./aiwf {source_tool} (workflow protocol {source_protocol})"
+        if result.returncode != 0 or result.stdout.strip() != expected_version:
+            failures.append("installed launcher version check failed")
     gaps = _install_target_gaps(root)
     if gaps:
         failures.append("package layout check failed: " + ", ".join(gaps))
-    source_tool = _read_version_constant(source_root / ".aiwf/bin/ai_workflow.py", "AIWF_TOOL_VERSION")
     target_tool = _read_version_constant(runtime, "AIWF_TOOL_VERSION")
-    source_protocol = _read_version_constant(source_root / ".aiwf/bin/ai_workflow.py", "WORKFLOW_PROTOCOL_VERSION")
     target_protocol = _read_version_constant(runtime, "WORKFLOW_PROTOCOL_VERSION")
     if source_tool != target_tool or source_protocol != target_protocol:
         failures.append("package version identity check failed")
@@ -2826,18 +2950,20 @@ def install_command(root: Path, target: str, yes: bool) -> int:
         print("Re-run with --yes to install AIWF.")
         return 0
 
-    transaction = _InstallRollback.create()
+    require_destination_handles()
+    transaction = _InstallRollback.create(target_root)
     try:
         for source_path, destination in copy_plan:
             transaction.ensure_dir(destination.parent)
             transaction.remember_destination(destination)
-            safe_copy_file_no_symlink(source_path, destination, source_root)
+            safe_copy_file_no_symlink(source_path, destination, source_root, target_root)
         for relative_dir in INSTALL_CREATED_DIRS:
             transaction.ensure_dir(target_root / relative_dir)
         agents_path = target_root / "AGENTS.md"
         transaction.ensure_dir(agents_path.parent)
         transaction.remember_destination(agents_path)
-        agents_path.write_text(agents_text, encoding="utf-8", errors="surrogateescape", newline="")
+        with destination_writer(agents_path, target_root) as output:
+            output.write(agents_text.encode("utf-8", errors="surrogateescape"))
         post_failures = _install_post_validation(target_root, source_root)
         if post_failures:
             raise ValueError("; ".join(post_failures))
@@ -2845,7 +2971,10 @@ def install_command(root: Path, target: str, yes: bool) -> int:
         rollback_failures = transaction.rollback()
         if isinstance(exc, KeyboardInterrupt):
             raise
-        print("[ERROR] AIWF installation failed; installation was rolled back.")
+        if rollback_failures:
+            print("[ERROR] AIWF installation failed; rollback was incomplete.")
+        else:
+            print("[ERROR] AIWF installation failed; installation was rolled back.")
         print(f"- {exc}")
         if rollback_failures:
             print("- rollback could not restore:")
@@ -2858,6 +2987,7 @@ def install_command(root: Path, target: str, yes: bool) -> int:
     print("Installed:\n  aiwf\n  .aiwf/bin\n  .aiwf/docs\n  .aiwf/templates\n  .aiwf/config.yaml\n  AGENTS.md managed block")
     print("Validation:\n  install payload boundary: PASS\n  runtime: PASS\n  package layout: PASS\n  agent instructions: PASS")
     print("Next:\n  ./aiwf new-task <task-name>")
+    print(MCP_SETUP_HINT)
     return 0
 
 
@@ -2931,16 +3061,62 @@ def upgrade_command(
 ) -> int:
     source_root = Path(source).expanduser().resolve()
     blockers = _upgrade_validate_source(source_root)
+    report_path = _migration_report_path(root, "upgrade")
+    try:
+        _validate_skeleton_destinations(root, report_path)
+        if migrate_legacy_docs and not no_relocate:
+            validate_destination(root / "docs", root, directory=True)
+            moves = _candidate_legacy_docs_relocation_paths(root)
+            _validate_relocation_entries(root, moves)
+        else:
+            moves = []
+        if not blockers:
+            for source_rel, _ in UPGRADE_COPY_SPECS.values():
+                for source_file in _managed_package_files(source_root, source_rel):
+                    destination = root / source_file.relative_to(source_root)
+                    validate_destination(destination, root)
+                    # A legacy directory moved in this apply becomes a payload parent.
+                    for entry in moves:
+                        if entry.classification == "relocatable" and destination.is_relative_to(entry.destination):
+                            validate_destination(entry.source / destination.relative_to(entry.destination), root)
+    except (OSError, SafePathError) as exc:
+        print(f"[ERROR] AIWF upgrade destination preflight failed: {exc}")
+        return 2
+    # Keep the upgrade intent until the verified report is committed. A retry
+    # can therefore distinguish a completed copy from a genuine no-op.
+    pending = sorted(report_path.parent.glob("*_upgrade.pending"))
+    if len(pending) > 1:
+        blockers.append("multiple pending upgrade reports; inspect .aiwf/migrations before applying another upgrade")
+    if pending:
+        report_path = pending[0].with_suffix(".md")
+    pending_path = report_path.with_suffix(".pending")
+    original_report = None
+    signature = ""
+    if not blockers:
+        validate_destination(pending_path, root)
+        validate_destination(report_path, root)
+        signature = json.dumps([no_relocate, migrate_legacy_docs, [
+            (p.relative_to(source_root).as_posix(), compute_sha256(p))
+            for folder, _ in UPGRADE_COPY_SPECS.values() for p in sorted(_managed_package_files(source_root, folder))
+        ]], separators=(",", ":"))
+        signature = hashlib.sha256(signature.encode()).hexdigest()
+        if pending:
+            saved_signature, _, original_report = pending_path.read_text(encoding="utf-8").partition("\n")
+            if (saved_signature != signature or not original_report.startswith("# AIWF Upgrade Report\n")
+                    or not original_report.endswith("- PENDING\n")):
+                blockers.append("pending upgrade requires the original source package and migration options; inspect .aiwf/migrations")
     current_info = _upgrade_current_info(root)
     source_info = _upgrade_source_info_unknown() if blockers else _upgrade_source_info(source_root)
-    target_gaps = _upgrade_target_requirement_gaps(root)
-    target_gaps.extend(
-        path for path in OPTIONAL_GUIDANCE_PACKAGE_FILES
-        if (source_root / path).is_file() and not (root / path).is_file()
-    )
+    target_records = _upgraded_record_root(load_aiwf_config(root).layout)
+    target_gaps: list[str] = []
+    if not blockers:
+        try:
+            target_gaps = _upgrade_target_content_gaps(root, source_root)
+        except (OSError, SafePathError) as exc:
+            blockers.append(f"cannot verify managed package contents: {exc}")
     relocation_entries = [
         entry
-        for entry in (_candidate_legacy_docs_relocation_paths(root) if migrate_legacy_docs else [])
+        for entry in moves
         if entry.group in {"docs", "records"} and entry.exists
     ]
     relocation_conflicts = (
@@ -2954,7 +3130,7 @@ def upgrade_command(
         or current_info["tool_version"] != source_info["tool_version"]
         or current_info["protocol_version"] != source_info["protocol_version"]
     )
-    repair_required = bool(target_gaps)
+    repair_required = bool(target_gaps or pending)
     upgrade_required = (
         package_update_required
         or relocation_required
@@ -2966,6 +3142,14 @@ def upgrade_command(
         target_gaps=target_gaps,
     )
     warnings = []
+    if pending:
+        warnings.append(f"pending upgrade report: {rel(root, pending_path)}; repeat --apply to finish recording the verified upgrade")
+    if upgrade_required:
+        parent = report_path.parent
+        while not parent.exists():
+            parent = parent.parent
+        if not os.access(parent, os.W_OK | os.X_OK):
+            blockers.append(f"upgrade report directory is not writable: {rel(root, parent)}")
     if no_relocate:
         warnings.append("legacy layout relocation skipped by --no-relocate")
     if not migrate_legacy_docs:
@@ -2988,7 +3172,7 @@ def upgrade_command(
         print(f"  tool_version: {source_info['tool_version']}")
         print(f"  layout_version: {source_info['layout_version']}")
         print(f"  runtime: {source_info['runtime']}")
-        print(f"  records: {source_info['records_root']}")
+        print(f"  records: {target_records}")
         print("Status:")
         print(f"  upgrade_required: {'yes' if upgrade_required else 'no'}")
         print(f"  repair_required: {'yes' if repair_required else 'no'}")
@@ -3025,7 +3209,7 @@ def upgrade_command(
         print(f"  tool_version: {source_info['tool_version']}")
         print(f"  layout_version: {source_info['layout_version']}")
         print(f"  runtime: {source_info['runtime']}")
-        print(f"  records: {source_info['records_root']}")
+        print(f"  records: {target_records}")
         print("Status:")
         print(f"  upgrade_required: {'yes' if upgrade_required else 'no'}")
         print(f"  repair_required: {'yes' if repair_required else 'no'}")
@@ -3037,6 +3221,10 @@ def upgrade_command(
                 print(f"  - {path}")
         else:
             print("  - none")
+        if target_gaps:
+            print("Missing or different managed files:")
+            for path in target_gaps:
+                print(f"  - {path}")
         print("Will preserve:")
         for path in UPGRADE_PRESERVED_PATHS:
             print(f"  - {path}")
@@ -3061,7 +3249,14 @@ def upgrade_command(
         if check:
             print("Next:")
             if upgrade_required:
-                print(f"  ./aiwf upgrade --dry-run --source {source_root}")
+                source_arg = shlex.quote(str(source_root))
+                options = (" --no-relocate" if no_relocate else "") + (" --migrate-legacy-docs" if migrate_legacy_docs else "")
+                command = f"upgrade --dry-run --source {source_arg}{options}"
+                if Path.cwd().resolve() == root.resolve():
+                    print(f"  ./aiwf {command}")
+                else:
+                    target_arg = shlex.quote(str(root.resolve()))
+                    print(f"  (cd {source_arg} && ./aiwf --repo-root {target_arg} {command})")
             else:
                 print("  none")
         return 0
@@ -3071,53 +3266,54 @@ def upgrade_command(
         print(f"Target already matches source package: {source_root}")
         return 0
 
-    config_action = "created"
-    event_log_action = "created"
+    require_destination_handles()
+    if original_report is None:
+        config_note = _prepare_aiwf_config(root)[1]
+        if no_relocate:
+            config_note += " (legacy layout preserved)"
+        elif not migrate_legacy_docs:
+            config_note += " (legacy docs migration disabled)"
+        original_report = _upgrade_report_text(
+            source_root=source_root, target_root=root, source_info=source_info, current_info=current_info,
+            copied=[UPGRADE_COPY_SPECS[item][1] for item in update_plan], preserved=UPGRADE_PRESERVED_PATHS,
+            relocated=[f"{entry.label}: {rel(root, entry.source)} -> {rel(root, entry.destination)}"
+                       for entry in relocation_entries], config_action=config_note, warnings=warnings,
+            validation_result="PENDING",
+        )
+        with destination_writer(pending_path, root) as output:
+            output.write((signature + "\n" + original_report).encode("utf-8"))
     if no_relocate or not migrate_legacy_docs:
-        config_action, event_log_action = _ensure_aiwf_upgrade_skeleton(root)
+        _ensure_aiwf_upgrade_skeleton(root)
     else:
         relocate_rc = relocate_command(root, dry_run=False, legacy_docs=True)
         if relocate_rc != 0:
             return relocate_rc
-        config_action = "relocated"
-        event_log_action = "relocated"
 
     copied = _copy_upgrade_artifacts(source_root, root, update_plan)
-    preserved = list(UPGRADE_PRESERVED_PATHS)
-    relocated = [
-        f"{entry.label}: {rel(root, entry.source)} -> {rel(root, entry.destination)}"
-        for entry in relocation_entries
-    ] if migrate_legacy_docs and not no_relocate else []
-    if no_relocate:
-        config_note = f"{config_action} (legacy layout preserved)"
-    elif not migrate_legacy_docs:
-        config_note = f"{config_action} (legacy docs migration disabled)"
-    else:
-        config_note = config_action
-    report_text = _upgrade_report_text(
-        source_root=source_root,
-        target_root=root,
-        source_info=source_info,
-        current_info=_upgrade_current_info(root),
-        copied=copied,
-        preserved=preserved,
-        relocated=relocated,
-        config_action=f"{config_note}; event_log={event_log_action}",
-        warnings=warnings,
-        validation_result="PASS",
-    )
-    aiwf_root = get_aiwf_root(root)
-    ensure_dir(aiwf_root / "migrations")
-    report_name = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')}_upgrade.md"
-    report_path = aiwf_root / "migrations" / report_name
-    report_path.write_text(report_text, encoding="utf-8")
+    try:
+        remaining = _upgrade_target_content_gaps(root, source_root)
+    except (OSError, SafePathError) as exc:
+        print(f"[ERROR] Could not verify the upgraded package: {exc}")
+        return 2
+    if remaining:
+        print("[ERROR] Upgraded package still differs from the source. Rerun upgrade --check.")
+        for path in remaining:
+            print(f"  - {path}")
+        return 2
+    report_text = original_report.removesuffix("- PENDING\n") + "- PASS\n"
+    if report_path.exists() and report_path.read_text(encoding="utf-8") != report_text:
+        raise ValueError(f"Existing upgrade report conflicts with pending evidence: {rel(root, report_path)}")
+    with destination_writer(report_path, root) as output:
+        output.write(report_text.encode("utf-8"))
+    with destination_directory(pending_path.parent, root) as parent:
+        os.unlink(pending_path.name, dir_fd=parent)
 
     print("[INFO] AIWF-UPGRADE-OK")
     print(f"Report: {rel(root, report_path)}")
     for path in copied:
         print(f"- installed {path}")
-    if relocated:
-        print(f"- relocated {len(relocated)} legacy paths")
+    if relocation_entries:
+        print(f"- relocated {len(relocation_entries)} legacy paths")
     if warnings:
         for warning in warnings:
             print(f"- warning: {warning}")
@@ -3133,8 +3329,9 @@ def write_dataset_output(root: Path, path: Path, content: str) -> WriteResult:
 
 
 def append_index(index_path: Path, entry: str) -> WriteResult:
-    ensure_dir(index_path.parent)
     if not index_path.exists():
+        workflow_lock.mark_mutation_started(index_path)
+        ensure_dir(index_path.parent)
         index_path.write_text("# AI Work Records\n\n", encoding="utf-8")
     text = index_path.read_text(encoding="utf-8", errors="replace")
     if entry.strip() in text:
@@ -3142,6 +3339,7 @@ def append_index(index_path: Path, entry: str) -> WriteResult:
     if not text.endswith("\n"):
         text += "\n"
     text += entry.rstrip() + "\n"
+    workflow_lock.mark_mutation_started(index_path)
     index_path.write_text(text, encoding="utf-8")
     return WriteResult(index_path, "updated")
 
@@ -3157,6 +3355,7 @@ def _rollback_failed_task_creation(
     if not task_dir_existed_before and task_dir.exists():
         shutil.rmtree(task_dir)
     if index_existed_before:
+        workflow_lock.mark_mutation_started(index_path)
         index_path.write_text(index_before_text or "", encoding="utf-8")
     elif index_path.exists():
         index_path.unlink()
@@ -3299,10 +3498,14 @@ def _sync_index_entry_status(root: Path, task_dir: Path) -> WriteResult:
     updated_line = _replace_index_status(lines[line_index], expected_status)
     if updated_line == lines[line_index]:
         return WriteResult(index_path, "exists")
+    if task_dir.parent.parent != get_record_root(root):
+        raise ValueError("AIWF-WRITE-DESTINATION: Task index is outside the configured writable records root.")
+    _preflight_workflow_files(root, index_path)
     lines[line_index] = updated_line
     new_text = "\n".join(lines)
     if text.endswith("\n"):
         new_text += "\n"
+    workflow_lock.mark_mutation_started(index_path)
     index_path.write_text(new_text, encoding="utf-8")
     return WriteResult(index_path, "updated")
 
@@ -3489,19 +3692,32 @@ def default_task_metadata(task_id: str, task_name: str, title: str, date: str) -
     return metadata
 
 
-def _strip_yaml_quotes(value: str) -> str:
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
+# Earlier releases escaped inner quotes only. An explicit format comment keeps
+# a literal legacy Windows path distinguishable from a newly encoded escape.
+_FRONT_MATTER_ENCODING = "# aiwf-string-encoding: json-v1"
+
+
+def _strip_yaml_quotes(value: str, json_encoded: bool) -> str:
+    if len(value) >= 2 and value[0] == value[-1]:
+        if value[0] == "'":
+            return value[1:-1].replace("''", "'")
+        if value[0] == '"':
+            if not json_encoded:
+                return value[1:-1].replace(r'\"', '"')
+            try:
+                return json.loads(value)
+            except ValueError:
+                return value[1:-1]
     return value
 
 
-def _parse_yaml_scalar(raw: str) -> Any:
+def _parse_yaml_scalar(raw: str, json_encoded: bool) -> Any:
     value = raw.strip()
     if value in {"null", "~"}:
         return None
     if value == "[]":
         return []
-    return _strip_yaml_quotes(value)
+    return _strip_yaml_quotes(value, json_encoded)
 
 
 def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
@@ -3518,13 +3734,14 @@ def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
         return {}, text
 
     metadata: dict[str, Any] = {}
+    json_encoded = _FRONT_MATTER_ENCODING in lines[1:end_index]
     active_list_key: Optional[str] = None
     for raw_line in lines[1:end_index]:
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         if active_list_key and stripped.startswith("- "):
-            metadata.setdefault(active_list_key, []).append(_parse_yaml_scalar(stripped[2:]))
+            metadata.setdefault(active_list_key, []).append(_parse_yaml_scalar(stripped[2:], json_encoded))
             continue
         active_list_key = None
         if ":" not in raw_line:
@@ -3538,7 +3755,7 @@ def parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
             metadata[key] = []
             active_list_key = key
             continue
-        metadata[key] = _parse_yaml_scalar(raw_value)
+        metadata[key] = _parse_yaml_scalar(raw_value, json_encoded)
 
     body = "\n".join(lines[end_index + 1 :])
     if text.endswith("\n"):
@@ -3550,8 +3767,8 @@ def _format_front_matter_value(value: Any) -> str:
     if value is None:
         return "null"
     if isinstance(value, str):
-        escaped = value.replace('"', '\\"')
-        return f'"{escaped}"'
+        encoded = json.dumps(value, ensure_ascii=False)
+        return re.sub(r"[\x7f-\x9f\u2028\u2029]", lambda m: f"\\u{ord(m[0]):04x}", encoded)
     return str(value)
 
 
@@ -3559,7 +3776,7 @@ def format_front_matter(metadata: dict[str, Any]) -> str:
     # Keep schema-defined fields first, then preserve unknown extension fields.
     ordered = [key for key in _schema_field_order() if key in metadata]
     ordered.extend(key for key in metadata.keys() if key not in TASK_METADATA_SCHEMA)
-    lines = ["---"]
+    lines = ["---", _FRONT_MATTER_ENCODING]
     for key in ordered:
         value = metadata.get(key)
         if isinstance(value, list):
@@ -3890,7 +4107,7 @@ def agent_md(title: str, backfill: bool = False) -> str:
 
 ## Role
 
-You are an AI workflow implementation engineer working in a Python/pytest automation repository.
+Carry out the work described in `task.md` using this project's tools and record the results.
 
 ## Project Context
 
@@ -3901,7 +4118,7 @@ Treat hardware-impacting actions as unsafe unless explicitly approved.
 ## Execution Rules
 
 1. Read `task.md` before editing.
-2. This is a v1.1 workflow {mode}.
+2. Keep the required {mode} files together in this directory.
 3. Keep changes minimal and scoped.
 4. Preserve existing historical records and conclusions.
 5. Do not modify business code unless the task explicitly requires it.
@@ -3931,7 +4148,7 @@ Treat hardware-impacting actions as unsafe unless explicitly approved.
 
 - Was the scope respected?
 - Were original records preserved?
-- Are v1.1 files complete?
+- Are the files listed under Required Outputs complete?
 - Are risks and skipped validations clear?
 - Were no real DUT/destructive operations executed?
 """
@@ -4402,6 +4619,7 @@ def correct_finalized_command(
         return 2
 
     safe_write_path(root, correction_path)
+    workflow_lock.mark_mutation_started(correction_path)
     ensure_dir(correction_path.parent)
     correction_metadata: dict[str, Any] = {
         "schema_version": CORRECTION_SCHEMA_VERSION,
@@ -4433,10 +4651,44 @@ def correct_finalized_command(
         )
         return 2
 
+    _mutation_observed("succeeded", "applied", {"correction_id": correction_id, "path": rel(root, correction_path)})
     print("[INFO] AIWF-CORRECTION-OK")
     print(f"{rel(root, correction_path)}: additive post-finalization correction created")
-    print("Historical closure evidence: preserved")
+    print("Historical closure files were left unchanged by this correction.")
     return 0
+
+
+def _inspect_projection(root: Path, target: Path, metadata: dict) -> tuple[dict, list[Diagnostic]]:
+    if not isinstance(metadata, dict) or not metadata:
+        return {}, [make_diagnostic("AIWF-META-001", rel(root, target / "task.md"), blocker=True)]
+    finalized = _is_already_finalized(metadata)
+    preserved = False
+    if finalized:
+        event_path = _task_event_log_path(target)
+        try:
+            validate_destination(event_path, root)
+            events, malformed = _load_events_with_stats(target)
+            integrity = None if malformed else _closure_manifest_matches(root, target, _latest_event(events, "finalize_success"))
+        except (OSError, ValueError):
+            integrity = None
+        if integrity is None:
+            return {}, [make_diagnostic("AIWF-INSPECT-002", rel(root, event_path), blocker=True)]
+        preserved = integrity
+    corrections, diagnostics = _correction_artifact_records(root, target)
+    latest = None
+    if corrections:
+        record = corrections[-1]
+        latest = {
+            "id": record["correction_id"], "type": record["correction_type"],
+            "authority": record["authority"], "current_effective_state": record["current_effective_state"],
+            "path": rel(root, record["path"]),
+        }
+    return {
+        "task_path": rel(root, target), "status": str(metadata.get("status", "unknown")),
+        "workflow_phase": str(metadata.get("workflow_phase", "unknown")),
+        "closure_preserved": preserved,
+        "correction_count": len(corrections), "latest_correction": latest,
+    }, diagnostics
 
 
 def inspect_command(root: Path, raw_target: str) -> int:
@@ -4447,31 +4699,53 @@ def inspect_command(root: Path, raw_target: str) -> int:
         _print_task_path_diagnostic(root, target, "AIWF-INSPECT-001")
         return 2
 
-    payload = load_task_metadata(target)
-    metadata = payload.get("metadata", {})
-    if not isinstance(metadata, dict) or not metadata:
-        _print_diagnostics([make_diagnostic("AIWF-META-001", rel(root, target / "task.md"), blocker=True)])
-        return 2
-
-    corrections, diagnostics = _correction_artifact_records(root, target)
+    metadata = load_task_metadata(target)["metadata"]
+    projection, diagnostics = _inspect_projection(root, target, metadata)
     if diagnostics:
         _print_diagnostics(diagnostics)
         return 2
 
     print(f"Task: {rel(root, target)}")
+    required = metadata.get("required_review_authority") or _task_required_review_authority(metadata)
+    print(f"Required review authority: {required if required in ('human', 'ai-agent') else 'unknown'}")
+    event_path = _task_event_log_path(target)
+    try:
+        reject_symlink_components(event_path, root)
+        if not event_path.is_file():
+            raise ValueError("Unsupported event file")
+        events, malformed = _load_events_with_stats(target)
+        _, latest_review = _latest_review_decision(events)
+    except (OSError, ValueError):
+        latest_review, malformed = None, True
+    if malformed:
+        print("Latest recorded review: unknown (task event log is missing, unreadable or incomplete)")
+    elif latest_review:
+        decision = _event_field(latest_review, "decision_authority")
+        if decision not in ("human", "ai-agent", "not_required"):
+            decision = "unknown"
+        result = _event_result_status(latest_review) or "unknown"
+        print(f"Latest recorded review: {result} (decision authority: {decision})")
+        if (not _is_already_finalized(metadata) and required == "human"
+                and decision == "ai-agent" and result == "pass"):
+            print("Waiting for human review. Send the task and validation evidence to the assigned reviewer.")
+    else:
+        print("Latest recorded review: no decision in the task event log")
     print(f"AIWF tool version: {AIWF_TOOL_VERSION}")
     print(f"Workflow protocol version: {WORKFLOW_PROTOCOL_VERSION}")
-    print(f"Historical workflow state: {metadata.get('workflow_phase', 'unknown')}")
-    print(f"Historical closure evidence: {'preserved' if _is_already_finalized(metadata) else 'not finalized'}")
-    print(f"Post-finalization correction: {'present' if corrections else 'none'}")
-    print(f"Correction count: {len(corrections)}")
-    if corrections:
-        latest = corrections[-1]
-        print(f"Latest correction: {latest['correction_id']}")
-        print(f"Latest correction type: {latest['correction_type']}")
+    latest = projection["latest_correction"]
+    print(f"Historical workflow state: {projection['workflow_phase']}")
+    integrity = "not finalized"
+    if _is_already_finalized(metadata):
+        integrity = "preserved" if projection["closure_preserved"] else "changed (run check --finalize-ready)"
+    print(f"Historical closure evidence: {integrity}")
+    print(f"Post-finalization correction: {'present' if latest else 'none'}")
+    print(f"Correction count: {projection['correction_count']}")
+    if latest:
+        print(f"Latest correction: {latest['id']}")
+        print(f"Latest correction type: {latest['type']}")
         print(f"Latest correction authority: {latest['authority']}")
         print(f"Current implementation state: {latest['current_effective_state']}")
-        print(f"Latest correction path: {rel(root, latest['path'])}")
+        print(f"Latest correction path: {latest['path']}")
     return 0
 
 
@@ -4492,6 +4766,8 @@ def _print_command_path_error(exc: CommandPathInputError) -> None:
     _print_diagnostics([make_diagnostic(exc.code, exc.requested_path, blocker=True)])
     print(f"Resolved path: {exc.resolved_path}")
     print(f"Repository root: {exc.root}")
+    if exc.code == "AIWF-CLI-PATH-001":
+        print("For a task, run ./aiwf list and copy its full task path into --path.")
 
 
 def _resolve_command_target_path(root: Path, raw_target: str) -> Optional[Path]:
@@ -4543,19 +4819,17 @@ def _guard_event_log_warning(root: Path, task_dir: Path) -> Optional[str]:
 
 
 def guard_pre_edit(root: Path, raw_target: Optional[str], *, pre_edit: bool) -> tuple[int, str]:
-    if not pre_edit or not _has_non_empty_text(raw_target):
-        diag = make_diagnostic("AIWF-GUARD-900", "", blocker=True)
-        return 1, f"{diag.code}: {diag.message}\n"
-
-    task_dir = _resolve_guard_target_path(root, raw_target or "")
+    task_dir = _resolve_guard_target_path(root, raw_target or "") if pre_edit else None
     if task_dir is None:
         diag = make_diagnostic("AIWF-GUARD-900", "", blocker=True)
-        return 1, f"{diag.code}: {diag.message}\n"
+        _observe_diagnostic(diag)
+        return 1, f"{diag.code}: {diag.message}\n{diag.suggested_fix}\nCopy the full task path from ./aiwf list.\n"
 
     display_path = rel(root, task_dir)
     if not task_dir.exists() or not task_dir.is_dir():
         diag = make_diagnostic("AIWF-GUARD-001", display_path, blocker=True)
-        return 2, f"{diag.code}: {diag.message}\ntask_path: {display_path}\n"
+        _observe_diagnostic(diag)
+        return 2, f"{diag.code}: {diag.message}\ntask_path: {display_path}\nCopy the full task path from ./aiwf list.\n"
 
     missing = [
         _artifact_group_label(group)
@@ -4564,6 +4838,7 @@ def guard_pre_edit(root: Path, raw_target: Optional[str], *, pre_edit: bool) -> 
     ]
     if missing:
         diag = make_diagnostic("AIWF-GUARD-002", display_path, blocker=True)
+        _observe_diagnostic(diag)
         lines = [f"{diag.code}: {diag.message}", f"task_path: {display_path}", "missing:"]
         lines.extend(f"- {filename}" for filename in missing)
         return 2, "\n".join(lines) + "\n"
@@ -4572,18 +4847,26 @@ def guard_pre_edit(root: Path, raw_target: Optional[str], *, pre_edit: bool) -> 
     front = metadata_payload.get("metadata", {})
     if not isinstance(front, dict) or not front:
         diag = make_diagnostic("AIWF-GUARD-003", display_path, blocker=True)
+        _observe_diagnostic(diag)
         return 2, f"{diag.code}: {diag.message}\ntask_path: {display_path}\n"
 
     closed_reason = _guard_is_closed(front)
     if closed_reason:
         diag = make_diagnostic("AIWF-GUARD-004", display_path, blocker=True)
+        _observe_diagnostic(diag)
         return 2, f"{diag.code}: {diag.message}\ntask_path: {display_path}\nreason: {closed_reason}\n"
+
+    if task_dir.parent.parent != get_record_root(root):
+        diag = make_diagnostic("AIWF-GUARD-005", display_path, blocker=True)
+        _observe_diagnostic(diag)
+        return 2, f"{diag.code}: {diag.message}\ntask_path: {display_path}\n{diag.suggested_fix}\n"
 
     warning = _guard_event_log_warning(root, task_dir)
     if warning:
         print(f"WARN: {warning}", file=sys.stderr)
 
     diag = make_diagnostic("AIWF-GUARD-PASS", display_path)
+    _observe_diagnostic(diag)
     return 0, f"{diag.code}: {diag.message}\ntask_path: {display_path}\n"
 
 
@@ -4758,6 +5041,24 @@ def _artifact_manifest(task_dir: Path) -> dict[str, str]:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         manifest[filename] = f"sha256:{digest}"
     return manifest
+
+
+def _closure_manifest_matches(root: Path, task: Path, event: Optional[dict]) -> Optional[bool]:
+    if not event:
+        return None
+    manifest = event.get("artifact_manifest")
+    if not isinstance(manifest, dict) and isinstance(event.get("payload"), dict):
+        manifest = event["payload"].get("artifact_manifest")
+    if not isinstance(manifest, dict):
+        return None
+    expected = {key: value for key, value in manifest.items() if key in FINALIZE_MANIFEST_FILES}
+    if (not all(any(name in expected for name in group) for group in FINALIZE_REQUIRED_FILE_GROUPS)
+            or not all(isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+                       for value in expected.values())):
+        return None
+    for name in FINALIZE_MANIFEST_FILES:
+        validate_destination(task / name, root)
+    return _artifact_manifest(task) == expected
 
 
 POST_FINALIZE_EVIDENCE_EVENT_TYPES = {
@@ -5018,18 +5319,12 @@ def _collect_path_policy_diagnostics(
                 )
             )
         elif is_v16:
-            manifest = finalize_success.get("artifact_manifest")
-            if not isinstance(manifest, dict):
-                payload = finalize_success.get("payload")
-                if isinstance(payload, dict):
-                    manifest = payload.get("artifact_manifest")
-            if not isinstance(manifest, dict):
+            try:
+                matches = _closure_manifest_matches(root, task_dir, finalize_success)
+            except (OSError, ValueError):
+                matches = None
+            if not matches:
                 diagnostics.append(make_diagnostic("AIWF-PATH-015", rel(root, _metadata_path(root, task_dir)), blocker=True))
-            else:
-                actual_manifest = _artifact_manifest(task_dir)
-                expected_manifest = {k: v for k, v in manifest.items() if k in FINALIZE_MANIFEST_FILES}
-                if actual_manifest != expected_manifest:
-                    diagnostics.append(make_diagnostic("AIWF-PATH-015", rel(root, _metadata_path(root, task_dir)), blocker=True))
 
     if is_v16 and include_finalize_checks:
         finalize_success_index = _latest_event_index(events, "finalize_success")
@@ -5199,18 +5494,76 @@ def _collect_task_diagnostics(
     return diagnostics
 
 
-def _print_diagnostics(diagnostics: Iterable[Diagnostic]) -> tuple[int, int]:
+# A structured invocation observes receipts at the same decision and write sites
+# as the text CLI. Plain callers do not install an observer.
+_MUTATION_RECEIPT: ContextVar[Optional[dict]] = ContextVar("aiwf_mutation_receipt", default=None)
+
+
+def _mutation_observed(status, state, result=None, *, target=None):
+    receipt = _MUTATION_RECEIPT.get()
+    if receipt is not None:
+        receipt.update(operation_status=status, mutation_state=state, result=result)
+        if target is not None:
+            receipt["target"] = target
+
+
+def _observe_diagnostic(item: Diagnostic):
+    receipt = _MUTATION_RECEIPT.get()
+    if receipt is not None:
+        receipt["diagnostics"].append(asdict(item))
+
+
+TEMPLATE_DIAGNOSTICS = {"AIWF-PLACEHOLDER-001", "AIWF-PATH-020", "AIWF-PATH-021", "AIWF-PATH-022"}
+
+
+def _print_diagnostics(diagnostics: Iterable[Diagnostic], *, compact: bool = False) -> tuple[int, int]:
     err = warn = 0
+    template_findings: dict[str, list[str]] = {}
     for item in diagnostics:
+        _observe_diagnostic(item)
+        err += int(item.severity == "error")
+        warn += int(item.severity == "warn")
+        if compact and item.severity == "info":
+            continue
+        if compact and item.code in TEMPLATE_DIAGNOSTICS:
+            template_findings.setdefault(item.path, []).append(item.code)
+            continue
         label = item.severity.upper()
         print(f"[{label}] {item.code}")
         print(f"{item.path}: {item.message}")
         if item.suggested_fix and item.severity in {"error", "warn"}:
             print("Suggested Fix:")
             print(item.suggested_fix)
-        err += int(item.severity == "error")
-        warn += int(item.severity == "warn")
+    if template_findings:
+        print("Template text to replace with task-specific evidence:")
+        for path, codes in template_findings.items():
+            print(f"  {path} ({len(codes)} findings, {', '.join(dict.fromkeys(codes))})")
     return err, warn
+
+
+def _print_closure_overview(
+    root: Path, target: Path, diagnostics: Sequence[Diagnostic], *, title: str, query: str,
+    applying: bool = False,
+) -> None:
+    path = shlex.quote(rel(root, target))
+    blockers = [item for item in diagnostics if item.severity == "error" and item.blocker]
+    print(f"{title}: {'BLOCKED' if blockers else 'PASS'} ({len(blockers)} finalize blockers)")
+    metadata = load_task_metadata(target)["metadata"]
+    finalized = _is_already_finalized(metadata)
+    if finalized:
+        print("This task is already finalized. Use a follow-up task for additional work.")
+    elif blockers:
+        codes = {item.code for item in blockers}
+        if "AIWF-PATH-025" in codes and _task_required_review_authority(metadata) == "human":
+            print("Waiting for human review. The agent review has been recorded.")
+            print("Send the task and validation evidence to the assigned reviewer. Record their decision after they respond.")
+        elif blockers[0].code in TEMPLATE_DIAGNOSTICS:
+            print("Fill in the listed files using the work performed and its evidence.")
+        else:
+            print(f"Next: {blockers[0].suggested_fix}")
+    elif not applying:
+        print(f"To close the task, run: ./aiwf finalize --path {path}")
+    print(f"Full diagnostics: ./aiwf query {query} --path {path}")
 
 
 def _diagnostic_exit_code(diagnostics: Iterable[Diagnostic], strict: bool) -> int:
@@ -5221,6 +5574,10 @@ def _diagnostic_exit_code(diagnostics: Iterable[Diagnostic], strict: bool) -> in
     if strict and warn:
         return 1
     return 0
+
+
+def _readiness_exit_code(diagnostics: Sequence[Diagnostic]) -> int:
+    return 2 if any(item.severity == "error" and item.blocker for item in diagnostics) else 0
 
 
 def summarize_diagnostics(diagnostics: Sequence[Diagnostic]) -> dict[str, Any]:
@@ -5265,6 +5622,9 @@ def append_aiwf_event(
     if not aiwf_event_logging_enabled(env):
         return
 
+    if task_dir.parent.parent != get_record_root(root):
+        print(f"WARN: Optional {command} event skipped for read-only task {rel(root, task_dir)}.", file=sys.stderr)
+        return
     context = build_event_context(env)
     diagnostics_summary = summarize_diagnostics(diagnostics)
     status = _event_status_from(exit_code, diagnostics_summary)
@@ -5308,6 +5668,10 @@ def _try_append_aiwf_event(
             actor_identity=actor_identity,
         )
     except Exception as exc:
+        if workflow_lock.mutation_started():
+            raise OSError("Could not record the expected workflow command event.") from exc
+        if workflow_lock.participating() and command not in {"check", "doctor"}:
+            raise ValueError(f"Cannot record the {command} event: {exc}") from exc
         print(f"WARN: failed to append AIWF event log: {exc}", file=sys.stderr)
 
 
@@ -5320,36 +5684,29 @@ def _finalize_task_metadata(root: Path, task_dir: Path) -> None:
     task_file = _metadata_path(root, task_dir)
     text = task_file.read_text(encoding="utf-8", errors="replace")
     metadata, body = parse_front_matter(text)
-    metadata["status"] = "done"
-    metadata["workflow_phase"] = "finalized"
-    metadata["phase_entered_at"] = _now_iso_timestamp()
-    metadata["finalized_at"] = _now_iso_timestamp()
-    metadata["finalized_by"] = "tool"
-    metadata["updated_at"] = _now_iso_date()
+    metadata.update(_projected_finalize_metadata())
+    workflow_lock.mark_mutation_started(task_file)
     task_file.write_text(format_front_matter(metadata) + body.lstrip("\n"), encoding="utf-8")
 
 
+def _projected_finalize_metadata() -> dict[str, str]:
+    timestamp = _now_iso_timestamp()
+    return {"status": "done", "workflow_phase": "finalized", "phase_entered_at": timestamp,
+            "finalized_at": timestamp, "finalized_by": "tool", "updated_at": _now_iso_date()}
+
+
 def _build_finalize_preview(root: Path, task_dir: Path) -> list[str]:
-    task_file = _metadata_path(root, task_dir)
-    text = task_file.read_text(encoding="utf-8", errors="replace")
-    metadata, _body = parse_front_matter(text)
-    target_updated = _now_iso_date()
-    preview: list[str] = []
+    metadata = load_task_metadata(task_dir)["metadata"]
     if _is_already_finalized(metadata):
-        return preview
-    preview.append(f"status: {metadata.get('status')} -> done")
-    preview.append(f"workflow_phase: {metadata.get('workflow_phase')} -> finalized")
-    preview.append(f"phase_entered_at: {metadata.get('phase_entered_at')} -> {_now_iso_timestamp()}")
-    preview.append(f"finalized_at: {metadata.get('finalized_at')} -> {_now_iso_timestamp()}")
-    preview.append(f"finalized_by: {metadata.get('finalized_by')} -> tool")
-    preview.append(f"updated_at: {metadata.get('updated_at')} -> {target_updated}")
-    return preview
+        return []
+    return [f"{key}: {metadata.get(key)} -> {value}" for key, value in _projected_finalize_metadata().items()]
 
 
 def _rewrite_task_metadata_file(task_dir: Path, metadata: dict[str, Any]) -> None:
     task_file = task_dir / "task.md"
     text = task_file.read_text(encoding="utf-8", errors="replace")
     _old_metadata, body = parse_front_matter(text)
+    workflow_lock.mark_mutation_started(task_file)
     task_file.write_text(format_front_matter(metadata) + body.lstrip("\n"), encoding="utf-8")
 
 
@@ -5394,6 +5751,7 @@ def transition_command(root: Path, raw_target: str, to_phase: str) -> int:
     metadata["workflow_phase"] = to_phase
     metadata["phase_entered_at"] = _now_iso_timestamp()
     metadata["updated_at"] = _now_iso_date()
+    _preflight_task_update(root, target)
     _rewrite_task_metadata_file(target, metadata)
     _append_evidence_event(
         root,
@@ -5414,6 +5772,7 @@ def transition_command(root: Path, raw_target: str, to_phase: str) -> int:
             "result": "ok",
         },
     )
+    _mutation_observed("succeeded", "applied", {"from": current_phase, "to": to_phase})
     print(f"[INFO] phase transition: {current_phase} -> {to_phase}")
     return 0
 
@@ -5547,8 +5906,10 @@ def record_command(
         event = {"event": "safety_ack_recorded", "summary": str(summary), "kind": kind}
 
     metadata["updated_at"] = _now_iso_date()
+    _preflight_task_update(root, target)
     _rewrite_task_metadata_file(target, metadata)
     _append_evidence_event(root, target, event)
+    _mutation_observed("succeeded", "applied", {"kind": kind, "recorded": True})
     print(f"[INFO] recorded {kind} evidence")
     return 0
 
@@ -5659,6 +6020,7 @@ def create_task(
         )
         return 2
     task_dir = resolve_task_dir(root, selected_date, name)
+    workflow_lock.set_allocated_target(root, task_dir)
     task_id, norm = split_task_dir_name(task_dir)
     if task_id is None or norm is None:
         raise SystemExit(f"ERROR: failed to resolve task directory: {task_dir}")
@@ -5690,6 +6052,7 @@ def create_task(
         "review_final.md": review_final_md(resolved_title),
     }
     index_path = ai_day / "index.md"
+    _preflight_workflow_files(root, index_path, *(task_dir / name for name in files))
     task_dir_existed_before = task_dir.exists()
     index_existed_before = index_path.exists()
     index_before_text = index_path.read_text(encoding="utf-8", errors="replace") if index_existed_before else None
@@ -5716,6 +6079,9 @@ def create_task(
             )
             _print_diagnostics(blockers)
             return 2
+        task_path = rel(root, task_dir)
+        _mutation_observed("succeeded", "applied", {"task_path": task_path, "task_id": task_id}, target=task_path)
+        print(f"Before editing, run: ./aiwf guard --pre-edit --path {shlex.quote(task_path)}")
         return 0
     except BaseException:
         _rollback_failed_task_creation(
@@ -5858,6 +6224,7 @@ def _write_missing_file(root: Path, path: Path, content: str) -> WriteResult:
     safe_write_path(root, path)
     if path.exists():
         return WriteResult(path, "exists")
+    workflow_lock.mark_mutation_started(path)
     ensure_dir(path.parent)
     path.write_text(content.rstrip() + "\n", encoding="utf-8")
     return WriteResult(path, "created")
@@ -6229,14 +6596,22 @@ def check_path(root: Path, raw_target: str, strict: bool, *, finalize_ready: boo
             v11_missing_is_fail=True,
             include_finalize_checks=finalize_ready,
         )
-        err, warn = _print_diagnostics(diagnostics)
+        path = shlex.quote(rel(root, target))
         if finalize_ready:
-            blockers = sum(1 for item in diagnostics if item.blocker and item.severity == "error")
-            print(f"\nSummary: {len(diagnostics)} findings, {err} ERROR, {warn} WARN, {blockers} finalize blockers")
-            exit_code = 2 if blockers > 0 else 0
+            exit_code = _readiness_exit_code(diagnostics)
+            _print_closure_overview(root, target, diagnostics, title="Finalize readiness (read-only)",
+                                    query="check --finalize-ready")
         else:
-            print(f"\nSummary: {len(diagnostics)} findings, {err} ERROR, {warn} WARN")
             exit_code = _diagnostic_exit_code(diagnostics, strict)
+            verdict = {0: "PASS", 1: "WARN (--strict)", 2: "FAIL"}[exit_code]
+            print(f"Task structure and metadata: {verdict}")
+            if exit_code:
+                print("Review the diagnostics below before checking closure readiness.")
+            else:
+                print(f"To assess closure evidence, run: ./aiwf check --path {path} --finalize-ready")
+            print(f"Full diagnostics: ./aiwf query check --path {path}")
+        err, warn = _print_diagnostics(diagnostics, compact=True)
+        print(f"\nSummary: {len(diagnostics)} findings, {err} ERROR, {warn} WARN")
         if finalize_ready:
             _print_read_only_notice()
         else:
@@ -6290,18 +6665,7 @@ def check_path(root: Path, raw_target: str, strict: bool, *, finalize_ready: boo
             )
         )
 
-    fail = warn = 0
-    for f in findings:
-        print(f"{f.severity:5} {f.path}: {f.message}")
-        fail += int(f.severity == "FAIL")
-        warn += int(f.severity == "WARN")
-
-    print(f"\nSummary: {len(findings)} findings, {fail} FAIL, {warn} WARN")
-    if fail:
-        return 2
-    if strict and warn:
-        return 1
-    return 0
+    return _print_structure_findings(findings, strict)
 
 
 def check_command(root: Path, raw_target: Optional[str], strict: bool, finalize_ready: bool) -> int:
@@ -6318,7 +6682,23 @@ def check_command(root: Path, raw_target: Optional[str], strict: bool, finalize_
 
 def guard_command(root: Path, pre_edit: bool, raw_target: Optional[str]) -> int:
     exit_code, output = guard_pre_edit(root, raw_target, pre_edit=pre_edit)
+    _mutation_observed("succeeded" if exit_code == 0 else "blocked", "not_applied", {"allowed": exit_code == 0})
     print(output, end="")
+    return exit_code
+
+
+def _print_structure_findings(findings: Sequence[Finding], strict: bool) -> int:
+    fail = sum(f.severity == "FAIL" for f in findings)
+    warn = sum(f.severity == "WARN" for f in findings)
+    exit_code = 2 if fail else 1 if strict and warn else 0
+    verdict = {0: "PASS", 1: "WARN (--strict)", 2: "FAIL"}[exit_code]
+    print(f"Workflow record structure: {verdict} ({fail} FAIL, {warn} WARN)")
+    if fail or warn:
+        print("Review the paths marked FAIL or WARN below.")
+    print("For task closure readiness, choose a path from ./aiwf list and run ./aiwf check --path <task_path> --finalize-ready.")
+    for f in findings:
+        print(f"{f.severity:5} {f.path}: {f.message}")
+    print(f"\nSummary: {len(findings)} findings, {fail} FAIL, {warn} WARN")
     return exit_code
 
 
@@ -6345,17 +6725,7 @@ def check_repo(root: Path, strict: bool) -> int:
     else:
         findings.append(Finding("WARN", rel(root, knowledge), "knowledge directory missing"))
 
-    fail = warn = 0
-    for f in findings:
-        print(f"{f.severity:5} {f.path}: {f.message}")
-        fail += int(f.severity == "FAIL")
-        warn += int(f.severity == "WARN")
-    print(f"\nSummary: {len(findings)} findings, {fail} FAIL, {warn} WARN")
-    if fail:
-        return 2
-    if strict and warn:
-        return 1
-    return 0
+    return _print_structure_findings(findings, strict)
 
 
 def create_knowledge(root: Path, kind: str, name: str, update_existing: bool) -> int:
@@ -6372,25 +6742,7 @@ def _task_event_log_path(task_dir: Path) -> Path:
 
 
 def _load_events_with_stats(task_dir: Path) -> tuple[list[dict[str, Any]], int]:
-    path = _task_event_log_path(task_dir)
-    if not path.exists():
-        return [], 0
-    events: list[dict[str, Any]] = []
-    malformed_count = 0
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        raw = line.strip()
-        if not raw:
-            continue
-        try:
-            item = json.loads(raw)
-        except json.JSONDecodeError:
-            malformed_count += 1
-            continue
-        if isinstance(item, dict):
-            events.append(item)
-        else:
-            malformed_count += 1
-    return events, malformed_count
+    return _load_jsonl_events_with_stats(_task_event_log_path(task_dir))
 
 
 def _load_events(task_dir: Path) -> list[dict[str, Any]]:
@@ -6403,8 +6755,9 @@ def _append_raw_event(root: Path, task_dir: Path, event: dict[str, Any]) -> None
         return
     event_file = _task_event_log_path(task_dir)
     repo_event_file = get_event_log_path(root)
-    for path in [event_file, repo_event_file]:
-        safe_write_path(root, path)
+    _preflight_workflow_files(root, event_file, repo_event_file)
+    for path in (event_file, repo_event_file):
+        workflow_lock.mark_mutation_started(path)
         ensure_dir(path.parent)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False))
@@ -6639,7 +6992,7 @@ def _dataset_date_from_task_dir(task_dir: Path) -> Optional[str]:
     return _canonical_dataset_date(task_dir.parent.name.replace("ai_", "", 1))
 
 
-def _normalize_repo_relative_path(root: Path, value: Any) -> Optional[str]:
+def _normalize_repo_relative_path(root: Path, value: Any, *, bound_paths: bool = False) -> Optional[str]:
     if not isinstance(value, str):
         return None
     raw = value.strip()
@@ -6649,6 +7002,17 @@ def _normalize_repo_relative_path(root: Path, value: Any) -> Optional[str]:
     candidate = Path(text)
     if not candidate.is_absolute():
         candidate = root / text
+    if bound_paths:
+        # Event task pointers are data. Avoid resolving an unrelated absolute
+        # path merely to decide whether its event belongs to the selected task.
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            return None
+        if ".." in relative.parts:
+            raise ValueError("Cannot project events containing a noncanonical task path.")
+        reject_symlink_components(candidate, root)
+        return relative.as_posix()
     try:
         rel_path = candidate.resolve().relative_to(root.resolve())
     except ValueError:
@@ -6663,28 +7027,35 @@ def _dataset_event_name(event: dict[str, Any]) -> str:
     return name
 
 
-def _load_jsonl_events_with_stats(path: Path) -> tuple[list[dict[str, Any]], int]:
+def _iter_jsonl_events(path: Path) -> Iterable[tuple[int, Optional[dict[str, Any]]]]:
     if not path.exists():
-        return [], 0
+        return
+    # JSON Lines uses LF. NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR are
+    # valid characters inside JSON strings and must survive a round trip.
+    with path.open(encoding="utf-8", errors="replace", newline="\n") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                item = None
+            yield line_number, item if isinstance(item, dict) else None
+
+
+def _load_jsonl_events_with_stats(path: Path) -> tuple[list[dict[str, Any]], int]:
     events: list[dict[str, Any]] = []
     malformed_count = 0
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        raw = line.strip()
-        if not raw:
-            continue
-        try:
-            item = json.loads(raw)
-        except json.JSONDecodeError:
+    for _, item in _iter_jsonl_events(path):
+        if item is None:
             malformed_count += 1
-            continue
-        if not isinstance(item, dict):
-            malformed_count += 1
-            continue
-        events.append(item)
+        else:
+            events.append(item)
     return events, malformed_count
 
 
-def _event_targets_task(root: Path, event: Mapping[str, Any], task_dir: Path) -> bool:
+def _event_targets_task(root: Path, event: Mapping[str, Any], task_dir: Path, *, bound_paths: bool = False) -> bool:
     task_rel = rel(root, task_dir)
     explicit_path_seen = False
     for field_name in ("task_path", "task_dir", "task"):
@@ -6694,7 +7065,7 @@ def _event_targets_task(root: Path, event: Mapping[str, Any], task_dir: Path) ->
             continue
         explicit_path_seen = True
         value = _event_field(event, field_name)
-        normalized = _normalize_repo_relative_path(root, value)
+        normalized = _normalize_repo_relative_path(root, value, bound_paths=bound_paths)
         if normalized is not None:
             if normalized == task_rel:
                 return True
@@ -6758,7 +7129,7 @@ def _format_activity_age(timestamp: Optional[dt.datetime]) -> Optional[str]:
     return " ".join(parts)
 
 
-def build_derived_evidence_summary(root: Path, task_dir: Path) -> dict[str, Any]:
+def build_derived_evidence_summary(root: Path, task_dir: Path, *, bound_paths: bool = False) -> dict[str, Any]:
     metadata_payload = load_task_metadata(task_dir)
     metadata = metadata_payload.get("metadata", {})
     if not isinstance(metadata, Mapping):
@@ -6766,7 +7137,7 @@ def build_derived_evidence_summary(root: Path, task_dir: Path) -> dict[str, Any]
 
     local_events, local_malformed = _load_events_with_stats(task_dir)
     global_events_all, global_malformed = _load_jsonl_events_with_stats(get_event_log_path(root))
-    global_events = [event for event in global_events_all if _event_targets_task(root, event, task_dir)]
+    global_events = [event for event in global_events_all if _event_targets_task(root, event, task_dir, bound_paths=bound_paths)]
     source_events: Sequence[Mapping[str, Any]] = local_events if local_events else global_events
 
     review_events = [event for event in local_events if _event_type(event) == "review_recorded"]
@@ -7172,14 +7543,15 @@ def associate_events_to_task(
 def _dataset_event_inventory(
     root: Path,
     task_dirs: Sequence[Path],
+    *, include_global_events: bool = True,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, str]]]]:
     task_paths = [rel(root, task_dir) for task_dir in task_dirs]
     associated: dict[str, list[dict[str, Any]]] = {task_path: [] for task_path in task_paths}
     warning_map: dict[str, list[dict[str, str]]] = {task_path: [] for task_path in task_paths}
-    indexes = _dataset_task_indexes(root, task_dirs)
+    indexes = _dataset_task_indexes(root, _iter_all_task_dirs(root)) if include_global_events else {}
 
     repo_event_path = get_event_log_path(root)
-    if repo_event_path.exists():
+    if include_global_events and repo_event_path.exists():
         events, malformed_count = _load_jsonl_events_with_stats(repo_event_path)
         unassociated_count = 0
         for event in events:
@@ -7187,7 +7559,8 @@ def _dataset_event_inventory(
             if task_path is None:
                 unassociated_count += 1
                 continue
-            associated[task_path].append(event)
+            if task_path in associated:
+                associated[task_path].append(event)
         if malformed_count > 0:
             for task_path in task_paths:
                 _append_dataset_warning(
@@ -7209,11 +7582,13 @@ def _dataset_event_inventory(
         events, malformed_count = _load_events_with_stats(task_dir)
         unassociated_count = 0
         for event in events:
-            matched_task_path = associate_events_to_task(root, event, indexes)
+            # A local-only export takes the same task-local rows as the packaged event log.
+            matched_task_path = associate_events_to_task(root, event, indexes) if include_global_events else task_path
             if matched_task_path is None:
                 unassociated_count += 1
                 continue
-            associated[matched_task_path].append(event)
+            if matched_task_path in associated:
+                associated[matched_task_path].append(event)
         if malformed_count > 0:
             _append_dataset_warning(
                 warning_map[task_path],
@@ -7329,8 +7704,8 @@ def collect_task_dataset_record(
     return {field: record[field] for field in DATASET_ALLOWED_TASK_FIELDS}
 
 
-def collect_dataset_records_for_task_dirs(root: Path, task_dirs: Sequence[Path]) -> list[dict[str, Any]]:
-    associated_events, warning_map = _dataset_event_inventory(root, task_dirs)
+def collect_dataset_records_for_task_dirs(root: Path, task_dirs: Sequence[Path], *, include_global_events: bool = True) -> list[dict[str, Any]]:
+    associated_events, warning_map = _dataset_event_inventory(root, task_dirs, include_global_events=include_global_events)
     records: list[dict[str, Any]] = []
     for task_dir in task_dirs:
         task_path = rel(root, task_dir)
@@ -7349,9 +7724,10 @@ def collect_dataset_records(root: Path) -> list[dict[str, Any]]:
     return collect_dataset_records_for_task_dirs(root, _iter_all_task_dirs(root))
 
 
-def build_dataset_export_payload(root: Path, task_dirs: Optional[Sequence[Path]] = None) -> dict[str, Any]:
+def build_dataset_export_payload(root: Path, task_dirs: Optional[Sequence[Path]] = None, *, include_global_events: bool = True) -> dict[str, Any]:
     records_root = get_record_root(root)
-    tasks = collect_dataset_records_for_task_dirs(root, task_dirs) if task_dirs is not None else collect_dataset_records(root)
+    tasks = collect_dataset_records_for_task_dirs(root, task_dirs if task_dirs is not None else _iter_all_task_dirs(root),
+                                                 include_global_events=include_global_events)
     return {
         "dataset_version": AIWF_DATASET_SCHEMA_VERSION,
         "generated_at": _now_iso_timestamp(),
@@ -7480,17 +7856,22 @@ def _package_records_result_label(result: Any) -> str:
     }.get(str(result), "UNKNOWN")
 
 
-def _package_records_package_path(records_root: Path, task_dir: Path) -> str:
+def _package_records_package_path(records_root: Path, task_dir: Path, *, legacy: bool) -> str:
     rel_to_records = task_dir.resolve().relative_to(records_root.resolve()).as_posix()
-    return f"records/{rel_to_records}"
+    prefix = "records/legacy" if legacy else "records"
+    return f"{prefix}/{rel_to_records}"
 
 
-def _package_records_discover_tasks(root: Path) -> tuple[list[PackageRecordsTaskCandidate], list[dict[str, str]], list[dict[str, str]]]:
-    records_root = get_record_root(root)
+def _package_records_discover_tasks(
+    root: Path, records_root: Path, *, legacy: bool = False,
+) -> tuple[list[PackageRecordsTaskCandidate], list[dict[str, str]], list[dict[str, str]]]:
+    validate_destination(records_root, root, directory=True)
     candidates: list[PackageRecordsTaskCandidate] = []
     excluded: list[dict[str, str]] = []
     findings: list[dict[str, str]] = []
 
+    if legacy and not records_root.exists():
+        return candidates, excluded, findings
     if not records_root.exists():
         findings.append(
             _package_records_finding(
@@ -7507,8 +7888,10 @@ def _package_records_discover_tasks(root: Path) -> tuple[list[PackageRecordsTask
             continue
         match = AI_DATE_RE.match(day_dir.name)
         if not match:
-            excluded.append({"source_path": source_path, "reason": "invalid_date_dir"})
+            if not legacy:
+                excluded.append({"source_path": source_path, "reason": "invalid_date_dir"})
             continue
+        validate_destination(day_dir, root, directory=True)
         task_date = f"{match.group(1)[0:4]}-{match.group(1)[4:6]}-{match.group(1)[6:8]}"
         for task_dir in sorted(day_dir.iterdir(), key=lambda item: item.name):
             task_source_path = rel(root, task_dir)
@@ -7518,7 +7901,10 @@ def _package_records_discover_tasks(root: Path) -> tuple[list[PackageRecordsTask
                 excluded.append({"source_path": task_source_path, "reason": "invalid_task_dir"})
                 continue
             task_id, task_name = split_task_dir_name(task_dir)
-            package_path = _package_records_package_path(records_root, task_dir)
+            validate_destination(task_dir, root, directory=True)
+            for filename in (*FINALIZE_MANIFEST_FILES, "agent.md", ".aiwf/events.jsonl"):
+                validate_destination(task_dir / filename, root)
+            package_path = _package_records_package_path(records_root, task_dir, legacy=legacy)
             metadata_info = load_task_metadata(task_dir)
             front = metadata_info.get("metadata", {})
             metadata = front if isinstance(front, dict) else {}
@@ -7700,7 +8086,16 @@ def _package_records_select_tasks(
     projects: set[str],
     tags: set[str],
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]], Optional[str]]:
-    candidates, excluded, findings = _package_records_discover_tasks(root)
+    layout = load_aiwf_config(root).layout
+    candidates, excluded, findings = _package_records_discover_tasks(root, root / layout.record_root)
+    # Explicit task selectors share the CLI's readable namespace. An unfiltered
+    # handoff retains the configured-root scope of earlier releases.
+    if task_selectors:
+        for name in layout.readable_records_roots[1:]:
+            other, skipped, diagnostics = _package_records_discover_tasks(root, root / name, legacy=True)
+            candidates.extend(other)
+            excluded.extend(skipped)
+            findings.extend(diagnostics)
     selected_task_paths, selector_error = _package_records_resolve_task_selectors(
         root,
         candidates,
@@ -7910,12 +8305,13 @@ def _package_records_dataset_metadata(
     selected_tasks: Sequence[dict[str, str]],
     *,
     include_dataset: bool,
+    include_global_events: bool,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     if not include_dataset:
         return {"included": False, "warning_count": 0}, []
 
     task_dirs = [(root / task["source_path"]).resolve() for task in selected_tasks if task.get("source_path")]
-    payload = build_dataset_export_payload(root, task_dirs=task_dirs)
+    payload = build_dataset_export_payload(root, task_dirs=task_dirs, include_global_events=include_global_events)
     warnings: list[dict[str, str]] = []
     findings: list[dict[str, str]] = []
     for task in payload.get("tasks", []):
@@ -8135,23 +8531,13 @@ def _package_records_event_field(event: Mapping[str, Any], field_name: str) -> A
 
 
 def _package_records_jsonl_rows(path: Path) -> tuple[list[dict[str, Any]], list[int]]:
-    if not path.exists():
-        return [], []
     events: list[dict[str, Any]] = []
     malformed_lines: list[int] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
-        raw = line.strip()
-        if not raw:
-            continue
-        try:
-            item = json.loads(raw)
-        except json.JSONDecodeError:
+    for line_number, item in _iter_jsonl_events(path):
+        if item is None:
             malformed_lines.append(line_number)
-            continue
-        if isinstance(item, dict):
-            events.append({"event": item, "source_line": line_number})
         else:
-            malformed_lines.append(line_number)
+            events.append({"event": item, "source_line": line_number})
     return events, malformed_lines
 
 
@@ -8198,7 +8584,7 @@ def _package_records_associate_global_event(
             return None, _package_records_finding(
                 "warn",
                 "AIWF-PACKAGE-RECORDS-AMBIGUOUS-EVENT-TASK-ID",
-                f"Global event task_id is ambiguous within selected tasks: {task_id}.",
+                f"Global event task_id is ambiguous across repository tasks: {task_id}.",
             )
         return None, None
 
@@ -8334,6 +8720,9 @@ def _package_records_event_plan(
     if include_global_events:
         global_path = get_event_log_path(root)
         if global_path.exists():
+            all_tasks = [{"source_path": rel(root, path), "task_id": split_task_dir_name(path)[0]}
+                         for path in _iter_all_task_dirs(root)]
+            repository_indexes = _package_records_selected_task_indexes(all_tasks)
             source_rel = rel(root, global_path)
             rows, malformed_lines = _package_records_jsonl_rows(global_path)
             associated_count = 0
@@ -8350,14 +8739,14 @@ def _package_records_event_plan(
             for row in rows:
                 event = row["event"]
                 line_number = int(row["source_line"])
-                task_path, association_finding = _package_records_associate_global_event(root, event, selected_indexes)
+                task_path, association_finding = _package_records_associate_global_event(root, event, repository_indexes)
                 if association_finding is not None:
                     association_finding["path"] = source_rel
                     association_finding["message"] = f"{association_finding['message']} Line {line_number}."
                     findings.append(association_finding)
                     unassociated_count += 1
                     continue
-                if task_path is None:
+                if task_path not in selected_indexes["path"]:
                     unassociated_count += 1
                     findings.append(
                         _package_records_finding(
@@ -8495,6 +8884,11 @@ def _package_records_canonical_events_jsonl(canonical_events: Sequence[dict[str,
     return "".join(f"{line}\n" for line in lines)
 
 
+def _package_records_exclusion_notice(manifest: Mapping[str, Any]) -> str:
+    count = len(manifest.get("excluded_tasks", []))
+    return f"Excluded task paths listed in manifest field excluded_tasks: {count} (includes names and exclusion reasons)."
+
+
 def _package_records_summary_md(manifest: Mapping[str, Any]) -> str:
     validation = manifest.get("validation", {})
     if not isinstance(validation, Mapping):
@@ -8510,6 +8904,7 @@ def _package_records_summary_md(manifest: Mapping[str, Any]) -> str:
             f"- Package type: {manifest.get('package_type', '')}",
             f"- Package version: {manifest.get('package_version', '')}",
             f"- Selected tasks: {len(manifest.get('selected_tasks', []))}",
+            f"- {_package_records_exclusion_notice(manifest)}",
             f"- Artifact files: {len(manifest.get('artifacts', {}).get('included', [])) if isinstance(manifest.get('artifacts'), Mapping) else 0}",
             f"- Canonical events: {manifest.get('events', {}).get('canonical_event_count', 0) if isinstance(manifest.get('events'), Mapping) else 0}",
             f"- Dataset included: {manifest.get('dataset', {}).get('included', False) if isinstance(manifest.get('dataset'), Mapping) else False}",
@@ -8517,10 +8912,12 @@ def _package_records_summary_md(manifest: Mapping[str, Any]) -> str:
             f"- Package Generation: {_package_records_result_label(validation.get('package_generation', {}).get('result') if isinstance(validation.get('package_generation'), Mapping) else '')}",
             f"- Manifest Schema: {_package_records_result_label(validation.get('manifest_schema', {}).get('result') if isinstance(validation.get('manifest_schema'), Mapping) else '')}",
             f"- Package Integrity: {_package_records_result_label(validation.get('package_integrity', {}).get('result') if isinstance(validation.get('package_integrity'), Mapping) else '')}",
-            f"- Privacy/Security: {_package_records_result_label(validation.get('privacy_security', {}).get('result') if isinstance(validation.get('privacy_security'), Mapping) else '')}",
+            f"- Built-in privacy checks: {_package_records_result_label(_package_records_manifest_status_result(validation, 'privacy_security'))} (secret patterns in selected artifacts and prohibited files)",
             f"- Workflow Evidence Findings: {_package_records_result_label(workflow_evidence.get('result', validation.get('result', '')))} ({workflow_finding_count} workflow evidence findings discovered)",
             "",
             "Workflow evidence findings are discovered while inspecting historical source workflow records. They do not by themselves mean package generation failed.",
+            "Before sharing, check task_inventory.csv and artifact_inventory.tsv, then review the included documents and events for confidential project content.",
+            "Review package_manifest.json as well. Share the package only with recipients authorized to see the task names it lists.",
             "",
         ]
     )
@@ -8588,7 +8985,8 @@ def _package_records_package_files(
     dataset = manifest.get("dataset")
     if isinstance(dataset, Mapping) and dataset.get("included") is True:
         dataset_path = normalize_package_path(str(dataset.get("path", AIWF_PACKAGE_RECORDS_DATASET_PATH)))
-        dataset_payload = build_dataset_export_payload(root, task_dirs=_package_records_selected_task_dirs(root, selected_tasks))
+        dataset_payload = build_dataset_export_payload(root, _package_records_selected_task_dirs(root, selected_tasks),
+                                                       include_global_events=include_global_events)
         dataset_payload["generated_at"] = "1970-01-01T00:00:00Z"
         files[dataset_path] = stable_json_dump(dataset_payload).encode("utf-8")
 
@@ -9018,7 +9416,8 @@ def _package_records_print_status(
         file=stream,
     )
     print(
-        f"Privacy/Security: {_package_records_result_label(privacy_security or _package_records_manifest_status_result(validation, 'privacy_security'))}",
+        f"Built-in privacy checks: {_package_records_result_label(privacy_security or _package_records_manifest_status_result(validation, 'privacy_security'))} "
+        "(secret patterns in selected artifacts and prohibited files)",
         file=stream,
     )
     print(
@@ -9052,6 +9451,7 @@ def _package_records_manifest(
         root,
         selected_tasks,
         include_dataset=include_dataset,
+        include_global_events=include_global_events,
     )
     findings.extend(dataset_findings)
     findings.extend(
@@ -9157,16 +9557,31 @@ def _package_records_safe_output_path(
     target = Path(raw_output)
     if not target.is_absolute():
         target = root / target
+    if target.is_symlink():
+        return None, "refusing to replace a symbolic link as package output"
     target = target.resolve()
+    for protected in (root / ".aiwf", root / ".git", root / "aiwf", root / "AGENTS.md"):
+        if target.is_relative_to(protected) or protected.is_relative_to(target):
+            return None, f"refusing to write package output over project files: {rel(root, target)}"
     if target.exists() and not force:
         return None, f"refusing to overwrite existing output path: {target}"
 
     records_root = get_record_root(root)
+    if root.is_relative_to(target) or records_root.is_relative_to(target):
+        return None, "refusing to replace the project or an ancestor of its workflow records"
+    for name in load_aiwf_config(root).layout.readable_records_roots[1:]:
+        legacy_root = root / name
+        if legacy_root.is_relative_to(target):
+            return None, "refusing to replace the legacy records root or its parent"
+        if target.is_relative_to(legacy_root):
+            parts = target.relative_to(legacy_root).parts
+            if parts and AI_DATE_RE.fullmatch(parts[0]):
+                return None, f"refusing to write inside legacy workflow records: {rel(root, target)}"
     if _package_records_is_under(target, records_root):
         return None, f"refusing to write package records output inside workflow records: {rel(root, target)}"
 
     events_root = get_event_log_path(root).parent
-    if _package_records_is_under(target, events_root):
+    if _package_records_is_under(target, events_root) or events_root.is_relative_to(target):
         return None, f"refusing to write package records output inside workflow events: {rel(root, target)}"
 
     for task in selected_tasks:
@@ -9180,15 +9595,56 @@ def _package_records_safe_output_path(
     return target, None
 
 
-def _package_records_prepare_output_path(output_path: Path, *, force: bool) -> None:
-    if not output_path.exists():
+def _publish_records_output(output: Path, staged: Path, *, force: bool) -> None:
+    if output.is_symlink():
+        raise ValueError("refusing to replace a symbolic link as package output")
+    if not output.exists():
+        if os.name == "nt":
+            staged.rename(output)  # Windows refuses an existing destination.
+        elif staged.is_file():
+            os.link(staged, output)  # Atomically claim the path without overwriting another writer.
+        else:
+            output.mkdir()
+            try:
+                staged.replace(output)
+            except OSError:
+                output.rmdir()
+                raise
         return
     if not force:
-        raise SystemExit(f"ERROR: refusing to overwrite existing output path: {output_path}")
-    if output_path.is_dir() and not output_path.is_symlink():
-        shutil.rmtree(output_path)
-    else:
-        output_path.unlink()
+        raise ValueError(f"refusing to overwrite existing output path: {output}")
+    if staged.is_file() and output.is_file():
+        staged.replace(output)
+        return
+    if not (staged.is_dir() and output.is_dir()):
+        raise ValueError("Existing output has a different type. Choose a new path for this format.")
+    if any(output.iterdir()):
+        previous_manifest = output / "package_manifest.json"
+        try:
+            validate_destination(previous_manifest, output)
+            validate_destination(output / "integrity/package_identity.json", output)
+            previous = json.loads(previous_manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = None
+        if (not isinstance(previous, dict) or previous.get("package_type") != "aiwf-package-records"
+                or not (output / "integrity/package_identity.json").is_file()):
+            raise ValueError("Refusing to replace a nonempty directory that is not an AIWF records package. Choose a new output directory.")
+    # Keep the previous package until its replacement is complete. An interrupted
+    # directory swap leaves the previous package in a named sibling for recovery.
+    backup_dir = Path(tempfile.mkdtemp(prefix=f".{output.name}-previous-", dir=output.parent))
+    backup = backup_dir / "package"
+    try:
+        output.rename(backup)
+        try:
+            staged.rename(output)
+        except OSError:
+            if not output.exists():
+                backup.rename(output)
+            raise
+    finally:
+        if not backup.exists():
+            backup_dir.rmdir()
+    shutil.rmtree(backup_dir)
 
 
 def _package_records_parse_filters(options: argparse.Namespace) -> tuple[Optional[str], Optional[str], set[str], Optional[int]]:
@@ -9359,35 +9815,42 @@ def package_records_command(root: Path, options: argparse.Namespace) -> int:
         print("ERROR: --strict rejected workflow evidence findings", file=sys.stderr)
         return 2
 
-    if options.dry_run:
+    try:
         ensure_dir(output_path.parent)
-        output_path.write_text(stable_json_dump(manifest), encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix=".aiwf-package-", dir=output_path.parent) as workspace:
+            staged = Path(workspace) / "new"
+            if options.dry_run:
+                staged.write_text(stable_json_dump(manifest), encoding="utf-8")
+            else:
+                package_files = _package_records_package_files(
+                    root, manifest, selected_tasks, redaction_profile=options.redaction_profile or "safe",
+                    include_global_events=not bool(options.task_local_events_only),
+                )
+                if options.format == "directory":
+                    _package_records_write_directory(staged, package_files)
+                else:
+                    _package_records_write_zip(staged, package_files)
+            _publish_records_output(output_path, staged, force=bool(options.force))
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: could not publish records package: {exc}", file=sys.stderr)
+        return 2
+
+    if options.dry_run:
+        print(f"Manifest preview. Selected tasks: {len(selected_tasks)}")
+        print(_package_records_exclusion_notice(manifest))
         _package_records_print_status(manifest)
         print(f"WROTE  {_package_records_manifest_output_label(root, output_path)}")
+        print("Review selected_tasks and artifacts.included in this manifest before creating a package.")
         return 0
 
-    package_files = _package_records_package_files(
-        root,
-        manifest,
-        selected_tasks,
-        redaction_profile=options.redaction_profile or "safe",
-        include_global_events=not bool(options.task_local_events_only),
-    )
-    try:
-        _package_records_prepare_output_path(output_path, force=bool(options.force))
-    except SystemExit as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    output_format = options.format or "zip"
-    if output_format == "directory":
-        _package_records_write_directory(output_path, package_files)
-    elif output_format == "zip":
-        _package_records_write_zip(output_path, package_files)
-    else:
-        print(f"ERROR: unsupported package records format: {output_format}", file=sys.stderr)
-        return 2
+    print(f"Selected tasks: {len(selected_tasks)} (redaction profile: {manifest['redaction_profile']})")
+    print(_package_records_exclusion_notice(manifest))
     _package_records_print_status(manifest)
     print(f"WROTE  {_package_records_manifest_output_label(root, output_path)}")
+    print("Before sharing, check task_inventory.csv and artifact_inventory.tsv inside the package, "
+          "then review the included documents and events for confidential project content.")
+    print("Review package_manifest.json as well. Share the package only with recipients authorized to see the task names it lists.")
+    print("To select a single task, use --task <task-path>.")
     return 0
 
 
@@ -9434,11 +9897,11 @@ def list_command(
             continue
         filtered.append(task)
 
-    print("task_id | status | workflow_phase | review_status | task_name")
+    print("task_id | status | workflow_phase | review_status | task_name | task_path")
     for task in filtered:
         print(
             f"{task.get('task_id', '')} | {task.get('status', '')} | "
-            f"{task.get('workflow_phase', '')} | {task.get('review_status', '')} | {task.get('task_name', '')}"
+            f"{task.get('workflow_phase', '')} | {task.get('review_status', '')} | {task.get('task_name', '')} | {task['path']}"
         )
     print(f"\nTotal: {len(filtered)}")
     return 0
@@ -10213,6 +10676,7 @@ def sync_index_command(root: Path, raw_target: str) -> int:
     try:
         result = _sync_index_entry_status(root, target)
     except SyncIndexError as exc:
+        _observe_diagnostic(Diagnostic("error", exc.code, rel(root, target), str(exc), "", True))
         print(f"[ERROR] {exc.code}")
         print(f"{rel(root, target)}: {exc}")
         print("Suggested Fix:")
@@ -10224,10 +10688,18 @@ def sync_index_command(root: Path, raw_target: str) -> int:
         print("Suggested Fix:")
         print(f"Run: ./aiwf sync-index --path {rel(root, target)}")
         return 2
+    _mutation_observed("succeeded", "applied" if result.action == "updated" else "already_applied", {"action": result.action})
     print(f"[INFO] AIWF-SYNC-OK")
     print(f"{rel(root, result.path)}: {DIAGNOSTICS['AIWF-SYNC-OK']['message']}")
     print(f"Result: {result.action.upper()}")
     return 0
+
+
+def _doctor_projection(root: Path, target: Path, *, bound_paths: bool = False) -> tuple[list[Diagnostic], dict]:
+    diagnostics = _collect_task_diagnostics(root, target, v11_missing_is_fail=True, include_finalize_checks=True)
+    summary = build_derived_evidence_summary(root, target, bound_paths=bound_paths)
+    diagnostics.extend(_collect_derived_evidence_diagnostics(root, target, summary))
+    return diagnostics, summary
 
 
 def doctor_command(root: Path, raw_target: str) -> int:
@@ -10240,17 +10712,10 @@ def doctor_command(root: Path, raw_target: str) -> int:
         print("Suggested Fix:")
         print(DIAGNOSTICS["AIWF-DOCTOR-001"]["suggested_fix"])
         return 2
-    diagnostics = _collect_task_diagnostics(
-        root,
-        target,
-        v11_missing_is_fail=True,
-        include_finalize_checks=True,
-    )
-    derived_summary = build_derived_evidence_summary(root, target)
-    diagnostics.extend(_collect_derived_evidence_diagnostics(root, target, derived_summary))
-    err, warn = _print_diagnostics(diagnostics)
-    blockers = sum(1 for item in diagnostics if item.blocker and item.severity == "error")
-    print(f"\nSummary: {len(diagnostics)} findings, {err} ERROR, {warn} WARN, {blockers} finalize blockers")
+    diagnostics, derived_summary = _doctor_projection(root, target)
+    _print_closure_overview(root, target, diagnostics, title="Doctor (closure readiness)", query="diagnostics")
+    err, warn = _print_diagnostics(diagnostics, compact=True)
+    print(f"\nSummary: {len(diagnostics)} findings, {err} ERROR, {warn} WARN")
     _print_derived_evidence_summary(derived_summary)
     exit_code = 2 if err else 0
     _try_append_aiwf_event(root, target, command="doctor", exit_code=exit_code, diagnostics=diagnostics)
@@ -10274,7 +10739,9 @@ def finalize_command(root: Path, raw_target: str, dry_run: bool = False) -> int:
         v11_missing_is_fail=True,
         include_finalize_checks=True,
     )
-    err, warn = _print_diagnostics(diagnostics)
+    _print_closure_overview(root, target, diagnostics, title="Finalize preview (read-only)" if dry_run else "Finalize preflight",
+                            query="check --preview" if dry_run else "check --finalize-ready", applying=not dry_run)
+    err, warn = _print_diagnostics(diagnostics, compact=True)
     blockers = [item for item in diagnostics if item.blocker and item.severity == "error"]
     if blockers:
         print(f"\nSummary: {len(diagnostics)} findings, {err} ERROR, {warn} WARN, {len(blockers)} finalize blockers")
@@ -10289,6 +10756,10 @@ def finalize_command(root: Path, raw_target: str, dry_run: bool = False) -> int:
                 diagnostics=diagnostics,
                 extra_result={"blocked": True},
             )
+            if _MUTATION_RECEIPT.get() is not None:
+                from lib.workflow_lock import mutation_started
+                audit = mutation_started()
+                _mutation_observed("blocked", "applied" if audit else "not_applied", {"finalized": False, "audit_written": audit})
         return 2
 
     metadata_payload = load_task_metadata(target).get("metadata", {})
@@ -10320,12 +10791,14 @@ def finalize_command(root: Path, raw_target: str, dry_run: bool = False) -> int:
             diagnostics=diagnostics,
             extra_result={"already_finalized": True},
         )
+        _mutation_observed("succeeded", "already_applied", {"finalized": True})
         return 0
 
     task_file = _metadata_path(root, target)
     original_task_text = task_file.read_text(encoding="utf-8", errors="replace")
     previous_phase = str(metadata_payload.get("workflow_phase", ""))
     preview = _build_finalize_preview(root, target)
+    _preflight_task_update(root, target, target.parent / "index.md")
     _finalize_task_metadata(root, target)
     try:
         index_sync = _sync_index_entry_status(root, target)
@@ -10389,33 +10862,425 @@ def finalize_command(root: Path, raw_target: str, dry_run: bool = False) -> int:
         v11_missing_is_fail=True,
         include_finalize_checks=False,
     )
-    err2, warn2 = _print_diagnostics(refreshed)
+    err2, warn2 = _print_diagnostics(refreshed, compact=True)
     print(f"\nSummary: {len(refreshed)} findings, {err2} ERROR, {warn2} WARN")
     exit_code = 0 if err2 == 0 else 2
     _try_append_aiwf_event(root, target, command="finalize", exit_code=exit_code, diagnostics=refreshed)
+    if exit_code:
+        from lib.workflow_lock import require_reconciliation
+        require_reconciliation()
+        _mutation_observed("failed", "partially_applied", {"finalized": True})
+    else:
+        _mutation_observed("succeeded", "applied", {"finalized": True})
     return exit_code
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AI Workflow deterministic governance helper")
-    parser.add_argument("--repo-root", default=None, help="repository root; defaults to upward search from cwd")
-    sub = parser.add_subparsers(dest="command", required=True)
+def emit_query_result(operation: str, rc: int, result: Optional[dict], *, code: str = "", message: str = "") -> int:
+    print(json.dumps({
+        "contract_version": QUERY_CONTRACT_VERSION, "operation": operation, "exit_code": rc,
+        "execution": "error" if code else "ok", "result": result,
+        "error": {"code": code, "message": message} if code else None,
+    }, ensure_ascii=False, allow_nan=False))
+    return rc
 
-    p = sub.add_parser("new-task", help="create a new AI work record task directory")
-    p.add_argument("name")
-    p.add_argument("--date", default=None)
-    p.add_argument("--update-existing", action="store_true")
-    p.add_argument("--title", default=None)
-    p.add_argument("--priority", choices=sorted(ALLOWED_PRIORITY), default=None)
-    p.add_argument("--risk", choices=sorted(ALLOWED_RISK), default=None)
-    p.add_argument("--project", default=None)
-    p.add_argument("--parent-task", default=None)
-    p.add_argument("--related-task", action="append", default=[])
-    p.add_argument("--blocked-by", action="append", default=[])
-    p.add_argument("--supersedes", action="append", default=[])
-    p.add_argument("--tag", action="append", default=[])
-    p.add_argument("--related-file", action="append", default=[])
-    p.add_argument("--allow-non-today-date", action="store_true")
+
+def _query_path(root: Path, raw: str, *, directory: bool = False) -> Path:
+    path = Path(raw)
+    if (not raw or path.is_absolute() or raw != path.as_posix() or raw == "."
+            or ".." in path.parts or "\\" in raw or ":" in raw):
+        raise ValueError("Expected a canonical repository-relative path.")
+    target = root / path
+    reject_symlink_components(target, root)
+    if workflow_lock.participating():
+        workflow_lock.verify_path(root, target)
+    try:
+        mode = target.lstat().st_mode
+    except FileNotFoundError:
+        return target
+    if not (stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)):
+        raise ValueError("Unexpected file type for a query input.")
+    return target
+
+
+def _query_layout(root: Path) -> AIWFLayoutConfig:
+    config = _query_path(root, ".aiwf/config.yaml")
+    # Reject noncanonical paths before the legacy loader normalizes the spelling.
+    if config.exists():
+        raw = _parse_aiwf_layout_config(config.read_text(encoding="utf-8"))
+        for key in ("records_root", "record_root", "docs_root", "event_log"):
+            if key in raw:
+                _query_path(root, raw[key], directory=key != "event_log")
+    layout = load_aiwf_config(root).layout
+    _query_path(root, layout.record_root, directory=True)
+    _query_path(root, layout.event_log)
+    if workflow_lock.participating():
+        workflow_lock.verify_path(root, root / layout.record_root)
+        workflow_lock.verify_path(root, root / layout.event_log)
+    return layout
+
+
+def _query_task(root: Path, raw: Optional[str], *records_roots: str) -> Path:
+    if not raw:
+        raise ValueError("A task path is required. Run ./aiwf query list and pass the task_path value to --path.")
+    target = _query_path(root, raw, directory=True)
+    if (target.parent.parent not in (root / name for name in records_roots) or not AI_DATE_RE.fullmatch(target.parent.name)
+            or not TASK_DIR_RE.fullmatch(target.name) or not target.is_dir()):
+        raise ValueError("Expected an existing dated task under an allowed records root. Find its path with ./aiwf query list.")
+    # Inspect exactly the namespace consumed by the legacy readers. The manifest
+    # reader hashes only the fixed FINALIZE_MANIFEST_FILES, never event-supplied paths.
+    _query_path(root, (target.parent / "index.md").relative_to(root).as_posix())
+    for sibling in target.parent.iterdir():
+        reject_symlink_components(sibling, root)
+    for path in target.glob("*.md"):
+        _query_path(root, path.relative_to(root).as_posix())
+    _query_path(root, (target / ".aiwf/events.jsonl").relative_to(root).as_posix())
+    corrections = _query_path(root, (target / CORRECTION_DIRNAME).relative_to(root).as_posix(), directory=True)
+    if corrections.exists():
+        for path in corrections.iterdir():
+            _query_path(root, path.relative_to(root).as_posix())
+    return target
+
+
+def _query_list_candidates(root: Path, layout: AIWFLayoutConfig) -> Iterable[Path]:
+    for name in layout.readable_records_roots:
+        records = root / name
+        for day in sorted(records.iterdir()) if records.exists() else ():
+            if not AI_DATE_RE.fullmatch(day.name) or stat.S_ISREG(day.lstat().st_mode):
+                continue
+            _query_path(root, day.relative_to(root).as_posix(), directory=True)
+            for task in sorted(day.iterdir()):
+                if not TASK_DIR_RE.fullmatch(task.name) or stat.S_ISREG(task.lstat().st_mode):
+                    continue
+                _query_path(root, task.relative_to(root).as_posix(), directory=True)
+                _query_path(root, (task / "task.md").relative_to(root).as_posix())
+                yield task
+
+
+def _query_task_list(root: Path, layout: AIWFLayoutConfig, options) -> dict[str, Any]:
+    selectors = {field: getattr(options, field) for field in ("status", "review_status", "workflow_phase")}
+    diagnostics = _validate_selector_values(command="list", selectors=selectors)
+    if diagnostics:
+        raise ValueError(diagnostics[0].message)
+    date_filter = None
+    if options.date is not None:
+        date_filter = dt.datetime.strptime(parse_aiwf_date_arg(options.date), "%Y%m%d").date().isoformat()
+    limit = 100 if options.limit is None else options.limit
+    if not 1 <= limit <= 100:
+        raise ValueError("List limit must be between 1 and 100.")
+    rows = []
+    for task in _query_list_candidates(root, layout):
+        front = load_task_metadata(task).get("metadata", {})
+        date = (_canonical_dataset_date(front.get("created_at")) or _canonical_dataset_date(front.get("date"))
+                or _dataset_date_from_task_dir(task))
+        if date_filter and date != date_filter or any(v and front.get(k) != v for k, v in selectors.items()):
+            continue
+        if len(rows) == limit:
+            return {"tasks": rows, "limit": limit, "truncated": True}
+        task_id, name = split_task_dir_name(task)
+        rows.append({"task_path": task.relative_to(root).as_posix(), "task_id": task_id, "task_name": name,
+                     **{k: str(front.get(k) or "") for k in ("title", *selectors)}})
+    return {"tasks": rows, "limit": limit, "truncated": False}
+
+
+def query_command(root: Path, operation: str, raw_target: Optional[str], finalize_ready: bool, options=None) -> int:
+    try:
+        preview = bool(options and options.preview)
+        full = bool(options and options.full_workflow)
+        if (finalize_ready or preview) and operation != "check":
+            raise ValueError("Readiness and preview apply only to check.")
+        if full and operation != "context":
+            raise ValueError("--full-workflow applies only to context.")
+        if options and operation != "list" and any(getattr(options, key) is not None for key in
+                                                   ("limit", "date", "workflow_phase", "status", "review_status")):
+            raise ValueError("Task list filters apply only to list.")
+        layout = _query_layout(root)
+        if full or operation != "context":
+            # The layout check verifies the write root. Verify any additional
+            # readable root before advertising it or enumerating tasks.
+            for name in layout.readable_records_roots[1:]:
+                _query_path(root, name, directory=True)
+        if operation == "context":
+            if raw_target is not None:
+                raise ValueError("Context does not accept a task path.")
+            installed = _query_path(root, ".aiwf/bin/ai_workflow.py")
+            if installed != Path(__file__).resolve():
+                raise ValueError("The executing runtime does not belong to this repository.")
+            helper = _query_path(root, ".aiwf/bin/guidance.py")
+            guidance = (helper.is_file() and importlib.util.find_spec("yaml") is not None
+                        and "GUIDANCE_QUERY_CONTRACT_VERSION = 1" in helper.read_text(encoding="utf-8").splitlines())
+            result = {
+                "tool_version": AIWF_TOOL_VERSION, "protocol_version": WORKFLOW_PROTOCOL_VERSION,
+                "records_root": layout.record_root, "capabilities": {
+                    "inspect": True, "check": True, "diagnostics": True, "guidance": guidance,
+                    "write_operations": False,
+                },
+            }
+            if full:
+                result["readable_records_roots"] = list(layout.readable_records_roots)
+                root_writable = workflow_lock.mutation_root_writable(root)
+                operations = list(MUTATION_OPERATIONS) if root_writable else []
+                if operations:
+                    try:
+                        _preflight_workflow_files(root, root / layout.event_log)
+                    except (OSError, ValueError):
+                        operations = [op for op in operations if op not in {"transition", "record", "finalize"}]
+                result.update(mutation_contract_version=MUTATION_CONTRACT_VERSION,
+                              mutation_root_writable=root_writable,
+                              mutation_operations=operations)
+                result["capabilities"].update(list=True, finalize_preview=True)
+            return emit_query_result(operation, 0, result)
+        if operation == "list":
+            if raw_target is not None:
+                raise ValueError("List does not accept a task path.")
+            return emit_query_result(operation, 0, _query_task_list(root, layout, options))
+        target = _query_task(root, raw_target, *layout.readable_records_roots)
+        if operation == "inspect":
+            result, diagnostics = _inspect_projection(root, target, load_task_metadata(target)["metadata"])
+            if diagnostics:
+                return emit_query_result(operation, 2, None, code=diagnostics[0].code, message=diagnostics[0].message)
+            return emit_query_result(operation, 0, result)
+        result = {"task_path": raw_target}
+        if operation == "diagnostics":
+            diagnostics, result["derived_evidence"] = _doctor_projection(root, target, bound_paths=True)
+            rc = _diagnostic_exit_code(diagnostics, strict=False)
+        else:
+            diagnostics = _collect_task_diagnostics(root, target, v11_missing_is_fail=True, include_finalize_checks=finalize_ready or preview)
+            rc = _readiness_exit_code(diagnostics) if finalize_ready or preview else _diagnostic_exit_code(diagnostics, strict=False)
+            result.update(mode="finalize_readiness" if finalize_ready else "standard", workflow_result="BLOCKED" if rc else "PASS")
+            if preview:
+                finalized = _is_already_finalized(load_task_metadata(target)["metadata"])
+                result.update(mode="finalize_preview", already_finalized=finalized,
+                              projected_metadata=None if rc else {} if finalized else _projected_finalize_metadata())
+        result["diagnostics"] = [asdict(item) for item in diagnostics]
+        return emit_query_result(operation, rc, result)
+    except (OSError, SystemExit):
+        return emit_query_result(operation, 2, None, code="AIWF-QUERY-001",
+                                 message="Could not read the repository layout or query inputs.")
+    except ValueError as exc:
+        return emit_query_result(operation, 2, None, code="AIWF-QUERY-001", message=str(exc))
+
+
+def _mutation_envelope(operation, target=None):
+    return {
+        "contract_version": MUTATION_CONTRACT_VERSION, "operation": operation,
+        "operation_status": "rejected", "mutation_state": "not_applied",
+        "runtime_exit_code": None, "target": target, "diagnostics": [],
+        "requires_reconciliation": False, "result": None,
+    }
+
+
+def _emit_mutation(receipt, rc):
+    receipt["runtime_exit_code"] = rc
+    print(json.dumps(receipt, ensure_ascii=False, allow_nan=False))
+    return rc
+
+
+def emit_mutation_lock_error(args, exc):
+    receipt = _mutation_envelope(args.operation)
+    receipt.update(operation_status=exc.operation_status, mutation_state=exc.mutation_state,
+                   requires_reconciliation=exc.requires_reconciliation)
+    receipt["diagnostics"].append({"code": exc.code, "severity": "error", "message": exc.message})
+    return _emit_mutation(receipt, 2)
+
+
+def _single_line_metadata(text: str) -> bool:
+    return all(ord(char) >= 32 and not 127 <= ord(char) <= 159
+               and char not in "\u2028\u2029" for char in text)
+
+
+def _mutation_inputs(root, args):
+    layout = _query_layout(root)
+    installed = _query_path(root, ".aiwf/bin/ai_workflow.py")
+    if installed != Path(__file__).resolve():
+        raise ValueError("Use the runtime installed in the bound repository.")
+    # Event writers load project configuration and the selected metadata profile.
+    for name in (".env", ".aiwf/metadata.current", ".aiwf/metadata.local.env"):
+        _query_path(root, name)
+    profile = _active_metadata_profile_name(root)
+    if profile:
+        _query_path(root, f".aiwf/metadata_profiles/{profile}.env")
+    if args.operation == "new-task":
+        if args.update_existing or args.allow_non_today_date:
+            raise ValueError("Mutation new-task is create-only and uses the current date.")
+        fields = [args.name, args.title, args.project, args.parent_task, *args.related_task, *args.blocked_by,
+                  *args.supersedes, *args.tag, *args.related_file]
+        if any(not _single_line_metadata(value) for value in fields if value):
+            raise ValueError("Task metadata fields must be single-line text.")
+        selected = parse_aiwf_date_arg(args.date) if args.date else today()
+        args.date = selected
+        day = _query_path(root, f"{layout.record_root}/ai_{selected}", directory=True)
+        _query_path(root, (day / "index.md").relative_to(root).as_posix())
+        if day.is_dir():
+            for entry in day.iterdir():
+                reject_symlink_components(entry, root)
+        return None
+    if args.operation == "guard" and not args.pre_edit:
+        raise ValueError("Guard requires pre-edit mode.")
+    if args.operation == "finalize" and args.dry_run:
+        raise ValueError("Use query check --preview for a read-only preview.")
+    target = _query_task(root, args.path, layout.record_root)
+    if args.operation == "correct-finalized":
+        if any(not _single_line_metadata(value) for value in (args.current_state, args.reason) if value):
+            raise ValueError("Correction metadata requires single-line text.")
+    if args.operation == "record" and args.kind == "review":
+        # The native serializer projects these specific fields into line-oriented metadata.
+        if args.reviewer and not _single_line_metadata(args.reviewer):
+            raise ValueError("Reviewer must be a single-line value.")
+        if args.result == "not_required" and args.summary and not _single_line_metadata(args.summary):
+            raise ValueError("A review waiver needs a single-line reason.")
+    if args.operation == "record" and args.agent_channel and args.kind == "review":
+        if args.decision_authority not in {"ai-agent", "not_required"} or args.reviewer != "ai-agent":
+            raise ValueError("This channel records agent review only.")
+        if args.result == "not_required":
+            meta = load_task_metadata(target).get("metadata", {})
+            if _task_required_review_authority(meta) != "ai-agent" or not _has_non_empty_text(args.summary):
+                raise ValueError("The declared review policy does not allow this waiver.")
+    return args.path
+
+
+def mutation_command(args, root):
+    # main() holds the shared writer lock from fresh validation through this
+    # receipt. The legacy action owns the actual decisions, writes and evidence.
+    from lib.workflow_lock import mutation_started, require_reconciliation
+
+    receipt = _mutation_envelope(args.operation)
+    token = _MUTATION_RECEIPT.set(receipt)
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as sink, redirect_stdout(sink):
+            receipt["target"] = _mutation_inputs(root, args)
+            rc = args.native_handler(args, root)
+        if receipt["operation_status"] == "rejected":
+            if rc == 0 or mutation_started():
+                receipt.update(operation_status="failed", mutation_state="unknown", requires_reconciliation=True)
+                require_reconciliation()
+                rc = 2
+            elif args.operation in {"finalize", "transition", "sync-index", "correct-finalized"} or any(
+                d["code"] == "AIWF-FINALIZED-002" for d in receipt["diagnostics"]
+            ):
+                receipt["operation_status"] = "blocked"
+        if rc and not receipt["diagnostics"]:
+            message = "The runtime rejected this operation or its inputs."
+            if args.operation == "record":
+                message += " " + RECORD_INPUT_HELP[args.kind]
+            receipt["diagnostics"].append({"code": "AIWF-MUTATION-INPUT", "severity": "error",
+                                           "message": message})
+    except (OSError, ValueError, SystemExit) as exc:
+        rc = 2
+        if mutation_started():
+            require_reconciliation()
+            receipt.update(operation_status="failed", mutation_state="unknown", requires_reconciliation=True)
+        receipt["diagnostics"].append({"code": "AIWF-MUTATION-ERROR", "severity": "error",
+                                       "message": "A workflow write may be incomplete." if mutation_started()
+                                       else str(exc) if isinstance(exc, ValueError) else "Cannot access the bound inputs."})
+    finally:
+        _MUTATION_RECEIPT.reset(token)
+    if receipt["mutation_state"] in {"partially_applied", "unknown"}:
+        receipt["requires_reconciliation"] = True
+    return _emit_mutation(receipt, rc)
+
+
+QUERY_HELP = {
+    "context": ("Show the installed tool version, records root and capabilities.", "--full-workflow"),
+    "inspect": ("Show one task's historical closure and effective state.", "--path TASK_PATH"),
+    "check": ("Check one task, evaluate closure readiness or preview finalization.", "--path TASK_PATH --preview"),
+    "diagnostics": ("Show one task's diagnostics and derived evidence.", "--path TASK_PATH"),
+    "list": ("Find task paths by exact metadata values.", "--workflow-phase review --limit 10"),
+}
+
+
+def _add_query_options(parser, operation=None, *, identify_only=False):
+    # On a syntax error identify only the positional operation, even if an option
+    # has an invalid/missing value or conflicts with another option.
+    value_args = {"nargs": "?"} if identify_only else {}
+    if operation in (None, "inspect", "check", "diagnostics"):
+        parser.add_argument("--path", required=operation is not None, **value_args,
+                            help="full repository-relative task path from ./aiwf query list")
+    if operation in (None, "check"):
+        mode = parser if identify_only else parser.add_mutually_exclusive_group()
+        mode.add_argument("--finalize-ready", action="store_true", help="check closure readiness")
+        mode.add_argument("--preview", action="store_true", help="preview the metadata changes from finalize")
+    if operation in (None, "context"):
+        parser.add_argument("--full-workflow", action="store_true", help="include workflow roots and mutation capabilities")
+    if operation in (None, "list"):
+        parser.add_argument("--date", **value_args, help="filter by task date (YYYYMMDD)")
+        for flag, values in (("--status", ALLOWED_STATUS), ("--workflow-phase", ALLOWED_WORKFLOW_PHASE),
+                             ("--review-status", ALLOWED_REVIEW_STATUS)):
+            parser.add_argument(flag, **value_args, help="exact match: " + ", ".join(sorted(values)))
+        parser.add_argument("--limit", type=None if identify_only else int, **value_args,
+                            help="maximum tasks to return, 1 through 100 (default: 100)")
+
+
+class _QueryHelp(argparse.Action):
+    """Display operation-specific help while retaining the shared query argument grammar."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        operation = namespace.operation
+        if operation:
+            description, example = QUERY_HELP[operation]
+            prog = f"{parser.prog} {operation}"
+            parser = argparse.ArgumentParser(prog=prog, description=description, epilog=f"Example: {prog} {example}")
+            _add_query_options(parser, operation)
+        else:
+            parser = argparse.ArgumentParser(prog=parser.prog, usage="%(prog)s OPERATION ...",
+                                             description=parser.description, epilog=parser.epilog,
+                                             formatter_class=argparse.RawDescriptionHelpFormatter)
+        parser.print_help()
+        parser.exit()
+
+
+def _add_new_task_options(parser, *, structured=False):
+    parser.add_argument("name", help="short task name, unique within its record date")
+    parser.add_argument("--date", help="today's date in YYYYMMDD format" if structured
+                        else "record date in YYYYMMDD format (default: today)")
+    parser.add_argument("--update-existing", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--title", help="human-readable task title")
+    parser.add_argument("--priority", choices=sorted(ALLOWED_PRIORITY), help="task priority")
+    parser.add_argument("--risk", choices=sorted(ALLOWED_RISK), help="task risk level")
+    parser.add_argument("--project", help="project name recorded on the task")
+    parser.add_argument("--parent-task", help="parent task ID or task directory")
+    parser.add_argument("--related-task", action="append", default=[], help="related task ID or directory (repeatable)")
+    parser.add_argument("--blocked-by", action="append", default=[], help="blocking task ID (repeatable)")
+    parser.add_argument("--supersedes", action="append", default=[], help="superseded task ID (repeatable)")
+    parser.add_argument("--tag", action="append", default=[], help="project scope tag (repeatable)")
+    parser.add_argument("--related-file", action="append", default=[], help="repository-relative file path (repeatable)")
+    parser.add_argument("--allow-non-today-date", action="store_true",
+                        help=argparse.SUPPRESS if structured else "allow an explicit record date other than today")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="./aiwf", usage="%(prog)s [--repo-root PATH] COMMAND ...",
+        description="""Track engineering tasks, evidence and review decisions in this repository.
+
+Start or resume work      new-task, list, guard, inspect
+Record and close work     transition, record, check, doctor, sync-index, finalize
+Maintain the installation install, upgrade, relocate, agents
+Manage workflow records   correct-finalized, backfill, next-id, knowledge-template
+Report and share          report, export-json, export-experiment, dataset, package
+Configure metadata        metadata, profile
+Use JSON from scripts     query, mutate""",
+        epilog="Start a task: ./aiwf new-task fix_login\nFind an existing task: ./aiwf list\n"
+               f"See a command's options: ./aiwf record --help\n{MCP_SETUP_HINT}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--repo-root", default=None, help="repository root; defaults to upward search from cwd")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {AIWF_TOOL_VERSION} (workflow protocol {WORKFLOW_PROTOCOL_VERSION})")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND", prog=parser.prog,
+                                help=argparse.SUPPRESS)
+
+    p = sub.add_parser("query", help="read a versioned JSON result without recording workflow events",
+                       add_help=False, formatter_class=argparse.RawDescriptionHelpFormatter,
+                       description="Read workflow data as JSON.\n\n" +
+                                   "\n".join(f"  {name:12} {description}" for name, (description, _) in QUERY_HELP.items()),
+                       epilog="Show one operation's options: ./aiwf query check --help")
+    p.add_argument("operation", choices=QUERY_HELP)
+    p.add_argument("-h", "--help", action=_QueryHelp, nargs=0, help="show help for the selected operation")
+    _add_query_options(p)
+    p.set_defaults(func=lambda a, r: query_command(r, a.operation, a.path, a.finalize_ready, a))
+
+    p = sub.add_parser("new-task", help="create a new AI work record task directory",
+                       epilog="Example: ./aiwf new-task fix_login --tag regression")
+    _add_new_task_options(p)
     p.set_defaults(
         func=lambda a, r: create_task(
             r,
@@ -10456,7 +11321,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="apply the preflight plan; without it, no files are changed")
     p.set_defaults(func=lambda a, r: install_command(r, a.target, a.yes))
 
-    p = sub.add_parser("check", help="check workflow compliance")
+    p = sub.add_parser("check", help="check workflow compliance",
+                       epilog="Before closing a task: ./aiwf check --path TASK_PATH --finalize-ready")
     p.add_argument("--path", default=None, help="limit check scope to a specific path")
     p.add_argument("--strict", action="store_true", help="return non-zero on warnings")
     p.add_argument(
@@ -10501,12 +11367,15 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
-    p = sub.add_parser("guard", help="run pre-edit AIWF guard checks for a task")
+    p = sub.add_parser("guard", help="run pre-edit AIWF guard checks for a task",
+                       usage="%(prog)s --pre-edit --path TASK_PATH",
+                       epilog="Copy the task path from ./aiwf list. Example: ./aiwf guard --pre-edit --path TASK_PATH")
     p.add_argument("--pre-edit", action="store_true", help="validate a task before non-trivial repository edits")
     p.add_argument("--path", default=None, help="task-specific path")
     p.set_defaults(func=lambda a, r: guard_command(r, a.pre_edit, a.path))
 
-    p = sub.add_parser("doctor", help="show deterministic diagnostics for a task path")
+    p = sub.add_parser("doctor", help="show deterministic diagnostics for a task path",
+                       epilog="Investigate workflow blockers: ./aiwf doctor --path TASK_PATH")
     p.add_argument("--path", required=True, help="task-specific path")
     p.set_defaults(func=lambda a, r: doctor_command(r, a.path))
 
@@ -10527,28 +11396,37 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
-    p = sub.add_parser("inspect", help="show historical closure and current-state projection for a task")
+    p = sub.add_parser("inspect", help="show historical closure and current-state projection for a task",
+                       epilog="Read one task's state: ./aiwf inspect --path TASK_PATH")
     p.add_argument("--path", required=True, help="task-specific path")
     p.set_defaults(func=lambda a, r: inspect_command(r, a.path))
 
-    p = sub.add_parser("finalize", help="finalize a task after deterministic checks pass")
+    p = sub.add_parser("finalize", help="finalize a task after deterministic checks pass",
+                       epilog="Preview closure: ./aiwf finalize --path TASK_PATH --dry-run")
     p.add_argument("--path", required=True, help="task-specific path")
     p.add_argument("--dry-run", action="store_true", help="run finalize checks and preview metadata changes without writing files")
     p.set_defaults(func=lambda a, r: finalize_command(r, a.path, a.dry_run))
 
-    p = sub.add_parser("transition", help="transition workflow_phase for a task")
+    p = sub.add_parser("transition", help="transition workflow_phase for a task",
+                       epilog="Example: ./aiwf transition --path TASK_PATH --to validation")
     p.add_argument("--path", required=True, help="task-specific path")
-    p.add_argument("--to", required=True, choices=sorted(ALLOWED_WORKFLOW_PHASE), help="target workflow phase (cannot be finalized)")
+    p.add_argument("--to", required=True, choices=sorted(ALLOWED_WORKFLOW_PHASE),
+                   metavar="{" + ",".join(sorted(set().union(*ALLOWED_PHASE_TRANSITIONS.values()))) + "}",
+                   help="target workflow phase; use ./aiwf finalize for closure")
     p.set_defaults(func=lambda a, r: transition_command(r, a.path, a.to))
 
     p = sub.add_parser(
         "record",
         help="record workflow evidence; this command does not execute external commands",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Store evidence from completed work.\n\n" +
+                    "\n".join(f"  {kind:12} {hint}" for kind, hint in RECORD_INPUT_HELP.items()),
+        epilog="After pytest passes: ./aiwf record --path TASK_PATH --kind validation --result pass --command pytest",
     )
     p.add_argument("--path", required=True, help="task-specific path")
     p.add_argument("--kind", required=True, choices=sorted(ALLOWED_RECORD_KIND), help="evidence kind")
     p.add_argument("--result", default=None, help="result value for validation/review records")
-    p.add_argument("--command", default=None, help="command string evidence only (not executed)")
+    p.add_argument("--command", dest="evidence_command", default=None, help="command string evidence only (not executed)")
     p.add_argument("--reviewer", default=None, help="reviewer name for review records")
     p.add_argument(
         "--decision-authority",
@@ -10563,7 +11441,7 @@ def build_parser() -> argparse.ArgumentParser:
             a.path,
             kind=a.kind,
             result=a.result,
-            command=a.command,
+            command=a.evidence_command,
             reviewer=a.reviewer,
             summary=a.summary,
             decision_authority=a.decision_authority,
@@ -10579,7 +11457,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--date", default=None, help="YYYYMMDD date; defaults to today")
     p.set_defaults(func=lambda a, r: next_id_command(r, a.date))
 
-    p = sub.add_parser("list", help="list tasks with optional filters")
+    p = sub.add_parser("list", help="list tasks with optional filters",
+                       description="List tasks by exact metadata values.",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="List tasks in the review phase:\n  ./aiwf list --workflow-phase review\n"
+                              "Compare a candidate's required and latest review authority:\n  ./aiwf inspect --path TASK_PATH")
     p.add_argument(
         "--status",
         default=None,
@@ -10653,7 +11535,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_records.add_argument("--from-date", default=None, help="include tasks created on or after YYYY-MM-DD")
     p_records.add_argument("--to-date", default=None, help="include tasks created on or before YYYY-MM-DD")
     p_records.add_argument("--date", action="append", default=[], help="include tasks for YYYY-MM-DD; may repeat")
-    p_records.add_argument("--task", action="append", default=[], help="exact task path or unambiguous task id; may repeat")
+    p_records.add_argument("--task", action="append", default=[],
+                           help="select records by exact task path or unambiguous ID; the manifest also lists excluded task paths")
     p_records.add_argument(
         "--status",
         action="append",
@@ -10760,21 +11643,185 @@ def build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--yes", action="store_true", help="confirm write operation")
     p_install.set_defaults(func=lambda a, r: agents_install_command(r, a.path, a.yes))
 
+    mutations = sub.add_parser("mutate", help="run a governed operation and emit a structured result",
+                               description="Run a workflow operation and return a JSON receipt.",
+                               epilog="Example: ./aiwf mutate guard --pre-edit --path TASK_PATH")
+    operations = mutations.add_subparsers(dest="operation", required=True)
+    for operation in MUTATION_OPERATIONS:
+        native = sub.choices[operation]
+        if operation == "new-task":
+            action = operations.add_parser(operation, allow_abbrev=False,
+                                           description="Create a task for today and return its path in a JSON receipt.")
+            _add_new_task_options(action, structured=True)
+        elif operation == "finalize":
+            action = operations.add_parser(operation, allow_abbrev=False,
+                                           epilog="Preview closure: ./aiwf query check --path TASK_PATH --preview")
+            action.add_argument("--path", required=True, help="full task path from ./aiwf query list")
+            action.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+        else:
+            action = operations.add_parser(operation, parents=[native], add_help=False, allow_abbrev=False,
+                                           description=native.description, formatter_class=native.formatter_class)
+            action.usage = native.usage
+        if operation == "record":
+            action.add_argument("--agent-channel", action="store_true", help="enforce agent review policy")
+        action.set_defaults(func=mutation_command, native_handler=native.get_default("func"))
     return parser
+
+
+_WORKFLOW_WRITERS = {"mutate", "new-task", "record", "transition", "sync-index", "correct-finalized", "backfill",
+                     "check", "doctor", "finalize"}
+_LEGACY_OBSERVATIONS = {"guard", "next-id", "inspect", "list", "report", "export-json", "export-experiment"}
+_WORKFLOW_READERS = _LEGACY_OBSERVATIONS | {"query"}
+
+
+def _verify_workflow_storage(root: Path) -> None:
+    workflow_lock.verify_path(root, root / ".aiwf/config.yaml")
+    layout = load_aiwf_config(root).layout
+    for value in (layout.record_root, layout.event_log):
+        workflow_lock.verify_path(root, root / value)
+
+
+def _locked_dispatch(args, root: Path) -> int:
+    command = args.command
+    if command == "upgrade" and args.apply and os.name == "posix":
+        import fcntl
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            try:
+                fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("[ERROR] Upgrade target is busy. Retry after the active workflow or upgrade completes.")
+                return 2
+            return args.func(args, root)
+        finally:
+            os.close(directory)
+    if command not in _WORKFLOW_WRITERS | _WORKFLOW_READERS:
+        return args.func(args, root)
+    writer = command in _WORKFLOW_WRITERS
+    if (command == "finalize" and args.dry_run) or (command == "check" and args.finalize_ready):
+        writer = False
+    operation = args.operation if command == "mutate" else command
+    supplied = getattr(args, "path", None)
+    target = None
+    if supplied is not None:
+        path = root / supplied
+        if path.is_relative_to(root) and ".." not in path.parts:
+            target = path.relative_to(root).as_posix()
+    # Structured receipts leave stdout only after marker cleanup and unlock.
+    buffered = io.StringIO() if command == "mutate" else None
+    try:
+        with workflow_lock.workflow_lock(root, writer=writer, operation=operation, target=target,
+                                         allow_unlocked_observation=command in _LEGACY_OBSERVATIONS):
+            if command == "mutate" and not workflow_lock.mutation_root_writable(root):
+                raise workflow_lock.marker_permission_error()
+            if command not in {"query", "mutate"}:
+                _verify_workflow_storage(root)
+            if writer:
+                for name in (".env", ".aiwf/metadata.current", ".aiwf/metadata.local.env"):
+                    workflow_lock.verify_path(root, root / name)
+                profile = _active_metadata_profile_name(root)
+                if profile:
+                    workflow_lock.verify_path(root, _metadata_profile_path(root, profile))
+                if target is not None:
+                    workflow_lock.verify_path(root, root / target)
+                    task = root / target
+                    if is_task_specific_dir(task):
+                        for input_path in (task.parent / "index.md", task / "task.md", _task_event_log_path(task)):
+                            workflow_lock.verify_path(root, input_path)
+                if operation == "new-task":
+                    date = args.date or _now_iso_date().replace("-", "")
+                    if re.fullmatch(r"\d{8}", date):
+                        index = get_record_root(root) / f"ai_{date}" / "index.md"
+                        workflow_lock.verify_path(root, index)
+            if buffered is not None:
+                with redirect_stdout(buffered):
+                    rc = args.func(args, root)
+            else:
+                rc = args.func(args, root)
+        if buffered is not None:
+            print(buffered.getvalue(), end="")
+        return rc
+    except workflow_lock.WorkflowLockError as exc:
+        if command == "mutate":
+            return emit_mutation_lock_error(args, exc)
+        if command == "query":
+            return emit_query_result(args.operation, 2, None, code=exc.code, message=exc.message)
+        print(f"[ERROR] {exc.code}: {exc.message}", file=sys.stderr)
+        return 2
+
+
+class _QueryOperationProbe(argparse.ArgumentParser):
+    def error(self, message):
+        # The full parser has already printed its diagnostic to stderr.
+        raise ValueError(message)
+
+
+def _requested_query(argv: Sequence[str]) -> Optional[str]:
+    probe = _QueryOperationProbe(add_help=False)
+    probe.add_argument("--repo-root")
+    query = probe.add_subparsers().add_parser("query", add_help=False)
+    _add_query_options(query, identify_only=True)
+    query.add_argument("operation", choices=QUERY_HELP)
+    query.add_argument("rest", nargs=argparse.REMAINDER)
+    try:
+        request, _ = probe.parse_known_args(argv)
+    except ValueError:
+        return None
+    return getattr(request, "operation", None)
+
+
+def _requested_mutation(argv: Sequence[str]) -> Optional[str]:
+    # Only recognize the top-level command position, never evidence text or a task name.
+    positional = list(argv)
+    if positional[:1] == ["--repo-root"]:
+        positional = positional[2:]
+    elif positional and positional[0].startswith("--repo-root="):
+        positional = positional[1:]
+    if len(positional) >= 2 and positional[0] == "mutate" and positional[1] in MUTATION_OPERATIONS:
+        return positional[1]
+    return None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    supplied = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = parser.parse_args(supplied)
+    except SystemExit as exc:
+        if exc.code != 2:
+            raise
+        query = _requested_query(supplied)
+        if query:
+            return emit_query_result(query, 2, None, code="AIWF-QUERY-001",
+                                     message=f"Invalid query arguments. Run ./aiwf query {query} --help for accepted options.")
+        operation = _requested_mutation(supplied)
+        if not operation:
+            raise
+        receipt = _mutation_envelope(operation)
+        receipt["diagnostics"].append({"code": "AIWF-MUTATION-INPUT", "severity": "error",
+                                       "message": "Arguments do not match the selected runtime operation."})
+        return _emit_mutation(receipt, 2)
     if args.command == "install" and not args.repo_root:
         target_root = Path(args.target).expanduser()
         root = (target_root if target_root.is_absolute() else Path.cwd() / target_root).resolve()
     else:
         root = Path(args.repo_root).resolve() if args.repo_root else find_repo_root(Path.cwd())
+    if not root.exists() and args.command == "query":
+        return emit_query_result(args.operation, 2, None, code="AIWF-QUERY-001", message="Repository root is unavailable.")
+    if not root.exists() and args.command == "mutate":
+        receipt = _mutation_envelope(args.operation)
+        receipt["diagnostics"].append({"code": "AIWF-MUTATION-INPUT", "severity": "error",
+                                       "message": "Repository root is unavailable."})
+        return _emit_mutation(receipt, 2)
     if not root.exists():
         raise SystemExit(f"ERROR: repo root does not exist: {root}")
     try:
-        return args.func(args, root)
+        return _locked_dispatch(args, root)
+    except OSError as exc:
+        if args.command not in {"upgrade", "relocate", "install"}:
+            raise
+        print(f"[ERROR] AIWF {args.command} failed: {exc}", file=sys.stderr)
+        return 2
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
